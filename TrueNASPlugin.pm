@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '1.0.0';
+our $VERSION = '1.0.6';
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -16,13 +16,17 @@ use Socket qw(inet_ntoa);
 use LWP::UserAgent;
 use HTTP::Request;
 use Cwd qw(abs_path);
-use Sys::Syslog qw(syslog);
+use Sys::Syslog qw(openlog syslog);
 use Carp qw(carp croak);
 use PVE::Tools qw(run_command trim);
 use PVE::Storage::Plugin;
 use PVE::JSONSchema qw(get_standard_option);
-use Sys::Syslog qw(syslog);
 use base qw(PVE::Storage::Plugin);
+
+# Initialize syslog at compile time
+BEGIN {
+    openlog('truenasplugin', 'pid', 'daemon');
+}
 
 # Simple cache for API results (static data)
 my %API_CACHE = ();
@@ -82,6 +86,23 @@ sub _format_bytes {
     return sprintf("%.2f %s", $size, $units[$unit_idx]);
 }
 
+# Debug logging helper - respects debug level from storage config
+# Usage: _log($scfg, $level, $priority, $message)
+#   $level: 0=always, 1=light debug, 2=verbose debug
+#   $priority: syslog priority ('err', 'warning', 'info', 'debug')
+sub _log {
+    my ($scfg, $level, $priority, $message) = @_;
+
+    # Level 0 messages (errors) are always logged
+    return syslog($priority, $message) if $level == 0;
+
+    # For level 1+, check debug configuration
+    my $debug_level = $scfg->{debug} // 0;
+    return if $level > $debug_level;
+
+    syslog($priority, $message);
+}
+
 # ======== Retry logic with exponential backoff ========
 sub _is_retryable_error {
     my ($error) = @_;
@@ -137,7 +158,7 @@ sub _retry_with_backoff {
 
         # Max retries exhausted
         if ($attempt > $max_retries) {
-            syslog('error', "Max retries ($max_retries) exhausted for $operation_name: $last_error");
+            syslog('err', "Max retries ($max_retries) exhausted for $operation_name: $last_error");
             die "Operation failed after $max_retries retries: $last_error";
         }
 
@@ -156,7 +177,29 @@ sub _retry_with_backoff {
 }
 
 # ======== Storage plugin identity ========
-sub api { return 11; } # storage plugin API version
+# Storage API version - dynamically adapts to PVE version
+# Supports PVE 8.x (APIVER 11) and PVE 9.x (APIVER 12)
+sub api {
+    my $tested_apiver = 12;  # Latest tested version (PVE 9.x)
+
+    # Get current system API version (safely, as PVE::Storage may not be loaded yet)
+    my $system_apiver = eval { require PVE::Storage; PVE::Storage::APIVER() } // 11;
+    my $system_apiage = eval { PVE::Storage::APIAGE() } // 2;
+
+    # If system API is within our tested range, return system version
+    # This ensures we never claim a higher version than the system supports
+    if ($system_apiver >= 11 && $system_apiver <= $tested_apiver) {
+        return $system_apiver;
+    }
+
+    # If we're within APIAGE of tested version, return tested version
+    if ($system_apiver - $system_apiage < $tested_apiver) {
+        return $tested_apiver;
+    }
+
+    # Fallback for very old systems (shouldn't happen with PVE 7+)
+    return 11;
+}
 sub type { return 'truenasplugin'; } # storage.cfg "type"
 sub plugindata {
     return {
@@ -238,6 +281,12 @@ sub properties {
         ipv6_by_path => {
             description => "Normalize IPv6 by-path names (enable only if using IPv6 portals).",
             type => 'boolean', optional => 1, default => 0,
+        },
+
+        # Debug level
+        debug => {
+            description => "Debug level: 0=none (errors only), 1=light (function calls), 2=verbose (full trace)",
+            type => 'integer', optional => 1, default => 0, minimum => 0, maximum => 2,
         },
 
         # CHAP (optional)
@@ -322,6 +371,9 @@ sub options {
 
         # Thin toggle
         tn_sparse => { optional => 1 },
+
+        # Debug
+        debug => { optional => 1 },
 
         # Live snapshots
         enable_live_snapshots => { optional => 1 },
@@ -695,7 +747,7 @@ sub _bulk_snapshot_delete($scfg, $snapshot_list) {
                 return []; # Return empty error list (success)
             } else {
                 my $error = "Bulk snapshot deletion job failed: " . $job_result->{error};
-                syslog('error', $error);
+                syslog('err', $error);
                 return [$error]; # Return error list
             }
         } else {
@@ -888,7 +940,7 @@ sub _wait_for_job_completion {
                 return { success => 1 };
             } elsif ($state eq 'FAILED') {
                 my $error = $job->{error} // $job->{exc_info} // 'Unknown error';
-                syslog('error', "TrueNAS job $job_id failed: $error");
+                syslog('err', "TrueNAS job $job_id failed: $error");
                 return { success => 0, error => $error };
             } elsif ($state eq 'RUNNING' || $state eq 'WAITING') {
                 # Job still in progress, continue waiting
@@ -907,7 +959,7 @@ sub _wait_for_job_completion {
     }
 
     # Timeout reached
-    syslog('error', "TrueNAS job $job_id timed out after ${timeout_seconds} seconds");
+    syslog('err', "TrueNAS job $job_id timed out after ${timeout_seconds} seconds");
     return { success => 0, error => "Job timed out after ${timeout_seconds} seconds" };
 }
 
@@ -928,7 +980,7 @@ sub _handle_api_result_with_job_support {
             return { success => 1, result => undef };
         } else {
             my $error = "TrueNAS $operation_name job failed: " . $job_result->{error};
-            syslog('error', $error);
+            syslog('err', $error);
             return { success => 0, error => $error };
         }
     }
@@ -940,6 +992,14 @@ sub _handle_api_result_with_job_support {
 # ======== Transport-agnostic API wrapper ========
 sub _api_call($scfg, $ws_method, $ws_params, $rest_fallback) {
     my $transport = lc($scfg->{api_transport} // 'ws');
+
+    # Level 2: Verbose - log all API calls with parameters
+    if ($ws_params && ref($ws_params) eq 'ARRAY' && @$ws_params) {
+        _log($scfg, 2, 'debug', "_api_call: method=$ws_method, transport=$transport, params=" . encode_json($ws_params));
+    } else {
+        _log($scfg, 2, 'debug', "_api_call: method=$ws_method, transport=$transport");
+    }
+
     if ($transport eq 'ws') {
         # Wrap WebSocket call with retry logic
         return _retry_with_backoff($scfg, "WS $ws_method", sub {
@@ -947,6 +1007,10 @@ sub _api_call($scfg, $ws_method, $ws_params, $rest_fallback) {
             my $res = _ws_rpc($conn, {
                 jsonrpc => "2.0", id => $conn->{next_id}++, method => $ws_method, params => $ws_params // [],
             });
+
+            # Level 2: Verbose - log API response
+            _log($scfg, 2, 'debug', "_api_call: response from $ws_method: " . (ref($res) ? encode_json($res) : ($res // 'undef')));
+
             return $res;
         });
     } elsif ($transport eq 'rest') {
@@ -1476,7 +1540,7 @@ sub _current_lun_for_zname($scfg, $zname) {
 # Pre-flight validation checks before volume allocation
 # Returns arrayref of error messages (empty if all checks pass)
 sub _preflight_check_alloc {
-    my ($scfg, $size_kb) = @_;
+    my ($scfg, $size_bytes) = @_;
 
     my @errors;
 
@@ -1510,8 +1574,8 @@ sub _preflight_check_alloc {
     }
 
     # Check 3: Sufficient space available (with 20% overhead)
-    if (defined $size_kb) {
-        my $bytes = int($size_kb) * 1024;
+    if (defined $size_bytes) {
+        my $bytes = int($size_bytes);
         my $required = $bytes * 1.2;
 
         eval {
@@ -1767,7 +1831,12 @@ sub _find_by_path_for_lun($scfg, $lun) {
     opendir(my $dh, "/dev/disk/by-path") or die "cannot open /dev/disk/by-path\n";
     my @paths = grep { $_ =~ /^ip-.*\Q$pattern\E$/ } readdir($dh);
     closedir($dh);
-    return "/dev/disk/by-path/$paths[0]" if @paths;
+    if (@paths) {
+        # Untaint the path by validating it matches expected format
+        if ($paths[0] =~ m{^(ip-[\w.:,\[\]\-]+iscsi-[\w.:,\[\]\-]+lun-\d+)$}) {
+            return "/dev/disk/by-path/$1";
+        }
+    }
     return undef;
 }
 
@@ -1784,7 +1853,14 @@ sub _dm_map_for_leaf($leaf) {
             chomp($name = <$fh> // ''); close $fh;
         }
         closedir($dh);
-        return $name ? "/dev/mapper/$name" : "/dev/$e";
+        # Untaint the device mapper name
+        if ($name && $name =~ m{^([\w\-]+)$}) {
+            return "/dev/mapper/$1";
+        }
+        # Untaint dm-N device
+        if ($e =~ m{^(dm-\d+)$}) {
+            return "/dev/$1";
+        }
     }
     closedir($dh);
     return undef;
@@ -1896,24 +1972,36 @@ sub path {
 }
 
 # Create a new VM disk (zvol + iSCSI extent + mapping) and hand it to Proxmox.
-# Arguments (per PVE): ($class, $storeid, $scfg, $vmid, $fmt, $name, $size_bytes)
+# Arguments (per PVE): ($class, $storeid, $scfg, $vmid, $fmt, $name, $size_kib)
+# NOTE: Proxmox passes size in KiB (kibibytes), not bytes!
 sub alloc_image {
-    my ($class, $storeid, $scfg, $vmid, $fmt, $name, $size) = @_;
+    my ($class, $storeid, $scfg, $vmid, $fmt, $name, $size_kib) = @_;
+
+    # Level 0: Always log (errors only logged elsewhere)
+    # Level 1: Light - function entry with key parameters
+    _log($scfg, 1, 'info', "alloc_image: vmid=$vmid, name=" . ($name // 'undef') . ", size=$size_kib KiB");
+
     die "only raw is supported\n" if defined($fmt) && $fmt ne 'raw';
-    die "invalid size\n" if !defined($size) || $size <= 0;
+    die "invalid size\n" if !defined($size_kib) || $size_kib <= 0;
+
+    # Convert KiB to bytes for TrueNAS API
+    my $bytes = int($size_kib) * 1024;
+
+    # Level 2: Verbose - unit conversion details
+    _log($scfg, 2, 'debug', "alloc_image: converting $size_kib KiB → $bytes bytes");
 
     # Pre-flight checks: validate all prerequisites before expensive operations
-    my $errors = _preflight_check_alloc($scfg, $size);
+    _log($scfg, 1, 'info', "alloc_image: running pre-flight checks for $bytes bytes");
+    my $errors = _preflight_check_alloc($scfg, $bytes);
     if (@$errors) {
         my $error_msg = "Pre-flight validation failed:\n  - " . join("\n  - ", @$errors);
-        syslog('error', "alloc_image pre-flight check failed for VM $vmid: " . join("; ", @$errors));
+        _log($scfg, 0, 'err', "alloc_image pre-flight check failed for VM $vmid: " . join("; ", @$errors));
         die "$error_msg\n";
     }
 
     # Log successful pre-flight checks
-    my $bytes = int($size) * 1024; # Proxmox passes size in KiB
-    syslog('info', sprintf(
-        "Pre-flight checks passed for %s volume allocation on '%s' (VM %d)",
+    _log($scfg, 1, 'info', sprintf(
+        "alloc_image: pre-flight checks passed for %s volume allocation on '%s' (VM %d)",
         _format_bytes($bytes), $scfg->{dataset}, $vmid
     ));
 
@@ -2064,18 +2152,20 @@ sub alloc_image {
 
     # 6) Verify device is accessible before returning success
     my $device_ready = 0;
-    for my $attempt (1..20) { # Wait up to 10 seconds for device to appear
+    # Progressive backoff: 0ms, 100ms, 250ms, 250ms, 250ms... (up to 5 seconds total)
+    my @retry_delays = (0, 100_000, 250_000);  # First 3 attempts: immediate, 100ms, 250ms
+    for my $attempt (1..20) { # Wait up to 5 seconds for device to appear
         eval {
             my $dev = _device_for_lun($scfg, $lun);
             if ($dev && -e $dev && -b $dev) {
-                syslog('info', "Device $dev is ready for LUN $lun");
+                syslog('info', "Device $dev is ready for LUN $lun (attempt $attempt)");
                 $device_ready = 1;
             }
         };
         last if $device_ready;
 
-        if ($attempt % 5 == 0) {
-            # Extra discovery/rescan every 2.5 seconds
+        if ($attempt % 4 == 0) {
+            # Extra discovery/rescan every second (every 4th attempt after initial burst)
             eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan"); };
             if ($scfg->{use_multipath}) {
                 eval { _try_run(['multipath','-r'], "multipath reload"); };
@@ -2083,12 +2173,14 @@ sub alloc_image {
             eval { run_command(['udevadm','settle'], outfunc => sub {}); };
         }
 
-        usleep(500_000); # 500ms between attempts
+        # Progressive backoff: first few attempts faster, then 250ms thereafter
+        my $delay = $retry_delays[$attempt - 1] // 250_000;
+        usleep($delay) if $delay > 0;
     }
 
     if (!$device_ready) {
         die sprintf(
-            "Volume created but device not accessible after 10 seconds\n\n" .
+            "Volume created but device not accessible after 5 seconds\n\n" .
             "LUN: %d\n" .
             "Target IQN: %s\n" .
             "Dataset: %s\n" .
@@ -2142,11 +2234,18 @@ sub volume_size_info {
 # clean up the initiator (flush multipath, rescan, optionally logout if no LUNs remain).
 sub free_image {
     my ($class, $storeid, $scfg, $volname, $isBase, $format) = @_;
+
+    # Level 1: Light - function entry
+    _log($scfg, 1, 'info', "free_image: volname=$volname");
+
     die "snapshots not supported on iSCSI zvols\n" if $isBase;
     die "unsupported format '$format'\n" if defined($format) && $format ne 'raw';
 
     my (undef, $zname, undef, undef, undef, undef, undef, $lun) = $class->parse_volname($volname);
     my $full_ds = $scfg->{dataset} . '/' . $zname;
+
+    # Level 2: Verbose - parsed details
+    _log($scfg, 2, 'debug', "free_image: zname=$zname, lun=$lun, full_ds=$full_ds");
 
     # Best-effort: flush local multipath path of this WWID (ignore "not a multipath device")
     if ($scfg->{use_multipath}) {
@@ -2238,6 +2337,10 @@ sub free_image {
         if ($active_luns <= 1 || $@) {
             syslog('info', "Logging out to retry extent deletion (active LUNs: $active_luns)");
             _logout_target_all_portals($scfg);
+            # Wait for iSCSI session to fully disconnect before retrying deletion
+            syslog('info', "Waiting for iSCSI session to disconnect...");
+            sleep(1);  # Reduced from 2s to 1s - modern systems settle faster
+            eval { run_command(['udevadm','settle'], outfunc => sub {}) };
         } else {
             syslog('info', "Skipping logout during extent deletion - $active_luns other LUNs active (preserves multi-disk operations)");
             $need_force_logout = 0;  # Skip retry since we're not logging out
@@ -2326,7 +2429,7 @@ sub free_image {
     if ($@ && $@ =~ /busy|in use/i) {
         syslog('info', "Dataset deletion failed (device busy), retrying with logout");
         _logout_target_all_portals($scfg);
-        sleep(2);
+        sleep(1);  # Reduced from 2s to 1s - modern systems settle faster
 
         eval {
             my $id = URI::Escape::uri_escape($full_ds);
@@ -2456,9 +2559,10 @@ sub list_images {
         my $owner;
         $owner = $1 if $zname =~ /^vm-(\d+)-/;
 
-        # Honor $vmid filter if owner is known
-        if (defined $vmid && defined $owner && $owner != $vmid) {
-            next MAPPING;
+        # Honor $vmid filter
+        if (defined $vmid) {
+            # Skip if no owner detected (e.g., weight zvol) or owner doesn't match
+            next MAPPING if !defined $owner || $owner != $vmid;
         }
 
         # Compose plugin volname + volid
@@ -2470,9 +2574,26 @@ sub list_images {
             next MAPPING;
         }
 
-        # Ask TrueNAS for the zvol to get current size (bytes)
+        # Ask TrueNAS for the zvol to get current size (bytes) and creation time
         my $ds   = eval { _tn_dataset_get($scfg, $ds_full) } // {};
         my $size = $norm->($ds->{volsize}); # bytes (0 if missing)
+
+        # Extract creation time
+        # Try multiple possible locations for creation time
+        my $ctime = 0;
+        if (my $props = $ds->{properties}) {
+            if (ref($props->{creation}) eq 'HASH') {
+                $ctime = int($props->{creation}{rawvalue} // $props->{creation}{value} // 0);
+            } elsif (defined $props->{creation} && $props->{creation} =~ /(\d{10})/) {
+                $ctime = int($1);
+            }
+        }
+        # Fallback: try direct fields on dataset
+        if (!$ctime && defined $ds->{created}) {
+            $ctime = int($ds->{created});
+        }
+        # If still no time, use current time as fallback to avoid epoch display
+        $ctime = time() if !$ctime;
 
         # Format is always raw for block iSCSI zvols
         my %entry = (
@@ -2481,6 +2602,7 @@ sub list_images {
             format  => 'raw',
             content => 'images',
             vmid    => defined($owner) ? int($owner) : 0,
+            ctime   => $ctime,
         );
         push @$res, \%entry;
     }
@@ -2527,11 +2649,11 @@ sub status {
             $active = 0;
         } elsif ($err =~ /does not exist|ENOENT|InstanceNotFound/i) {
             # Dataset doesn't exist - this is a configuration error
-            syslog('error', "TrueNAS storage '$storeid' configuration error (dataset not found): $err");
+            syslog('err', "TrueNAS storage '$storeid' configuration error (dataset not found): $err");
             $active = 0;
         } elsif ($err =~ /401|403|authentication|unauthorized|forbidden/i) {
             # Authentication/permission issue - configuration error
-            syslog('error', "TrueNAS storage '$storeid' authentication failed (check API key): $err");
+            syslog('err', "TrueNAS storage '$storeid' authentication failed (check API key): $err");
             $active = 0;
         } else {
             # Other errors - mark inactive but log as warning for investigation
@@ -2547,7 +2669,196 @@ sub status {
     return ($total, $avail, $used, $active);
 }
 
-sub activate_storage { return 1; }
+# ======== Target Visibility Pre-flight Check ========
+# Ensures the iSCSI target is visible and discoverable.
+# If the target has no extents, it won't appear in discovery.
+# This function creates a small "weight" zvol to keep the target visible.
+sub _ensure_target_visible {
+    my ($scfg) = @_;
+
+    my $iqn = $scfg->{target_iqn};
+    my $portal = _normalize_portal($scfg->{discovery_portal});
+    my $weight_name = 'pve-plugin-weight';
+    my $weight_zname = $scfg->{dataset} . '/' . $weight_name;
+
+    # Level 1: Log pre-flight check start
+    _log($scfg, 1, 'info', "Pre-flight: Checking target visibility for $iqn");
+
+    # Step 1: Check if target exists on TrueNAS
+    # Note: TrueNAS stores the target name without the IQN prefix
+    # Extract target name from full IQN (e.g., "iqn.2005-10.org.freenas.ctl:proxmox" -> "proxmox")
+    my $target_name = $iqn;
+    if ($iqn =~ /:([^:]+)$/) {
+        $target_name = $1;
+    }
+
+    my $target_exists = 0;
+    my $target_id;
+    eval {
+        my $targets = _tn_targets($scfg);
+        _log($scfg, 1, 'info', "Pre-flight: Retrieved " . scalar(@$targets) . " targets from TrueNAS");
+        for my $t (@$targets) {
+            my $tname = $t->{name} // 'undefined';
+            _log($scfg, 2, 'debug', "Pre-flight: Checking target '$tname' against '$target_name'");
+            if ($tname eq $target_name) {
+                $target_exists = 1;
+                $target_id = $t->{id};
+                last;
+            }
+        }
+    };
+    if ($@) {
+        _log($scfg, 0, 'err', "Pre-flight: Failed to query targets: $@");
+    }
+
+    if (!$target_exists) {
+        _log($scfg, 0, 'err', "Pre-flight: Target $target_name does not exist on TrueNAS");
+        die "iSCSI target $target_name not found on TrueNAS. Please configure the target first.\n";
+    }
+
+    _log($scfg, 1, 'info', "Pre-flight: Target $target_name exists on TrueNAS (ID: $target_id)");
+
+    # Step 2: Check if target is discoverable via iscsiadm
+    my $target_discoverable = 0;
+    eval {
+        # Try discovery
+        my @discovery_output = _run_lines(['iscsiadm', '-m', 'discovery', '-t', 'sendtargets', '-p', $portal]);
+        for my $line (@discovery_output) {
+            if ($line =~ /\b\Q$iqn\E\b/) {
+                $target_discoverable = 1;
+                last;
+            }
+        }
+    };
+
+    if ($target_discoverable) {
+        _log($scfg, 1, 'info', "Pre-flight: Target $iqn is discoverable");
+        return 1; # Target is visible, nothing to do
+    }
+
+    _log($scfg, 1, 'info', "Pre-flight: Target $iqn is NOT discoverable - creating weight zvol");
+
+    # Step 3: Target exists but isn't discoverable - likely no extents
+    # Create weight zvol if it doesn't exist
+    my $weight_exists = 0;
+    eval {
+        my $ds = _tn_dataset_get($scfg, $weight_zname);
+        $weight_exists = 1 if $ds;
+    };
+
+    if (!$weight_exists) {
+        _log($scfg, 1, 'info', "Pre-flight: Creating weight zvol $weight_zname (1GB)");
+        eval {
+            _tn_dataset_create($scfg, $weight_zname, 1048576, '64K'); # 1GB in KiB
+        };
+        if ($@) {
+            _log($scfg, 0, 'err', "Pre-flight: Failed to create weight zvol: $@");
+            die "Failed to create weight zvol: $@\n";
+        }
+        _log($scfg, 1, 'info', "Pre-flight: Weight zvol created");
+    } else {
+        _log($scfg, 1, 'info', "Pre-flight: Weight zvol already exists");
+    }
+
+    # Step 4: Create extent for weight zvol if it doesn't exist
+    my $weight_extent_exists = 0;
+    eval {
+        my $extents = _tn_extents($scfg);
+        for my $ext (@$extents) {
+            if (($ext->{name} // '') eq $weight_name) {
+                $weight_extent_exists = 1;
+                last;
+            }
+        }
+    };
+
+    if (!$weight_extent_exists) {
+        _log($scfg, 1, 'info', "Pre-flight: Creating extent for weight zvol");
+        eval {
+            _tn_extent_create($scfg, $weight_name, $weight_zname);
+        };
+        if ($@) {
+            _log($scfg, 0, 'err', "Pre-flight: Failed to create weight extent: $@");
+            die "Failed to create weight extent: $@\n";
+        }
+        _log($scfg, 1, 'info', "Pre-flight: Weight extent created");
+    } else {
+        _log($scfg, 1, 'info', "Pre-flight: Weight extent already exists");
+    }
+
+    # Step 5: Ensure extent is mapped to target
+    my $weight_mapped = 0;
+    my $weight_extent_id;
+    eval {
+        my $extents = _tn_extents($scfg);
+        for my $ext (@$extents) {
+            if (($ext->{name} // '') eq $weight_name) {
+                $weight_extent_id = $ext->{id};
+                last;
+            }
+        }
+
+        if ($weight_extent_id) {
+            my $targetextents = _tn_targetextents($scfg);
+            for my $te (@$targetextents) {
+                if ($te->{extent} == $weight_extent_id) {
+                    $weight_mapped = 1;
+                    last;
+                }
+            }
+        }
+    };
+
+    if (!$weight_mapped && $weight_extent_id && $target_id) {
+        _log($scfg, 1, 'info', "Pre-flight: Mapping weight extent to target");
+        eval {
+            _tn_targetextent_create($scfg, $target_id, $weight_extent_id, 0);
+        };
+        if ($@) {
+            _log($scfg, 0, 'warning', "Pre-flight: Failed to map weight extent: $@");
+            # Non-fatal - extent may already be mapped
+        } else {
+            _log($scfg, 1, 'info', "Pre-flight: Weight extent mapped to target");
+        }
+    }
+
+    # Step 6: Verify target is now discoverable
+    sleep 2; # Give TrueNAS time to update
+    $target_discoverable = 0;
+    eval {
+        my @discovery_output = _run_lines(['iscsiadm', '-m', 'discovery', '-t', 'sendtargets', '-p', $portal]);
+        for my $line (@discovery_output) {
+            if ($line =~ /\b\Q$iqn\E\b/) {
+                $target_discoverable = 1;
+                last;
+            }
+        }
+    };
+
+    if ($target_discoverable) {
+        _log($scfg, 1, 'info', "Pre-flight: Target $iqn is now discoverable");
+        return 1;
+    } else {
+        _log($scfg, 0, 'warning', "Pre-flight: Target $iqn still not discoverable after weight zvol creation");
+        # Don't die - let iSCSI login handle the error with better diagnostics
+        return 0;
+    }
+}
+
+sub activate_storage {
+    my ($class, $storeid, $scfg, $cache) = @_;
+
+    # Run pre-flight check to ensure target is visible
+    eval {
+        _ensure_target_visible($scfg);
+    };
+    if ($@) {
+        syslog('warning', "Target visibility pre-flight check failed for $storeid: $@");
+    }
+
+    return 1;
+}
+
 sub deactivate_storage { return 1; }
 
 sub activate_volume {
