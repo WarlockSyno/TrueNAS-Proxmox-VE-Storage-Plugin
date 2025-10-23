@@ -2,6 +2,45 @@
 
 Common issues and solutions for the TrueNAS Proxmox VE Storage Plugin.
 
+## Table of Contents
+
+- [About Plugin Error Messages](#about-plugin-error-messages)
+- [Storage Status Issues](#storage-status-issues)
+  - [Storage Shows as Inactive](#storage-shows-as-inactive)
+- [Connection and API Issues](#connection-and-api-issues)
+  - ["Could not connect to TrueNAS API"](#could-not-connect-to-truenas-api)
+  - [API Rate Limiting](#api-rate-limiting)
+- [iSCSI Discovery and Connection Issues](#iscsi-discovery-and-connection-issues)
+  - ["Could not discover iSCSI targets"](#could-not-discover-iscsi-targets)
+  - ["Could not resolve iSCSI target ID for configured IQN"](#could-not-resolve-iscsi-target-id-for-configured-iqn)
+  - [iSCSI Session Issues](#iscsi-session-issues)
+- [Volume Creation Issues](#volume-creation-issues)
+  - ["Failed to create iSCSI extent for disk"](#failed-to-create-iscsi-extent-for-disk)
+  - ["Insufficient space on dataset"](#insufficient-space-on-dataset)
+  - ["Unable to find free disk name after 1000 attempts"](#unable-to-find-free-disk-name-after-1000-attempts)
+  - ["Volume created but device not accessible after 10 seconds"](#volume-created-but-device-not-accessible-after-10-seconds)
+- [VM Deletion Issues](#vm-deletion-issues)
+  - [Orphaned Volumes After VM Deletion](#orphaned-volumes-after-vm-deletion)
+  - [Warnings During VM Deletion](#warnings-during-vm-deletion)
+- [Snapshot Issues](#snapshot-issues)
+  - [Snapshot Creation Fails](#snapshot-creation-fails)
+  - [Snapshot Rollback Fails](#snapshot-rollback-fails)
+- [Performance Issues](#performance-issues)
+  - [Slow VM Disk Performance](#slow-vm-disk-performance)
+  - [Slow Multipath Read Performance](#slow-multipath-read-performance)
+  - [Slow VM Cloning](#slow-vm-cloning)
+- [Cluster-Specific Issues](#cluster-specific-issues)
+  - [Storage Not Shared Across Nodes](#storage-not-shared-across-nodes)
+  - [VM Migration Fails](#vm-migration-fails)
+- [Log Files and Debugging](#log-files-and-debugging)
+  - [Proxmox Logs](#proxmox-logs)
+  - [TrueNAS Logs](#truenas-logs)
+  - [Storage Diagnostics](#storage-diagnostics)
+  - [Enable Debug Logging](#enable-debug-logging)
+- [Getting Help](#getting-help)
+
+---
+
 ## About Plugin Error Messages
 
 **The plugin provides enhanced error messages** with built-in troubleshooting guidance. When an error occurs, the plugin includes:
@@ -605,6 +644,69 @@ ip link show eth1
 # Use dedicated 10GbE network for iSCSI
 # Configure VLANs to isolate storage traffic
 ```
+
+### Slow Multipath Read Performance
+
+**Symptom**: Read performance with multipath is lower than expected, even though both paths are configured correctly
+
+**Observed Behavior**:
+- Write speeds: ~100-110 MB/s (both paths utilized) ✅
+- Sequential read speeds: ~50-100 MB/s (lower than expected) ⚠️
+- Network monitoring shows both interfaces active during reads
+- Multipath configuration appears correct
+
+**Root Cause**:
+This is a **known limitation** of TrueNAS SCALE's iSCSI implementation. The `MaxOutstandingR2T` parameter is hardcoded to `1`, which limits read parallelism across multiple paths.
+
+**Verification**:
+```bash
+# Check iSCSI session parameters
+iscsiadm -m session -P 3 | grep MaxOutstandingR2T
+
+# You'll see:
+# MaxOutstandingR2T: 1
+
+# Verify multipath is working (both paths should be active)
+multipath -ll
+
+# Check actual I/O distribution (both paths should show activity)
+grep -E '(sdX|sdY)' /proc/diskstats  # Before test
+# Run read test
+grep -E '(sdX|sdY)' /proc/diskstats  # After test
+# Both paths should show increased read sectors
+```
+
+**Important**:
+- This is **NOT a configuration error** - your multipath setup is working correctly
+- Both paths ARE being used, they just can't operate fully in parallel for reads
+- Write performance is not affected by this limitation
+
+**Solutions**:
+
+#### 1. Upgrade to 10GbE (Recommended)
+```bash
+# Single 10GbE path provides ~1000 MB/s
+# Eliminates the bottleneck entirely
+# Best long-term solution
+```
+
+#### 2. Accept Current Performance
+- ~100 MB/s read is reasonable for many workloads
+- Real-world applications with multiple VMs perform better than single-threaded benchmarks
+- Most production workloads issue parallel I/O naturally
+
+#### 3. Test with Parallel I/O
+```bash
+# Verify performance improves with parallel workloads
+fio --name=parallel-read --filename=/dev/mapper/mpathX \
+    --rw=read --bs=1M --size=2G --numjobs=4 --iodepth=16 \
+    --direct=1 --ioengine=libaio --runtime=30 --time_based --group_reporting
+
+# Should show better performance (~100-110 MB/s)
+```
+
+**For More Information**:
+See [Known Limitations - Multipath Read Performance](Known-Limitations.md#multipath-read-performance-limitation) for detailed explanation, technical details, and additional workarounds.
 
 ### Slow VM Cloning
 
