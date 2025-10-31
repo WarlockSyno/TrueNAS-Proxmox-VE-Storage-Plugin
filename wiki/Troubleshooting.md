@@ -117,9 +117,6 @@ perl -c /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
 
 **Common Messages**:
 ```bash
-ERROR: Required dependency 'jq' not found
-Please install: apt-get install jq
-
 ERROR: Required dependency 'curl' or 'wget' not found
 Please install: apt-get install curl wget
 
@@ -133,18 +130,16 @@ Please install: apt-get install perl
 apt-get update
 
 # Install all common dependencies
-apt-get install curl wget jq perl
+apt-get install curl wget perl
 
 # For minimal systems, install just what's needed
-apt-get install jq  # JSON parsing (required)
-
 # Either curl or wget (at least one required)
 apt-get install curl
 # OR
 apt-get install wget
 
 # Verify installations
-which jq curl wget perl
+which curl wget perl
 
 # Run installer again
 ./install.sh

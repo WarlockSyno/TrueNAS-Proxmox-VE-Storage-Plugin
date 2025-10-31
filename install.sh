@@ -382,11 +382,6 @@ check_dependencies() {
         missing_deps+=("wget or curl")
     fi
 
-    # Check for jq (needed for GitHub API)
-    if ! command -v jq >/dev/null 2>&1; then
-        missing_deps+=("jq")
-    fi
-
     # Check other dependencies
     for dep in "${deps[@]}"; do
         if ! command -v "$dep" >/dev/null 2>&1; then
@@ -661,9 +656,9 @@ github_api_call() {
     }
 
     # Check for rate limiting
-    if echo "$response" | jq -e '.message' >/dev/null 2>&1; then
+    if echo "$response" | grep -q '"message"'; then
         local message
-        message=$(echo "$response" | jq -r '.message')
+        message=$(echo "$response" | grep -Po '"message":\s*"\K[^"]+')
         if [[ "$message" == *"rate limit"* ]]; then
             error "GitHub API rate limit exceeded. Please try again later."
             log "ERROR" "GitHub API rate limit exceeded"
@@ -700,7 +695,7 @@ get_all_releases() {
 # Extract version from release data
 get_release_version() {
     local release_data="$1"
-    echo "$release_data" | jq -r '.tag_name' | sed 's/^v//'
+    echo "$release_data" | grep -Po '"tag_name":\s*"\K[^"]+' | sed 's/^v//'
 }
 
 # Get download URL for plugin file from release
@@ -709,12 +704,28 @@ get_plugin_download_url() {
     local plugin_url
 
     # Try to find TrueNASPlugin.pm in assets
-    plugin_url=$(echo "$release_data" | jq -r '.assets[] | select(.name == "TrueNASPlugin.pm") | .browser_download_url' 2>/dev/null)
+    # Extract the assets array and search for matching name
+    plugin_url=""
+    local assets_section
+    assets_section=$(echo "$release_data" | grep -Pzo '(?s)"assets":\s*\[.*?\]' | tr -d '\0')
+
+    if [[ -n "$assets_section" ]]; then
+        # Split assets into individual objects and search for TrueNASPlugin.pm
+        while IFS= read -r asset_line; do
+            if echo "$asset_line" | grep -q '"name":\s*"TrueNASPlugin\.pm"'; then
+                # Found the matching asset, extract the browser_download_url
+                local context_lines
+                context_lines=$(echo "$assets_section" | grep -A 10 '"name":\s*"TrueNASPlugin\.pm"')
+                plugin_url=$(echo "$context_lines" | grep -Po '"browser_download_url":\s*"\K[^"]+' | head -1)
+                break
+            fi
+        done < <(echo "$assets_section" | grep -o '"name":\s*"[^"]*"')
+    fi
 
     if [[ -z "$plugin_url" || "$plugin_url" == "null" ]]; then
         # Fallback to raw GitHub URL
         local tag_name
-        tag_name=$(echo "$release_data" | jq -r '.tag_name')
+        tag_name=$(echo "$release_data" | grep -Po '"tag_name":\s*"\K[^"]+')
         plugin_url="https://raw.githubusercontent.com/${GITHUB_REPO}/${tag_name}/TrueNASPlugin.pm"
     fi
 
@@ -1392,10 +1403,17 @@ menu_view_versions() {
     }
 
     echo
-    echo "$releases" | jq -r '.[] | "  • v" + (.tag_name | ltrimstr("v")) + " - " + .name + " (" + (.published_at | split("T")[0]) + ")"' | head -20
+    echo "$releases" | grep -Po '"tag_name":\s*"\K[^"]+' | head -20 | while IFS= read -r tag; do
+        # Extract corresponding name and date for this release
+        release_block=$(echo "$releases" | grep -A 5 "\"tag_name\":\s*\"$tag\"")
+        name=$(echo "$release_block" | grep -Po '"name":\s*"\K[^"]+' | head -1)
+        date=$(echo "$release_block" | grep -Po '"published_at":\s*"\K[^T]+' | head -1)
+        version="${tag#v}"
+        echo "  • v$version - $name ($date)"
+    done
     echo
 
-    if [[ $(echo "$releases" | jq '. | length') -gt 20 ]]; then
+    if [[ $(echo "$releases" | grep -o '"tag_name"' | wc -l) -gt 20 ]]; then
         info "Showing latest 20 releases. Visit GitHub for full list."
     fi
 
@@ -1685,7 +1703,7 @@ menu_install_specific_version() {
 
     echo
     echo "Available versions:"
-    echo "$releases" | jq -r '.[] | "  • v" + (.tag_name | ltrimstr("v"))' | head -20
+    echo "$releases" | grep -Po '"tag_name":\s*"\K[^"]+' | sed 's/^v//' | head -20 | sed 's/^/  • v/'
     echo
 
     read -rp "Enter version number (e.g., 1.0.7): " version
@@ -1783,9 +1801,9 @@ test_truenas_api() {
 
     stop_spinner
     echo ""
-    if [[ -n "$response" ]] && echo "$response" | jq -e '.version' >/dev/null 2>&1; then
+    if [[ -n "$response" ]] && echo "$response" | grep -q '"version"'; then
         local version
-        version=$(echo "$response" | jq -r '.version' 2>/dev/null)
+        version=$(echo "$response" | grep -Po '"version":\s*"\K[^"]+' 2>/dev/null)
         success "Connected to TrueNAS successfully (version: $version)"
         return 0
     else
@@ -1824,7 +1842,7 @@ verify_dataset() {
 
     stop_spinner
     echo ""
-    if [[ -n "$response" ]] && echo "$response" | jq -e '.[0].id' >/dev/null 2>&1; then
+    if [[ -n "$response" ]] && echo "$response" | grep -Eq '\[\s*\{[^}]*"id"'; then
         success "Dataset '$dataset' verified"
         return 0
     else
