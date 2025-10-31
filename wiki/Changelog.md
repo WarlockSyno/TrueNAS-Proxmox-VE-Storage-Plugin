@@ -28,7 +28,7 @@
 
 ### ✅ **Validation**
 Tested with multiple blocksize configurations:
-- 16K blocksize: 528 KiB → 544 KiB (aligned to 16K × 33)
+- 16K blocksize: 528 KiB → 528 KiB (already aligned, 16K × 33)
 - 64K blocksize: 528 KiB → 576 KiB (aligned to 64K × 9)
 - 128K blocksize: 528 KiB → 640 KiB (aligned to 128K × 5)
 
