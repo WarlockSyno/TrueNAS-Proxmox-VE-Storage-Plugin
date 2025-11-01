@@ -655,14 +655,18 @@ github_api_call() {
         return 1
     }
 
-    # Check for rate limiting
-    if echo "$response" | grep -q '"message"'; then
-        local message
-        message=$(echo "$response" | grep -Po '"message":\s*"\K[^"]+')
-        if [[ "$message" == *"rate limit"* ]]; then
-            error "GitHub API rate limit exceeded. Please try again later."
-            log "ERROR" "GitHub API rate limit exceeded"
-            return 1
+    # Check for rate limiting - only check message field if response lacks expected success fields
+    # GitHub success responses have tag_name, assets, etc. Error responses have message field.
+    if ! echo "$response" | grep -q '"tag_name"\|"assets"\|"version"'; then
+        # This looks like an error response, check for rate limit message
+        if echo "$response" | grep -q '"message"'; then
+            local message
+            message=$(echo "$response" | grep -Po '"message":\s*"\K[^"]+')
+            if [[ "$message" == *"rate limit"* ]]; then
+                error "GitHub API rate limit exceeded. Please try again later."
+                log "ERROR" "GitHub API rate limit exceeded"
+                return 1
+            fi
         fi
     fi
 
@@ -704,22 +708,15 @@ get_plugin_download_url() {
     local plugin_url
 
     # Try to find TrueNASPlugin.pm in assets
-    # Extract the assets array and search for matching name
+    # Use sed to extract assets section more reliably than grep -Pzo
     plugin_url=""
-    local assets_section
-    assets_section=$(echo "$release_data" | grep -Pzo '(?s)"assets":\s*\[.*?\]' | tr -d '\0')
 
-    if [[ -n "$assets_section" ]]; then
-        # Split assets into individual objects and search for TrueNASPlugin.pm
-        while IFS= read -r asset_line; do
-            if echo "$asset_line" | grep -q '"name":\s*"TrueNASPlugin\.pm"'; then
-                # Found the matching asset, extract the browser_download_url
-                local context_lines
-                context_lines=$(echo "$assets_section" | grep -A 10 '"name":\s*"TrueNASPlugin\.pm"')
-                plugin_url=$(echo "$context_lines" | grep -Po '"browser_download_url":\s*"\K[^"]+' | head -1)
-                break
-            fi
-        done < <(echo "$assets_section" | grep -o '"name":\s*"[^"]*"')
+    # Check if the asset exists and extract its download URL
+    if echo "$release_data" | grep -q '"name":\s*"TrueNASPlugin\.pm"'; then
+        # Found the matching asset, extract the browser_download_url from context
+        local context_lines
+        context_lines=$(echo "$release_data" | grep -A 10 '"name":\s*"TrueNASPlugin\.pm"')
+        plugin_url=$(echo "$context_lines" | grep -Po '"browser_download_url":\s*"\K[^"]+' | head -1)
     fi
 
     if [[ -z "$plugin_url" || "$plugin_url" == "null" ]]; then
@@ -1842,7 +1839,7 @@ verify_dataset() {
 
     stop_spinner
     echo ""
-    if [[ -n "$response" ]] && echo "$response" | grep -Eq '\[\s*\{[^}]*"id"'; then
+    if [[ -n "$response" ]] && echo "$response" | grep -Eq '\[\s*\{[^}]*"id"\s*:\s*"[^"]+"\s*[,}]'; then
         success "Dataset '$dataset' verified"
         return 0
     else
