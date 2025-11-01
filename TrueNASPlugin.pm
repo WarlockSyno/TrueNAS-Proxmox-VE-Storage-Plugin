@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '1.0.8';
+our $VERSION = '1.1.0';
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -119,6 +119,19 @@ sub _log {
     return if $level > $debug_level;
 
     syslog($priority, $message);
+}
+
+# Normalize blocksize to uppercase format required by TrueNAS 25.10+
+# Converts: 16k -> 16K, 128k -> 128K, etc.
+# TrueNAS 25.10 requires: '512', '512B', '1K', '2K', '4K', '8K', '16K', '32K', '64K', '128K'
+sub _normalize_blocksize {
+    my ($blocksize) = @_;
+    return undef if !defined $blocksize;
+
+    # Convert to uppercase (16k -> 16K, 64k -> 64K, etc.)
+    $blocksize = uc($blocksize);
+
+    return $blocksize;
 }
 
 # ======== Retry logic with exponential backoff ========
@@ -269,10 +282,20 @@ sub properties {
             type => 'string', optional => 1,
         },
 
+        # Transport mode selection
+        transport_mode => {
+            description => "Storage transport protocol: 'iscsi' or 'nvme-tcp'.",
+            type => 'string',
+            enum => ['iscsi', 'nvme-tcp'],
+            optional => 1,
+            default => 'iscsi',
+        },
+
         # iSCSI target & portals
         target_iqn => {
-            description => "Shared iSCSI Target IQN on TrueNAS (or target's short name).",
+            description => "Shared iSCSI Target IQN on TrueNAS (or target's short name) - required for iSCSI transport.",
             type => 'string',
+            optional => 1,
         },
         discovery_portal => {
             description => "Primary SendTargets portal (IP[:port] or [IPv6]:port).",
@@ -307,9 +330,31 @@ sub properties {
             type => 'integer', optional => 1, default => 0, minimum => 0, maximum => 2,
         },
 
-        # CHAP (optional)
+        # CHAP (optional - iSCSI only)
         chap_user     => { type => 'string', optional => 1 },
         chap_password => { type => 'string', optional => 1 },
+
+        # NVMe/TCP parameters
+        subsystem_nqn => {
+            description => "NVMe subsystem NQN - required for nvme-tcp transport.",
+            type => 'string',
+            optional => 1,
+        },
+        hostnqn => {
+            description => "NVMe host NQN (optional, auto-generated from /etc/nvme/hostnqn if not specified).",
+            type => 'string',
+            optional => 1,
+        },
+        nvme_dhchap_secret => {
+            description => "DH-HMAC-CHAP host authentication key (format: DHHC-1:01:...) - optional.",
+            type => 'string',
+            optional => 1,
+        },
+        nvme_dhchap_ctrl_secret => {
+            description => "DH-HMAC-CHAP controller authentication key for bidirectional auth - optional.",
+            type => 'string',
+            optional => 1,
+        },
 
         # Thin provisioning toggle (maps to TrueNAS sparse)
         tn_sparse => {
@@ -371,9 +416,12 @@ sub options {
         dataset        => { fixed => 1 },
         zvol_blocksize => { optional => 1, fixed => 1 },
 
-        # Target & portals
-        target_iqn             => { fixed => 1 },
-        discovery_portal       => { fixed => 1 },
+        # Transport mode
+        transport_mode => { optional => 1, fixed => 1 },
+
+        # iSCSI target & portals
+        target_iqn             => { optional => 1, fixed => 1 },
+        discovery_portal       => { optional => 1, fixed => 1 },
         portals                => { optional => 1 },
         force_delete_on_inuse  => { optional => 1 },
         logout_on_free         => { optional => 1 },
@@ -383,9 +431,15 @@ sub options {
         use_by_path   => { optional => 1 },
         ipv6_by_path  => { optional => 1 },
 
-        # CHAP
+        # CHAP (iSCSI)
         chap_user     => { optional => 1 },
         chap_password => { optional => 1 },
+
+        # NVMe/TCP parameters
+        subsystem_nqn          => { optional => 1, fixed => 1 },
+        hostnqn                => { optional => 1 },
+        nvme_dhchap_secret     => { optional => 1 },
+        nvme_dhchap_ctrl_secret => { optional => 1 },
 
         # Thin toggle
         tn_sparse => { optional => 1 },
@@ -412,7 +466,7 @@ sub check_config {
     my ($class, $sectionId, $config, $create, $skipSchemaCheck) = @_;
     my $opts = $class->SUPER::check_config($sectionId, $config, $create, $skipSchemaCheck);
 
-    # Always set shared=1 since this is iSCSI-based shared storage
+    # Always set shared=1 since this is block-based shared storage (iSCSI or NVMe/TCP)
     $opts->{shared} = 1;
 
     # Validate retry configuration parameters
@@ -481,8 +535,66 @@ sub check_config {
     if (!$opts->{dataset}) {
         die "dataset is required\n";
     }
-    if (!$opts->{target_iqn}) {
-        die "target_iqn is required\n";
+
+    # Validate transport mode and transport-specific parameters
+    my $mode = $opts->{transport_mode} // 'iscsi';
+
+    if ($mode eq 'iscsi') {
+        # iSCSI mode requires target_iqn and discovery_portal
+        if (!$opts->{target_iqn}) {
+            die "target_iqn is required for iSCSI transport\n";
+        }
+        if (!$opts->{discovery_portal}) {
+            die "discovery_portal is required for iSCSI transport\n";
+        }
+
+        # Warn if NVMe-specific parameters are set in iSCSI mode
+        if ($opts->{subsystem_nqn}) {
+            syslog('warning',
+                "Storage '$sectionId': subsystem_nqn is ignored in iSCSI mode"
+            );
+        }
+        if ($opts->{hostnqn}) {
+            syslog('warning',
+                "Storage '$sectionId': hostnqn is ignored in iSCSI mode"
+            );
+        }
+
+    } elsif ($mode eq 'nvme-tcp') {
+        # NVMe/TCP mode requires subsystem_nqn
+        if (!$opts->{subsystem_nqn}) {
+            die "subsystem_nqn is required for nvme-tcp transport\n";
+        }
+
+        # Validate NQN format (basic check)
+        if ($opts->{subsystem_nqn} !~ /^nqn\.\d{4}-\d{2}\./) {
+            die "subsystem_nqn must follow NVMe NQN format (e.g., nqn.2005-10.org.example:identifier)\n";
+        }
+
+        # Validate hostnqn format if provided
+        if ($opts->{hostnqn} && $opts->{hostnqn} !~ /^nqn\./) {
+            die "hostnqn must follow NVMe NQN format\n";
+        }
+
+        # Warn if iSCSI-specific parameters are set in NVMe mode
+        if ($opts->{target_iqn}) {
+            syslog('warning',
+                "Storage '$sectionId': target_iqn is ignored in nvme-tcp mode"
+            );
+        }
+        if ($opts->{chap_user} || $opts->{chap_password}) {
+            syslog('warning',
+                "Storage '$sectionId': CHAP parameters are ignored in nvme-tcp mode (use nvme_dhchap_secret instead)"
+            );
+        }
+        if ($opts->{use_by_path}) {
+            syslog('warning',
+                "Storage '$sectionId': use_by_path is ignored in nvme-tcp mode (UUID paths used)"
+            );
+        }
+
+    } else {
+        die "Invalid transport_mode '$mode': must be 'iscsi' or 'nvme-tcp'\n";
     }
 
     return $opts;
@@ -1115,7 +1227,10 @@ sub _tn_dataset_create($scfg, $full, $size_kib, $blocksize) {
         volsize=> $bytes,
         sparse => ($scfg->{tn_sparse} // 1) ? JSON::PP::true : JSON::PP::false,
     };
-    $payload->{volblocksize} = $blocksize if $blocksize;
+    # Normalize blocksize to uppercase for TrueNAS 25.10+ compatibility
+    if ($blocksize) {
+        $payload->{volblocksize} = _normalize_blocksize($blocksize);
+    }
     return _api_call($scfg, 'pool.dataset.create', [ $payload ],
         sub { _rest_call($scfg, 'POST', '/pool/dataset', $payload) }
     );
@@ -1355,10 +1470,24 @@ sub volume_resize {
         sub { _rest_call($scfg, 'PUT', "/pool/dataset/id/$id", $payload) },
     );
 
-    # Initiator-side rescan so Linux + multipath see the new size
-    _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed");
-    if ($scfg->{use_multipath}) {
-        _try_run(['multipath','-r'], "multipath map reload failed");
+    # Initiator-side rescan so Linux sees the new size (transport-specific)
+    my $mode = $scfg->{transport_mode} // 'iscsi';
+    if ($mode eq 'iscsi') {
+        _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed");
+        if ($scfg->{use_multipath}) {
+            _try_run(['multipath','-r'], "multipath map reload failed");
+        }
+    } elsif ($mode eq 'nvme-tcp') {
+        # NVMe namespace size updates automatically when zvol is resized
+        # Trigger device rescan to ensure kernel sees updated size
+        my $nqn = $scfg->{subsystem_nqn};
+        eval {
+            _try_run(['nvme', 'ns-rescan', '-n', $nqn], "nvme namespace rescan failed");
+        };
+        # Fallback: rescan all NVMe controllers if specific rescan fails
+        if ($@) {
+            eval { _try_run(['nvme', 'ns-rescan', '/dev/nvme0'], "nvme rescan failed"); };
+        }
     }
     run_command(['udevadm','settle'], outfunc => sub {});
     select(undef, undef, undef, 0.25); # ~250ms
@@ -1574,6 +1703,7 @@ sub _preflight_check_alloc {
     my ($scfg, $size_bytes) = @_;
 
     my @errors;
+    my $mode = $scfg->{transport_mode} // 'iscsi';
 
     # Check 1: TrueNAS API is reachable
     eval {
@@ -1584,24 +1714,45 @@ sub _preflight_check_alloc {
         push @errors, "TrueNAS API is unreachable: $@";
     }
 
-    # Check 2: iSCSI service is running
-    eval {
-        my $services = _api_call($scfg, 'service.query',
-            [[ ["service", "=", "iscsitarget"] ]],
-            sub { _rest_call($scfg, 'GET', '/service?service=iscsitarget') });
+    # Check 2: Service is running (transport-specific)
+    if ($mode eq 'iscsi') {
+        eval {
+            my $services = _api_call($scfg, 'service.query',
+                [[ ["service", "=", "iscsitarget"] ]],
+                sub { _rest_call($scfg, 'GET', '/service?service=iscsitarget') });
 
-        if (!$services || !@$services) {
-            push @errors, "Unable to query iSCSI service status";
-        } elsif ($services->[0]->{state} ne 'RUNNING') {
-            push @errors, sprintf(
-                "TrueNAS iSCSI service is not running (state: %s)\n" .
-                "  Start the service in TrueNAS: System Settings > Services > iSCSI",
-                $services->[0]->{state} // 'UNKNOWN'
-            );
+            if (!$services || !@$services) {
+                push @errors, "Unable to query iSCSI service status";
+            } elsif ($services->[0]->{state} ne 'RUNNING') {
+                push @errors, sprintf(
+                    "TrueNAS iSCSI service is not running (state: %s)\n" .
+                    "  Start the service in TrueNAS: System Settings > Services > iSCSI",
+                    $services->[0]->{state} // 'UNKNOWN'
+                );
+            }
+        };
+        if ($@) {
+            push @errors, "Cannot verify iSCSI service status: $@";
         }
-    };
-    if ($@) {
-        push @errors, "Cannot verify iSCSI service status: $@";
+    } elsif ($mode eq 'nvme-tcp') {
+        eval {
+            my $services = _api_call($scfg, 'service.query',
+                [[ ["service", "=", "nvmet"] ]],
+                sub { die "REST API not supported for NVMe-oF operations\n"; });
+
+            if (!$services || !@$services) {
+                push @errors, "Unable to query NVMe-oF service status";
+            } elsif ($services->[0]->{state} ne 'RUNNING') {
+                push @errors, sprintf(
+                    "TrueNAS NVMe-oF service is not running (state: %s)\n" .
+                    "  Start the service in TrueNAS: System Settings > Services > NVMe-oF Target",
+                    $services->[0]->{state} // 'UNKNOWN'
+                );
+            }
+        };
+        if ($@) {
+            push @errors, "Cannot verify NVMe-oF service status: $@";
+        }
     }
 
     # Check 3: Sufficient space available (with 20% overhead)
@@ -1636,20 +1787,23 @@ sub _preflight_check_alloc {
         }
     }
 
-    # Check 4: iSCSI target exists and is configured
-    eval {
-        my $target_id = _resolve_target_id($scfg);
-        if (!defined $target_id) {
-            push @errors, sprintf(
-                "iSCSI target not found: %s\n" .
-                "  Verify target exists in TrueNAS: Shares > Block Shares (iSCSI) > Targets",
-                $scfg->{target_iqn}
-            );
+    # Check 4: Target/subsystem exists and is configured (transport-specific)
+    if ($mode eq 'iscsi') {
+        eval {
+            my $target_id = _resolve_target_id($scfg);
+            if (!defined $target_id) {
+                push @errors, sprintf(
+                    "iSCSI target not found: %s\n" .
+                    "  Verify target exists in TrueNAS: Shares > Block Shares (iSCSI) > Targets",
+                    $scfg->{target_iqn}
+                );
+            }
+        };
+        if ($@) {
+            push @errors, "Cannot verify iSCSI target: $@";
         }
-    };
-    if ($@) {
-        push @errors, "Cannot verify iSCSI target: $@";
     }
+    # NVMe subsystem validation is done during activation, not pre-flight
 
     # Check 5: Parent dataset exists
     eval {
@@ -1966,43 +2120,378 @@ sub _zvol_name($vmid, $name) {
     return "vm-$vmid-$name";
 }
 
+# ======== NVMe/TCP Helper Functions ========
+
+# Get or read host NQN from /etc/nvme/hostnqn
+sub _nvme_get_hostnqn {
+    my ($scfg) = @_;
+
+    # If explicitly configured, use that
+    return $scfg->{hostnqn} if $scfg->{hostnqn};
+
+    # Otherwise read from /etc/nvme/hostnqn
+    my $hostnqn_file = '/etc/nvme/hostnqn';
+    if (-f $hostnqn_file) {
+        if (open my $fh, '<', $hostnqn_file) {
+            my $nqn = <$fh>;
+            close $fh;
+            chomp $nqn if $nqn;
+            return $nqn if $nqn;
+        }
+    }
+
+    die "Could not determine host NQN: /etc/nvme/hostnqn not found and hostnqn not configured\n";
+}
+
+# Check if nvme-cli is installed
+sub _nvme_check_cli {
+    eval {
+        run_command(['nvme', 'version'], outfunc => sub {}, errfunc => sub {});
+    };
+    if ($@) {
+        die "nvme-cli is not installed. Please install it: apt-get install nvme-cli\n";
+    }
+}
+
+# Parse portal string into (host, port)
+sub _nvme_parse_portal {
+    my ($portal) = @_;
+
+    # Handle IPv6: [addr]:port or addr:port
+    if ($portal =~ /^\[([^\]]+)\]:(\d+)$/) {
+        return ($1, $2);
+    } elsif ($portal =~ /^([^:]+):(\d+)$/) {
+        return ($1, $2);
+    } elsif ($portal =~ /^\[([^\]]+)\]$/) {
+        return ($1, 4420);  # Default NVMe/TCP port
+    } else {
+        return ($portal, 4420);
+    }
+}
+
+# Check if connected to a subsystem
+sub _nvme_is_connected {
+    my ($scfg) = @_;
+    my $nqn = $scfg->{subsystem_nqn};
+
+    my $connected = 0;
+    eval {
+        run_command(['nvme', 'list-subsys'],
+            outfunc => sub {
+                my $line = shift;
+                $connected = 1 if $line =~ /\Q$nqn\E/;
+            },
+            errfunc => sub {}
+        );
+    };
+
+    return $connected;
+}
+
+# Connect to NVMe/TCP subsystem (all portals)
+sub _nvme_connect {
+    my ($scfg) = @_;
+
+    _log($scfg, 1, 'info', "nvme_connect: connecting to subsystem $scfg->{subsystem_nqn}");
+
+    # Check if already connected
+    return if _nvme_is_connected($scfg);
+
+    my $nqn = $scfg->{subsystem_nqn};
+    my @portals = ();
+
+    # Primary portal
+    push @portals, $scfg->{discovery_portal} if $scfg->{discovery_portal};
+
+    # Additional portals
+    if ($scfg->{portals}) {
+        push @portals, split(/\s*,\s*/, $scfg->{portals});
+    }
+
+    die "No portals configured for NVMe/TCP storage\n" unless @portals;
+
+    my $hostnqn = _nvme_get_hostnqn($scfg);
+    my $connected_count = 0;
+
+    for my $portal (@portals) {
+        my ($host, $port) = _nvme_parse_portal($portal);
+
+        _log($scfg, 2, 'debug', "nvme_connect: connecting to $host:$port");
+
+        my @cmd = ('nvme', 'connect', '-t', 'tcp', '-n', $nqn, '-a', $host, '-s', $port);
+
+        # Add host NQN if not default
+        push @cmd, '--hostnqn', $hostnqn if $hostnqn;
+
+        # Add DH-HMAC-CHAP authentication if configured
+        if ($scfg->{nvme_dhchap_secret}) {
+            push @cmd, '--dhchap-secret', $scfg->{nvme_dhchap_secret};
+        }
+        if ($scfg->{nvme_dhchap_ctrl_secret}) {
+            push @cmd, '--dhchap-ctrl-secret', $scfg->{nvme_dhchap_ctrl_secret};
+        }
+
+        eval {
+            run_command(\@cmd,
+                outfunc => sub { _log($scfg, 2, 'debug', "nvme connect: " . shift); },
+                errfunc => sub { _log($scfg, 1, 'warning', "nvme connect error: " . shift); }
+            );
+            $connected_count++;
+        };
+        if ($@) {
+            # Log warning but continue - may already be connected or portal unreachable
+            _log($scfg, 1, 'warning', "Failed to connect to portal $portal: $@");
+        }
+    }
+
+    die "Failed to connect to any NVMe/TCP portal for subsystem $nqn\n" if $connected_count == 0;
+
+    # Wait for devices to settle
+    run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {});
+    usleep(250_000);
+
+    _log($scfg, 1, 'info', "nvme_connect: connected to $connected_count portal(s)");
+}
+
+# Disconnect from NVMe/TCP subsystem
+sub _nvme_disconnect {
+    my ($scfg) = @_;
+    my $nqn = $scfg->{subsystem_nqn};
+
+    _log($scfg, 1, 'info', "nvme_disconnect: disconnecting from subsystem $nqn");
+
+    eval {
+        run_command(['nvme', 'disconnect', '-n', $nqn],
+            outfunc => sub { _log($scfg, 2, 'debug', "nvme disconnect: " . shift); },
+            errfunc => sub {}
+        );
+    };
+    if ($@) {
+        _log($scfg, 1, 'warning', "nvme_disconnect: $@");
+    }
+}
+
+# Get device path for namespace by UUID
+sub _nvme_device_for_uuid {
+    my ($scfg, $device_uuid) = @_;
+
+    my $uuid_path = "/dev/disk/by-id/nvme-uuid.$device_uuid";
+
+    # Wait for device to appear (up to 5 seconds)
+    for (my $i = 0; $i < 50; $i++) {
+        if (-e $uuid_path) {
+            _log($scfg, 2, 'debug', "nvme_device_for_uuid: found device at $uuid_path");
+            return $uuid_path;
+        }
+
+        # Trigger udev settle periodically
+        if ($i == 10 || $i == 25 || $i == 40) {
+            run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {});
+        }
+
+        usleep(100_000);  # 100ms
+    }
+
+    die "Could not locate NVMe device for UUID $device_uuid at $uuid_path\n";
+}
+
+# Ensure NVMe subsystem exists on TrueNAS
+sub _nvme_ensure_subsystem {
+    my ($scfg) = @_;
+    my $nqn = $scfg->{subsystem_nqn};
+
+    _log($scfg, 2, 'debug', "nvme_ensure_subsystem: checking for subsystem $nqn");
+
+    # Query existing subsystems
+    my $subsystems = _api_call($scfg, 'nvmet.subsys.query', [
+        [["subnqn", "=", $nqn]]
+    ], sub { die "REST API not supported for NVMe-oF operations\n"; });
+
+    if ($subsystems && @$subsystems) {
+        my $subsys = $subsystems->[0];
+        _log($scfg, 2, 'debug', "nvme_ensure_subsystem: subsystem exists with id=$subsys->{id}");
+        return $subsys->{id};
+    }
+
+    # Create subsystem if it doesn't exist
+    _log($scfg, 1, 'info', "nvme_ensure_subsystem: creating subsystem $nqn");
+
+    # Generate short name from NQN (last part after :)
+    my $name = $nqn;
+    $name = $1 if $nqn =~ /:([^:]+)$/;
+    $name =~ s/[^a-zA-Z0-9_\-]/_/g;
+
+    # TrueNAS 25.10+ no longer accepts serial parameter in subsystem creation
+    my $subsys = _api_call($scfg, 'nvmet.subsys.create', [{
+        name => $name,
+        subnqn => $nqn,
+        allow_any_host => JSON::PP::true,  # TODO: Make configurable for auth
+    }], sub { die "REST API not supported for NVMe-oF operations\n"; });
+
+    my $subsys_id = ref($subsys) eq 'HASH' ? $subsys->{id} : $subsys;
+
+    # Create ports for all configured portals
+    my @portals = ();
+    push @portals, $scfg->{discovery_portal} if $scfg->{discovery_portal};
+    push @portals, split(/\s*,\s*/, $scfg->{portals}) if $scfg->{portals};
+
+    for my $portal (@portals) {
+        my ($host, $port) = _nvme_parse_portal($portal);
+
+        _log($scfg, 2, 'debug', "nvme_ensure_subsystem: creating port for $host:$port");
+
+        eval {
+            _api_call($scfg, 'nvmet.port.create', [{
+                subsys_id => $subsys_id,
+                trtype => 'TCP',
+                traddr => $host,
+                trsvcid => "$port",  # Must be string
+            }], sub { die "REST API not supported for NVMe-oF operations\n"; });
+        };
+        if ($@) {
+            _log($scfg, 1, 'warning', "Failed to create port for $portal: $@");
+        }
+    }
+
+    _log($scfg, 1, 'info', "nvme_ensure_subsystem: created subsystem with id=$subsys_id");
+    return $subsys_id;
+}
+
+# Create NVMe namespace for a zvol
+sub _nvme_create_namespace {
+    my ($scfg, $zname, $full_ds, $zvol_path) = @_;
+
+    _log($scfg, 1, 'info', "nvme_create_namespace: creating namespace for $zname");
+
+    # Ensure subsystem exists
+    my $subsys_id = _nvme_ensure_subsystem($scfg);
+
+    # Create namespace
+    my $ns = _api_call($scfg, 'nvmet.namespace.create', [{
+        device_type => 'ZVOL',
+        device_path => $zvol_path,  # Already has 'zvol/' prefix
+        subsys_id => $subsys_id,
+        enabled => JSON::PP::true,
+    }], sub { die "REST API not supported for NVMe-oF operations\n"; });
+
+    my $device_uuid = $ns->{device_uuid};
+    die "Failed to get device_uuid from namespace creation\n" unless $device_uuid;
+
+    _log($scfg, 1, 'info', "nvme_create_namespace: created namespace with UUID $device_uuid");
+
+    # Connect to subsystem if not already connected
+    _nvme_connect($scfg);
+
+    # Wait for device to appear
+    my $dev = _nvme_device_for_uuid($scfg, $device_uuid);
+    _log($scfg, 1, 'info', "nvme_create_namespace: device ready at $dev");
+
+    return $device_uuid;
+}
+
+# Delete NVMe namespace
+sub _nvme_delete_namespace {
+    my ($scfg, $zname, $full_ds) = @_;
+
+    _log($scfg, 1, 'info', "nvme_delete_namespace: deleting namespace for $zname");
+
+    # Get subsystem ID
+    my $nqn = $scfg->{subsystem_nqn};
+    my $subsystems = _api_call($scfg, 'nvmet.subsys.query', [
+        [["subnqn", "=", $nqn]]
+    ], sub { die "REST API not supported for NVMe-oF operations\n"; });
+
+    return unless $subsystems && @$subsystems;
+    my $subsys_id = $subsystems->[0]{id};
+
+    # Find namespace for this zvol
+    my $zvol_path = "zvol/$full_ds";
+    my $namespaces = _api_call($scfg, 'nvmet.namespace.query', [
+        [["subsys_id", "=", $subsys_id], ["device_path", "=", $zvol_path]]
+    ], sub { die "REST API not supported for NVMe-oF operations\n"; });
+
+    return unless $namespaces && @$namespaces;
+
+    for my $ns (@$namespaces) {
+        _log($scfg, 2, 'debug', "nvme_delete_namespace: deleting namespace id=$ns->{id}");
+        eval {
+            _api_call($scfg, 'nvmet.namespace.delete', [$ns->{id}],
+                sub { die "REST API not supported for NVMe-oF operations\n"; });
+        };
+        if ($@) {
+            _log($scfg, 1, 'warning', "Failed to delete namespace $ns->{id}: $@");
+        }
+    }
+}
+
 # ======== Required storage interface ========
-# volname format: vol-<zname>-lun<N>, where <zname> is usually vm-<vmid>-disk-<n>
+# volname format:
+#   iSCSI:    vol-<zname>-lun<N>, where <zname> is usually vm-<vmid>-disk-<n>
+#   NVMe/TCP: vol-<zname>-ns<uuid>, where uuid is the device_uuid from TrueNAS
 sub parse_volname {
     my ($class, $volname) = @_;
+
+    # iSCSI format: vol-<zname>-lun<N>
     if ($volname =~ m/^vol-([A-Za-z0-9:_\.\-]+)-lun(\d+)$/) {
         my ($zname, $lun) = ($1, $2);
         my $vmid;
         $vmid = $1 if $zname =~ m/^vm-(\d+)-/; # derive owner if named vm-<vmid>-...
         # return shape mimics other block plugins:
-        # ($vtype, $name, $vmid, $basename, $basevmid, $isBase, $format, $lun)
+        # ($vtype, $name, $vmid, $basename, $basevmid, $isBase, $format, $metadata)
+        # For iSCSI, metadata = lun number
         return ('images', $zname, $vmid, undef, undef, undef, 'raw', $lun);
     }
+
+    # NVMe format: vol-<zname>-ns<uuid>
+    if ($volname =~ m/^vol-([A-Za-z0-9:_\.\-]+)-ns([a-f0-9\-]+)$/) {
+        my ($zname, $uuid) = ($1, $2);
+        my $vmid;
+        $vmid = $1 if $zname =~ m/^vm-(\d+)-/; # derive owner if named vm-<vmid>-...
+        # For NVMe, metadata = device_uuid
+        return ('images', $zname, $vmid, undef, undef, undef, 'raw', $uuid);
+    }
+
     die "unable to parse volname '$volname'\n";
 }
 
 sub path {
     my ($class, $scfg, $volname, $storeid, $snapname) = @_;
     # Note: snapname is used during clone operations - we support snapshots via ZFS
-    my (undef, $zname, $vmid, undef, undef, undef, undef, $lun) = $class->parse_volname($volname);
-    _iscsi_login_all($scfg);
-    my $dev;
-    eval { $dev = _device_for_lun($scfg, $lun); };
-    if ($@ || !$dev) {
-        # try to re-resolve LUN mapping from TrueNAS
-        my $real_lun = eval { _current_lun_for_zname($scfg, $zname) };
-        if (defined $real_lun && (!defined($lun) || $real_lun != $lun)) {
-            $dev = _device_for_lun($scfg, $real_lun);
-            # (optional) carp "LUN changed for $zname: $lun -> $real_lun; resolved $dev";
-        } else {
-            die $@ if $@; # bubble up original cause
-            die "Could not locate device for LUN $lun (IQN $scfg->{target_iqn})\n";
+    my (undef, $zname, $vmid, undef, undef, undef, undef, $metadata) = $class->parse_volname($volname);
+
+    my $mode = $scfg->{transport_mode} // 'iscsi';
+
+    if ($mode eq 'iscsi') {
+        # iSCSI: metadata is LUN number
+        my $lun = $metadata;
+        _iscsi_login_all($scfg);
+        my $dev;
+        eval { $dev = _device_for_lun($scfg, $lun); };
+        if ($@ || !$dev) {
+            # try to re-resolve LUN mapping from TrueNAS
+            my $real_lun = eval { _current_lun_for_zname($scfg, $zname) };
+            if (defined $real_lun && (!defined($lun) || $real_lun != $lun)) {
+                $dev = _device_for_lun($scfg, $real_lun);
+            } else {
+                die $@ if $@; # bubble up original cause
+                die "Could not locate device for LUN $lun (IQN $scfg->{target_iqn})\n";
+            }
         }
+        return ($dev, $vmid, 'images');
+
+    } elsif ($mode eq 'nvme-tcp') {
+        # NVMe: metadata is device_uuid
+        my $uuid = $metadata;
+        _nvme_connect($scfg);
+        my $dev = _nvme_device_for_uuid($scfg, $uuid);
+        return ($dev, $vmid, 'images');
+
+    } else {
+        die "Unknown transport mode: $mode\n";
     }
-    return ($dev, $vmid, 'images');
 }
 
-# Create a new VM disk (zvol + iSCSI extent + mapping) and hand it to Proxmox.
+# Create a new VM disk (zvol + transport-specific exposure) and hand it to Proxmox.
 # Arguments (per PVE): ($class, $storeid, $scfg, $vmid, $fmt, $name, $size_kib)
 # NOTE: Proxmox passes size in KiB (kibibytes), not bytes!
 sub alloc_image {
@@ -2092,7 +2581,8 @@ sub alloc_image {
         volsize => $bytes,
         sparse  => ($scfg->{tn_sparse} // 1) ? JSON::PP::true : JSON::PP::false,
     };
-    $create_payload->{volblocksize} = $blocksize if $blocksize;
+    # Normalize blocksize to uppercase for TrueNAS 25.10+ compatibility
+    $create_payload->{volblocksize} = _normalize_blocksize($blocksize) if $blocksize;
 
     _api_call(
         $scfg,
@@ -2101,9 +2591,25 @@ sub alloc_image {
         sub { _rest_call($scfg, 'POST', '/pool/dataset', $create_payload) },
     );
 
-    # 2) Create an iSCSI extent for that zvol (device-backed)
-    # TrueNAS expects a 'disk' like "zvol/<pool>/<zname>"
+    # 2) Transport-specific volume exposure
     my $zvol_path = 'zvol/' . $full_ds;
+    my $mode = $scfg->{transport_mode} // 'iscsi';
+
+    if ($mode eq 'iscsi') {
+        return _alloc_image_iscsi($class, $scfg, $zname, $full_ds, $zvol_path);
+    } elsif ($mode eq 'nvme-tcp') {
+        return _alloc_image_nvme($class, $scfg, $zname, $full_ds, $zvol_path);
+    } else {
+        die "Unknown transport mode: $mode\n";
+    }
+}
+
+# iSCSI-specific allocation (create extent + mapping, wait for device)
+sub _alloc_image_iscsi {
+    my ($class, $scfg, $zname, $full_ds, $zvol_path) = @_;
+
+    # Create an iSCSI extent for that zvol (device-backed)
+    # TrueNAS expects a 'disk' like "zvol/<pool>/<zname>"
     my $extent_payload = {
         name => $zname,
         type => 'DISK',
@@ -2272,6 +2778,21 @@ sub alloc_image {
     return $volname;
 }
 
+# NVMe-specific allocation (create namespace, wait for device)
+sub _alloc_image_nvme {
+    my ($class, $scfg, $zname, $full_ds, $zvol_path) = @_;
+
+    _log($scfg, 1, 'info', "_alloc_image_nvme: creating NVMe namespace for $zname");
+
+    # Create namespace and get device_uuid
+    my $device_uuid = _nvme_create_namespace($scfg, $zname, $full_ds, $zvol_path);
+
+    # Return encoded volname
+    my $volname = "vol-$zname-ns$device_uuid";
+    _log($scfg, 1, 'info', "_alloc_image_nvme: volume created successfully: $volname");
+    return $volname;
+}
+
 # Return size in bytes (scalar), or (size_bytes, format) in list context
 sub volume_size_info {
     my ($class, $scfg, $storeid, $volname, $timeout) = @_;
@@ -2292,22 +2813,37 @@ sub volume_size_info {
     return wantarray ? ($bytes, $fmt) : $bytes;
 }
 
-# Delete a VM disk: remove iSCSI mapping+extent on TrueNAS, delete zvol, and
-# clean up the initiator (flush multipath, rescan, optionally logout if no LUNs remain).
+# Delete a VM disk: remove transport-specific resources, delete zvol, and clean up.
 sub free_image {
     my ($class, $storeid, $scfg, $volname, $isBase, $format) = @_;
 
     # Level 1: Light - function entry
     _log($scfg, 1, 'info', "free_image: volname=$volname");
 
-    die "snapshots not supported on iSCSI zvols\n" if $isBase;
+    die "snapshots not supported on zvols\n" if $isBase;
     die "unsupported format '$format'\n" if defined($format) && $format ne 'raw';
 
-    my (undef, $zname, undef, undef, undef, undef, undef, $lun) = $class->parse_volname($volname);
+    my (undef, $zname, undef, undef, undef, undef, undef, $metadata) = $class->parse_volname($volname);
     my $full_ds = $scfg->{dataset} . '/' . $zname;
 
     # Level 2: Verbose - parsed details
-    _log($scfg, 2, 'debug', "free_image: zname=$zname, lun=$lun, full_ds=$full_ds");
+    _log($scfg, 2, 'debug', "free_image: zname=$zname, metadata=$metadata, full_ds=$full_ds");
+
+    # Dispatch to transport-specific deletion
+    my $mode = $scfg->{transport_mode} // 'iscsi';
+
+    if ($mode eq 'iscsi') {
+        return _free_image_iscsi($class, $storeid, $scfg, $volname, $zname, $full_ds, $metadata);
+    } elsif ($mode eq 'nvme-tcp') {
+        return _free_image_nvme($class, $storeid, $scfg, $volname, $zname, $full_ds, $metadata);
+    } else {
+        die "Unknown transport mode: $mode\n";
+    }
+}
+
+# iSCSI-specific deletion
+sub _free_image_iscsi {
+    my ($class, $storeid, $scfg, $volname, $zname, $full_ds, $lun) = @_;
 
     # Best-effort: flush local multipath path of this WWID (ignore "not a multipath device")
     if ($scfg->{use_multipath}) {
@@ -2544,6 +3080,77 @@ sub free_image {
     return undef;
 }
 
+# NVMe-specific deletion
+sub _free_image_nvme {
+    my ($class, $storeid, $scfg, $volname, $zname, $full_ds, $device_uuid) = @_;
+
+    _log($scfg, 1, 'info', "_free_image_nvme: deleting NVMe namespace for $zname");
+
+    # 1) Delete NVMe namespace
+    eval {
+        _nvme_delete_namespace($scfg, $zname, $full_ds);
+    };
+    if ($@) {
+        my $err = $@ // '';
+        # Only warn if resource actually exists
+        warn "warning: delete NVMe namespace failed: $err" unless $err =~ /does not exist|ENOENT|not found/i;
+    }
+
+    # 2) Delete all snapshots before deleting the zvol dataset
+    eval {
+        syslog('info', "Searching for and deleting all snapshots of $full_ds before dataset deletion");
+        my $snapshots = _tn_snapshots($scfg) // [];
+        my @volume_snapshots = grep { $_->{name} && $_->{name} =~ /^\Q$full_ds\E@/ } @$snapshots;
+
+        if (@volume_snapshots) {
+            syslog('info', "Found " . scalar(@volume_snapshots) . " snapshots for $full_ds, deleting them first");
+            for my $snap (@volume_snapshots) {
+                my $snap_name = $snap->{name};
+                syslog('info', "Deleting snapshot $snap_name before volume deletion");
+                eval {
+                    my $snap_id = URI::Escape::uri_escape($snap_name);
+                    my $result = _api_call($scfg, 'zfs.snapshot.delete', [ $snap_name ],
+                        sub { _rest_call($scfg, 'DELETE', "/zfs/snapshot/id/$snap_id", undef) });
+                    my $job_result = _handle_api_result_with_job_support($scfg, $result, "snapshot deletion for $snap_name", 15);
+                    if (!$job_result->{success}) {
+                        die $job_result->{error};
+                    }
+                    syslog('info', "Successfully deleted snapshot $snap_name");
+                };
+                if ($@) {
+                    syslog('warning', "Failed to delete snapshot $snap_name: $@");
+                }
+            }
+        }
+
+        # 3) Delete the zvol dataset
+        my $id = URI::Escape::uri_escape($full_ds);
+        my $payload = { recursive => JSON::PP::false, force => JSON::PP::true };
+
+        syslog('info', "Deleting dataset $full_ds (after snapshot cleanup)");
+        my $result = _api_call($scfg,'pool.dataset.delete',[ $full_ds, $payload ],
+            sub { _rest_call($scfg,'DELETE',"/pool/dataset/id/$id",$payload) });
+
+        my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion for $full_ds", 20);
+        if (!$job_result->{success}) {
+            die $job_result->{error};
+        }
+
+        syslog('info', "Dataset $full_ds deletion completed successfully");
+    };
+
+    if ($@) {
+        my $err = $@ // '';
+        # Only warn if dataset actually exists
+        warn "warning: delete dataset $full_ds failed: $err" unless $err =~ /does not exist|ENOENT|InstanceNotFound/i;
+    }
+
+    # 4) Clean up udev
+    eval { run_command(['udevadm','settle'], outfunc=>sub{}) };
+
+    return undef;
+}
+
 # Heuristic: returns true if our target session shows no "Attached SCSI devices" with LUNs.
 # Conservative: we only logout if we see a session for the IQN AND there are zero LUNs listed.
 sub _session_has_no_luns {
@@ -2575,6 +3182,22 @@ sub _session_has_no_luns {
 # Returns an arrayref of hashes: { volid, size, format, vmid? }
 # Respects $vmid (owner filter) and $vollist (explicit include list).
 sub list_images {
+    my ($class, $storeid, $scfg, $vmid, $vollist, $cache) = @_;
+    my $res = [];
+
+    my $mode = $scfg->{transport_mode} // 'iscsi';
+
+    if ($mode eq 'iscsi') {
+        return _list_images_iscsi($class, $storeid, $scfg, $vmid, $vollist, $cache);
+    } elsif ($mode eq 'nvme-tcp') {
+        return _list_images_nvme($class, $storeid, $scfg, $vmid, $vollist, $cache);
+    }
+
+    return $res;
+}
+
+# iSCSI-specific list_images implementation
+sub _list_images_iscsi {
     my ($class, $storeid, $scfg, $vmid, $vollist, $cache) = @_;
     my $res = [];
 
@@ -2668,6 +3291,119 @@ sub list_images {
         );
         push @$res, \%entry;
     }
+    return $res;
+}
+
+# NVMe-specific list_images implementation
+sub _list_images_nvme {
+    my ($class, $storeid, $scfg, $vmid, $vollist, $cache) = @_;
+    my $res = [];
+
+    # Get subsystem ID
+    my $nqn = $scfg->{subsystem_nqn};
+    my $subsystems = eval {
+        _api_call($scfg, 'nvmet.subsys.query', [
+            [["subnqn", "=", $nqn]]
+        ], sub { die "REST API not supported for NVMe-oF operations\n"; });
+    };
+    if ($@) {
+        _log($scfg, 0, 'err', "list_images_nvme: failed to query subsystem: $@");
+        return $res;
+    }
+    if (!$subsystems || !@$subsystems) {
+        _log($scfg, 0, 'err', "list_images_nvme: subsystem $nqn not found");
+        return $res;
+    }
+    my $subsys_id = $subsystems->[0]{id};
+
+    # Get all namespaces for this subsystem
+    # Note: Query without filter because TrueNAS API filter syntax is inconsistent
+    my $namespaces = eval {
+        _api_call($scfg, 'nvmet.namespace.query', [[]], sub { die "REST API not supported for NVMe-oF operations\n"; });
+    } // [];
+
+    # Filter to only our subsystem
+    # Note: namespace has 'subsys' field which is a hash with 'id' field
+    $namespaces = [ grep {
+        my $ns_subsys = $_->{subsys};
+        my $ns_subsys_id = ref($ns_subsys) eq 'HASH' ? $ns_subsys->{id} : $ns_subsys;
+        ($ns_subsys_id // -1) == $subsys_id
+    } @$namespaces ];
+
+    # Optional include filter
+    my %want;
+    if ($vollist && ref($vollist) eq 'ARRAY' && @$vollist) {
+        %want = map { $_ => 1 } @$vollist;
+    }
+
+    # Normalizer for size fields
+    my $norm = sub {
+        my ($v) = @_;
+        return 0 if !defined $v;
+        return $v if !ref($v);
+        return $v->{parsed} // $v->{raw} // 0 if ref($v) eq 'HASH';
+        return 0;
+    };
+
+    # Process each namespace
+    for my $ns (@$namespaces) {
+        my $device_path = $ns->{device_path} // '';
+        next unless $device_path =~ m{^zvol/(.+)$};
+        my $ds_full = $1;  # e.g., "flash/nvme-test/vm-998-disk-0"
+
+        # Extract zvol name from path
+        next unless $ds_full =~ m{^\Q$scfg->{dataset}\E/(.+)$};
+        my $zname = $1;  # e.g., "vm-998-disk-0"
+
+        # Owner (vmid) from naming convention
+        my $owner;
+        $owner = $1 if $zname =~ /^vm-(\d+)-/;
+
+        # Honor $vmid filter
+        if (defined $vmid) {
+            next if !defined $owner || $owner != $vmid;
+        }
+
+        # Compose volname using device_uuid
+        my $device_uuid = $ns->{device_uuid} // next;
+        my $volname = "vol-$zname-ns$device_uuid";
+        my $volid = "$storeid:$volname";
+
+        # Honor explicit include filter
+        if (%want && !$want{$volid}) {
+            next;
+        }
+
+        # Get zvol details for size and creation time
+        my $ds = eval { _tn_dataset_get($scfg, $ds_full) } // {};
+        my $size = $norm->($ds->{volsize});  # bytes
+
+        # Extract creation time
+        my $ctime = 0;
+        if (my $props = $ds->{properties}) {
+            if (ref($props->{creation}) eq 'HASH') {
+                $ctime = int($props->{creation}{rawvalue} // $props->{creation}{value} // 0);
+            } elsif (defined $props->{creation} && $props->{creation} =~ /(\d{10})/) {
+                $ctime = int($1);
+            }
+        }
+        if (!$ctime && defined $ds->{created}) {
+            $ctime = int($ds->{created});
+        }
+        $ctime = time() if !$ctime;
+
+        # Format is always raw for NVMe zvols
+        my %entry = (
+            volid   => $volid,
+            size    => $size || 0,
+            format  => 'raw',
+            content => 'images',
+            vmid    => defined($owner) ? int($owner) : 0,
+            ctime   => $ctime,
+        );
+        push @$res, \%entry;
+    }
+
     return $res;
 }
 
@@ -2910,12 +3646,33 @@ sub _ensure_target_visible {
 sub activate_storage {
     my ($class, $storeid, $scfg, $cache) = @_;
 
-    # Run pre-flight check to ensure target is visible
-    eval {
-        _ensure_target_visible($scfg);
-    };
-    if ($@) {
-        syslog('warning', "Target visibility pre-flight check failed for $storeid: $@");
+    my $mode = $scfg->{transport_mode} // 'iscsi';
+
+    if ($mode eq 'iscsi') {
+        # Run pre-flight check to ensure target is visible
+        eval {
+            _ensure_target_visible($scfg);
+        };
+        if ($@) {
+            syslog('warning', "Target visibility pre-flight check failed for $storeid: $@");
+        }
+    } elsif ($mode eq 'nvme-tcp') {
+        # Check nvme-cli is available
+        eval {
+            _nvme_check_cli();
+        };
+        if ($@) {
+            die "NVMe/TCP storage activation failed: $@\n";
+        }
+
+        # Ensure subsystem exists and connect
+        eval {
+            _nvme_ensure_subsystem($scfg);
+            _nvme_connect($scfg);
+        };
+        if ($@) {
+            syslog('warning', "NVMe/TCP subsystem connection failed for $storeid: $@");
+        }
     }
 
     return 1;
@@ -2926,10 +3683,20 @@ sub deactivate_storage { return 1; }
 sub activate_volume {
     my ($class, $storeid, $scfg, $volname, $snapname, $cache) = @_;
     # Note: snapname is used for snapshot operations, we support snapshots via ZFS
-    _iscsi_login_all($scfg);
-    if ($scfg->{use_multipath}) { run_command(['multipath','-r'], outfunc => sub {}); }
-    run_command(['udevadm','settle'], outfunc => sub {});
-    usleep(150_000);
+
+    my $mode = $scfg->{transport_mode} // 'iscsi';
+
+    if ($mode eq 'iscsi') {
+        _iscsi_login_all($scfg);
+        if ($scfg->{use_multipath}) { run_command(['multipath','-r'], outfunc => sub {}); }
+        run_command(['udevadm','settle'], outfunc => sub {});
+        usleep(150_000);
+    } elsif ($mode eq 'nvme-tcp') {
+        _nvme_connect($scfg);
+        run_command(['udevadm','settle'], outfunc => sub {});
+        usleep(150_000);
+    }
+
     return 1;
 }
 sub deactivate_volume { return 1; }
@@ -2939,9 +3706,23 @@ sub deactivate_volume { return 1; }
 sub clone_image {
     my ($class, $scfg, $storeid, $volname, $vmid, $snapname, $name, $format) = @_;
 
-
     die "clone not supported without snapshot\n" unless $snapname;
     die "only raw format is supported\n" if defined($format) && $format ne 'raw';
+
+    # Dispatch by transport mode
+    my $mode = $scfg->{transport_mode} // 'iscsi';
+    if ($mode eq 'iscsi') {
+        return _clone_image_iscsi($class, $scfg, $storeid, $volname, $vmid, $snapname, $name);
+    } elsif ($mode eq 'nvme-tcp') {
+        return _clone_image_nvme($class, $scfg, $storeid, $volname, $vmid, $snapname, $name);
+    } else {
+        die "Unknown transport mode: $mode\n";
+    }
+}
+
+# iSCSI-specific clone implementation
+sub _clone_image_iscsi {
+    my ($class, $scfg, $storeid, $volname, $vmid, $snapname, $name) = @_;
 
     # Parse source volume information
     my (undef, $source_zname) = $class->parse_volname($volname);
@@ -3062,6 +3843,101 @@ sub clone_image {
 
     # 6) Return clone volume name
     my $clone_volname = "vol-$target_zname-lun$lun";
+    return $clone_volname;
+}
+
+# NVMe-specific clone implementation
+sub _clone_image_nvme {
+    my ($class, $scfg, $storeid, $volname, $vmid, $snapname, $name) = @_;
+
+    # Parse source volume information
+    my (undef, $source_zname) = $class->parse_volname($volname);
+    my $source_full = $scfg->{dataset} . '/' . $source_zname;
+    my $source_snapshot = $source_full . '@' . $snapname;
+
+    # Determine target dataset name
+    my $target_zname = $name;
+    if (!$target_zname) {
+        # Generate automatic name: vm-<vmid>-disk-<n>
+        for (my $n = 0; $n < 1000; $n++) {
+            my $candidate = "vm-$vmid-disk-$n";
+            my $candidate_full = $scfg->{dataset} . '/' . $candidate;
+            my $exists = eval { _tn_dataset_get($scfg, $candidate_full) };
+            if ($@ || !$exists) {
+                $target_zname = $candidate;
+                last;
+            }
+        }
+        die "unable to find free clone name\n" if !$target_zname;
+    }
+
+    my $target_full = $scfg->{dataset} . '/' . $target_zname;
+
+    # 1) Create ZFS clone from snapshot
+    _tn_dataset_clone($scfg, $source_snapshot, $target_full);
+
+    # 2) Create NVMe namespace for the cloned zvol
+    my $nqn = $scfg->{subsystem_nqn};
+
+    # Get subsystem ID
+    my $subsystems = eval {
+        _api_call($scfg, 'nvmet.subsys.query', [
+            [["subnqn", "=", $nqn]]
+        ], sub { die "REST API not supported for NVMe-oF operations\n"; });
+    };
+    if ($@ || !$subsystems || !@$subsystems) {
+        die "Failed to query NVMe subsystem $nqn: $@\n";
+    }
+    my $subsys_id = $subsystems->[0]{id};
+
+    # Get zvol details for blocksize
+    my $ds = eval { _tn_dataset_get($scfg, $target_full) } // {};
+    my $norm = sub {
+        my ($v) = @_;
+        return 0 if !defined $v;
+        return $v if !ref($v);
+        return $v->{parsed} // $v->{raw} // 0 if ref($v) eq 'HASH';
+        return 0;
+    };
+    my $volblocksize = $norm->($ds->{volblocksize}) || (128 * 1024);  # default 128K
+
+    # Normalize blocksize to uppercase format
+    my $blocksize_str = _normalize_blocksize($volblocksize);
+
+    # Create namespace
+    my $ns_payload = {
+        subsys_id => $subsys_id,
+        device_path => "zvol/$target_full",
+        device_type => 'ZVOL',
+        block_size => $blocksize_str,
+    };
+
+    my $ns = eval {
+        _api_call($scfg, 'nvmet.namespace.create', [ $ns_payload ],
+            sub { die "REST API not supported for NVMe-oF operations\n"; });
+    };
+    if ($@) {
+        # Cleanup: delete the zvol clone if namespace creation failed
+        eval { _tn_dataset_delete($scfg, $target_full) };
+        die "Failed to create NVMe namespace for clone: $@\n";
+    }
+
+    my $device_uuid = $ns->{device_uuid} // die "No device_uuid returned from namespace creation\n";
+
+    # 3) Wait for device to appear
+    my $dev = _nvme_device_for_uuid($scfg, $device_uuid);
+    if (!$dev) {
+        # Cleanup on failure
+        eval {
+            _api_call($scfg, 'nvmet.namespace.delete', [ $ns->{id} ],
+                sub { die "REST API not supported for NVMe-oF operations\n"; });
+        };
+        eval { _tn_dataset_delete($scfg, $target_full) };
+        die "Device did not appear for cloned namespace (UUID: $device_uuid)\n";
+    }
+
+    # 4) Return clone volume name
+    my $clone_volname = "vol-$target_zname-ns$device_uuid";
     return $clone_volname;
 }
 
