@@ -28,7 +28,7 @@ curl -sSL https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/insta
 ```
 
 The installer will:
-1. ✅ Check for required dependencies (curl/wget, jq, perl)
+1. ✅ Check for required dependencies (curl/wget, perl)
 2. ✅ Download the latest plugin from GitHub
 3. ✅ Validate plugin syntax before installation
 4. ✅ Install to the correct directory with proper permissions
@@ -298,15 +298,15 @@ tail -n 100 /var/log/truenas-installer.log
 
 **Missing Dependencies**
 ```bash
-# Installer checks for: curl or wget, jq, perl
+# Installer checks for: curl or wget, perl
 # If missing, installer will display clear error:
 
-ERROR: Required dependency 'jq' not found
-Please install: apt-get install jq
+ERROR: Required dependency 'curl' or 'wget' not found
+Please install: apt-get install curl wget
 
 # Install dependencies:
 apt-get update
-apt-get install curl jq perl
+apt-get install curl perl
 ```
 
 **Permission Issues**

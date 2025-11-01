@@ -11,7 +11,7 @@ set -euo pipefail
 # CONSTANTS AND CONFIGURATION
 # ============================================================================
 
-readonly INSTALLER_VERSION="1.0.0"
+readonly INSTALLER_VERSION="1.0.2"
 readonly GITHUB_REPO="WarlockSyno/truenasplugin"
 readonly PLUGIN_FILE="/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm"
 readonly STORAGE_CFG="/etc/pve/storage.cfg"
@@ -382,11 +382,6 @@ check_dependencies() {
         missing_deps+=("wget or curl")
     fi
 
-    # Check for jq (needed for GitHub API)
-    if ! command -v jq >/dev/null 2>&1; then
-        missing_deps+=("jq")
-    fi
-
     # Check other dependencies
     for dep in "${deps[@]}"; do
         if ! command -v "$dep" >/dev/null 2>&1; then
@@ -551,8 +546,11 @@ EXAMPLES:
     # Non-interactive installation
     $0 --non-interactive
 
-    # One-liner installation from GitHub
-    wget -qO- https://raw.githubusercontent.com/${GITHUB_REPO}/main/install.sh | bash
+    # One-liner installation from GitHub (auto-detects non-interactive)
+    curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh | bash
+
+    # Or with wget
+    wget -qO- https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh | bash
 
 For more information, visit:
 https://github.com/${GITHUB_REPO}
@@ -657,14 +655,18 @@ github_api_call() {
         return 1
     }
 
-    # Check for rate limiting
-    if echo "$response" | jq -e '.message' >/dev/null 2>&1; then
-        local message
-        message=$(echo "$response" | jq -r '.message')
-        if [[ "$message" == *"rate limit"* ]]; then
-            error "GitHub API rate limit exceeded. Please try again later."
-            log "ERROR" "GitHub API rate limit exceeded"
-            return 1
+    # Check for rate limiting - only check message field if response lacks expected success fields
+    # GitHub success responses have tag_name, assets, etc. Error responses have message field.
+    if ! echo "$response" | grep -q '"tag_name"\|"assets"\|"version"'; then
+        # This looks like an error response, check for rate limit message
+        if echo "$response" | grep -q '"message"'; then
+            local message
+            message=$(echo "$response" | grep -Po '"message":\s*"\K[^"]+')
+            if [[ "$message" == *"rate limit"* ]]; then
+                error "GitHub API rate limit exceeded. Please try again later."
+                log "ERROR" "GitHub API rate limit exceeded"
+                return 1
+            fi
         fi
     fi
 
@@ -697,7 +699,7 @@ get_all_releases() {
 # Extract version from release data
 get_release_version() {
     local release_data="$1"
-    echo "$release_data" | jq -r '.tag_name' | sed 's/^v//'
+    echo "$release_data" | grep -Po '"tag_name":\s*"\K[^"]+' | sed 's/^v//'
 }
 
 # Get download URL for plugin file from release
@@ -706,12 +708,21 @@ get_plugin_download_url() {
     local plugin_url
 
     # Try to find TrueNASPlugin.pm in assets
-    plugin_url=$(echo "$release_data" | jq -r '.assets[] | select(.name == "TrueNASPlugin.pm") | .browser_download_url' 2>/dev/null)
+    # Use sed to extract assets section more reliably than grep -Pzo
+    plugin_url=""
+
+    # Check if the asset exists and extract its download URL
+    if echo "$release_data" | grep -q '"name":\s*"TrueNASPlugin\.pm"'; then
+        # Found the matching asset, extract the browser_download_url from context
+        local context_lines
+        context_lines=$(echo "$release_data" | grep -A 10 '"name":\s*"TrueNASPlugin\.pm"')
+        plugin_url=$(echo "$context_lines" | grep -Po '"browser_download_url":\s*"\K[^"]+' | head -1)
+    fi
 
     if [[ -z "$plugin_url" || "$plugin_url" == "null" ]]; then
         # Fallback to raw GitHub URL
         local tag_name
-        tag_name=$(echo "$release_data" | jq -r '.tag_name')
+        tag_name=$(echo "$release_data" | grep -Po '"tag_name":\s*"\K[^"]+')
         plugin_url="https://raw.githubusercontent.com/${GITHUB_REPO}/${tag_name}/TrueNASPlugin.pm"
     fi
 
@@ -899,7 +910,7 @@ format_age() {
 # Scan backups and return statistics
 scan_backups() {
     local backups
-    backups=$(list_backups)
+    backups=$(list_backups 2>/dev/null || true)
 
     if [[ -z "$backups" ]]; then
         echo "0:0:0:0"  # count:total_size:oldest_age:newest_age
@@ -992,6 +1003,17 @@ install_plugin_file() {
     if ! validate_plugin "$source"; then
         error "Plugin validation failed. Installation aborted."
         return 1
+    fi
+
+    # Ensure target directory exists
+    local plugin_dir
+    plugin_dir="$(dirname "$PLUGIN_FILE")"
+    if [[ ! -d "$plugin_dir" ]]; then
+        info "Creating plugin directory $plugin_dir..."
+        mkdir -p "$plugin_dir" || {
+            error "Failed to create plugin directory"
+            return 1
+        }
     fi
 
     # Install plugin
@@ -1184,7 +1206,7 @@ menu_not_installed() {
 
         # Check if backups exist
         local backups
-        backups=$(list_backups 2>/dev/null | wc -l)
+        backups=$(list_backups 2>/dev/null | wc -l || echo "0")
         local has_backups=false
         if [[ "$backups" -gt 0 ]]; then
             has_backups=true
@@ -1378,10 +1400,17 @@ menu_view_versions() {
     }
 
     echo
-    echo "$releases" | jq -r '.[] | "  • v" + (.tag_name | ltrimstr("v")) + " - " + .name + " (" + (.published_at | split("T")[0]) + ")"' | head -20
+    echo "$releases" | grep -Po '"tag_name":\s*"\K[^"]+' | head -20 | while IFS= read -r tag; do
+        # Extract corresponding name and date for this release
+        release_block=$(echo "$releases" | grep -A 5 "\"tag_name\":\s*\"$tag\"")
+        name=$(echo "$release_block" | grep -Po '"name":\s*"\K[^"]+' | head -1)
+        date=$(echo "$release_block" | grep -Po '"published_at":\s*"\K[^T]+' | head -1)
+        version="${tag#v}"
+        echo "  • v$version - $name ($date)"
+    done
     echo
 
-    if [[ $(echo "$releases" | jq '. | length') -gt 20 ]]; then
+    if [[ $(echo "$releases" | grep -o '"tag_name"' | wc -l) -gt 20 ]]; then
         info "Showing latest 20 releases. Visit GitHub for full list."
     fi
 
@@ -1671,7 +1700,7 @@ menu_install_specific_version() {
 
     echo
     echo "Available versions:"
-    echo "$releases" | jq -r '.[] | "  • v" + (.tag_name | ltrimstr("v"))' | head -20
+    echo "$releases" | grep -Po '"tag_name":\s*"\K[^"]+' | sed 's/^v//' | head -20 | sed 's/^/  • v/'
     echo
 
     read -rp "Enter version number (e.g., 1.0.7): " version
@@ -1769,9 +1798,9 @@ test_truenas_api() {
 
     stop_spinner
     echo ""
-    if [[ -n "$response" ]] && echo "$response" | jq -e '.version' >/dev/null 2>&1; then
+    if [[ -n "$response" ]] && echo "$response" | grep -q '"version"'; then
         local version
-        version=$(echo "$response" | jq -r '.version' 2>/dev/null)
+        version=$(echo "$response" | grep -Po '"version":\s*"\K[^"]+' 2>/dev/null)
         success "Connected to TrueNAS successfully (version: $version)"
         return 0
     else
@@ -1810,7 +1839,7 @@ verify_dataset() {
 
     stop_spinner
     echo ""
-    if [[ -n "$response" ]] && echo "$response" | jq -e '.[0].id' >/dev/null 2>&1; then
+    if [[ -n "$response" ]] && echo "$response" | grep -Eq '\[\s*\{[^}]*"id"\s*:\s*"[^"]+"\s*[,}]'; then
         success "Dataset '$dataset' verified"
         return 0
     else
@@ -2068,7 +2097,7 @@ menu_rollback() {
 
     info "Searching for available backups..."
     local backups
-    backups=$(list_backups)
+    backups=$(list_backups 2>/dev/null || true)
 
     if [[ -z "$backups" ]]; then
         warning "No backups found"
@@ -2157,7 +2186,7 @@ view_all_backups() {
     print_header "Backup Files"
 
     local backups
-    backups=$(list_backups)
+    backups=$(list_backups 2>/dev/null || true)
 
     if [[ -z "$backups" ]]; then
         warning "No backups found"
@@ -2223,7 +2252,7 @@ delete_old_backups() {
     print_header "Delete Old Backups"
 
     local backups
-    backups=$(list_backups)
+    backups=$(list_backups 2>/dev/null || true)
 
     if [[ -z "$backups" ]]; then
         warning "No backups found"
@@ -2298,7 +2327,7 @@ keep_latest_backups() {
     print_header "Keep Latest N Backups"
 
     local backups
-    backups=$(list_backups)
+    backups=$(list_backups 2>/dev/null || true)
 
     if [[ -z "$backups" ]]; then
         warning "No backups found"
@@ -2366,7 +2395,7 @@ delete_all_backups() {
     print_header "Delete All Backups"
 
     local backups
-    backups=$(list_backups)
+    backups=$(list_backups 2>/dev/null || true)
 
     if [[ -z "$backups" ]]; then
         warning "No backups found"
@@ -2617,6 +2646,73 @@ menu_uninstall() {
 main() {
     # Parse arguments
     parse_arguments "$@"
+
+    # Detect if stdin is not a TTY (piped from curl/wget) and redirect to terminal
+    if [[ ! -t 0 ]] && [[ "$NON_INTERACTIVE" != "true" ]]; then
+        # Try to reconnect stdin to the controlling terminal
+        if [[ -c /dev/tty ]] && ( : </dev/tty ) 2>/dev/null; then
+            # Test if /dev/tty is actually connected to a terminal
+            if [[ -t /dev/tty ]] 2>/dev/null || ( [[ -c /dev/tty ]] && tty -s </dev/tty 2>/dev/null ); then
+                # Successfully can use /dev/tty for interactive input
+                exec 0</dev/tty
+                log "INFO" "Redirected stdin from pipe to /dev/tty for interactive mode"
+            else
+                # /dev/tty exists but is not usable for interactive input
+                echo
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo "  TrueNAS Plugin Installer - Interactive Mode Not Available"
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo
+                echo "This installer was run in a non-interactive context (e.g., via SSH"
+                echo "without a pseudo-terminal) and cannot access your terminal for prompts."
+                echo
+                echo "Please choose one of these methods instead:"
+                echo
+                echo "  ${COLOR_GREEN}1. SSH to Proxmox, then run installer (Recommended)${COLOR_RESET}"
+                echo "     ssh root@your-proxmox-host"
+                echo "     bash <(curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh)"
+                echo
+                echo "  ${COLOR_GREEN}2. Download and Run${COLOR_RESET}"
+                echo "     wget https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh"
+                echo "     chmod +x install.sh"
+                echo "     ./install.sh"
+                echo
+                echo "  ${COLOR_YELLOW}3. Non-Interactive (For Automation)${COLOR_RESET}"
+                echo "     curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh | bash -s -- --non-interactive"
+                echo
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo
+                exit $EXIT_ERROR
+            fi
+        else
+            # Cannot redirect - show helpful error
+            echo
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "  TrueNAS Plugin Installer - Interactive Mode Not Available"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo
+            echo "This installer was piped from curl/wget but cannot access your"
+            echo "terminal for interactive prompts."
+            echo
+            echo "Please choose one of these methods instead:"
+            echo
+            echo "  ${COLOR_GREEN}1. SSH to Proxmox, then run installer (Recommended)${COLOR_RESET}"
+            echo "     ssh root@your-proxmox-host"
+            echo "     bash <(curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh)"
+            echo
+            echo "  ${COLOR_GREEN}2. Download and Run${COLOR_RESET}"
+            echo "     wget https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh"
+            echo "     chmod +x install.sh"
+            echo "     ./install.sh"
+            echo
+            echo "  ${COLOR_YELLOW}3. Non-Interactive (For Automation)${COLOR_RESET}"
+            echo "     curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh | bash -s -- --non-interactive"
+            echo
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo
+            exit $EXIT_ERROR
+        fi
+    fi
 
     # Initialize logging
     init_logging
