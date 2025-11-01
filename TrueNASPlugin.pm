@@ -3280,38 +3280,12 @@ sub _free_image_nvme {
         }
     }
 
-    # 2) Delete all snapshots before deleting the zvol dataset
+    # 2) Delete the zvol dataset with recursive flag to handle snapshots automatically
     eval {
-        syslog('info', "Searching for and deleting all snapshots of $full_ds before dataset deletion");
-        my $snapshots = _tn_snapshots($scfg) // [];
-        my @volume_snapshots = grep { $_->{name} && $_->{name} =~ /^\Q$full_ds\E@/ } @$snapshots;
-
-        if (@volume_snapshots) {
-            syslog('info', "Found " . scalar(@volume_snapshots) . " snapshots for $full_ds, deleting them first");
-            for my $snap (@volume_snapshots) {
-                my $snap_name = $snap->{name};
-                syslog('info', "Deleting snapshot $snap_name before volume deletion");
-                eval {
-                    my $snap_id = URI::Escape::uri_escape($snap_name);
-                    my $result = _api_call($scfg, 'zfs.snapshot.delete', [ $snap_name ],
-                        sub { _rest_call($scfg, 'DELETE', "/zfs/snapshot/id/$snap_id", undef) });
-                    my $job_result = _handle_api_result_with_job_support($scfg, $result, "snapshot deletion for $snap_name", 15);
-                    if (!$job_result->{success}) {
-                        die $job_result->{error};
-                    }
-                    syslog('info', "Successfully deleted snapshot $snap_name");
-                };
-                if ($@) {
-                    syslog('warning', "Failed to delete snapshot $snap_name: $@");
-                }
-            }
-        }
-
-        # 3) Delete the zvol dataset
         my $id = URI::Escape::uri_escape($full_ds);
-        my $payload = { recursive => JSON::PP::false, force => JSON::PP::true };
+        my $payload = { recursive => JSON::PP::true, force => JSON::PP::true };
 
-        syslog('info', "Deleting dataset $full_ds (after snapshot cleanup)");
+        syslog('info', "Deleting dataset $full_ds (recursive deletion includes snapshots)");
         my $result = _api_call($scfg,'pool.dataset.delete',[ $full_ds, $payload ],
             sub { _rest_call($scfg,'DELETE',"/pool/dataset/id/$id",$payload) });
 
