@@ -106,9 +106,9 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Timing constants (in seconds)
-readonly API_SETTLE_TIME=2        # Wait for API operations to settle
-readonly DELETION_WAIT=3          # Wait after VM deletion to verify cleanup
-readonly DELETION_VERIFY_SLEEP=5  # Initial wait before verifying deletions
+readonly API_SETTLE_TIME=1        # Wait for API operations to settle
+readonly DELETION_WAIT=1          # Wait after VM deletion to verify cleanup
+readonly DELETION_VERIFY_SLEEP=2  # Initial wait before verifying deletions
 readonly DISK_ATTACH_WAIT=1       # Wait after disk attachment
 readonly DELETION_MAX_RETRIES=10  # Max attempts to verify VM deletion
 
@@ -518,13 +518,15 @@ test_disk_deletion() {
         log_warning "Could not attach disk (might already be attached)"
     fi
 
-    # Delete VM
+    # Delete VM and time only the deletion operation
+    local delete_start=$(date +%s)
     if ! pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1; then
         log_error "Failed to delete VM"
         FAILED_TESTS=$((FAILED_TESTS + 1))
         TEST_RESULTS+=("FAIL: $test_name")
         return 1
     fi
+    local delete_duration=$(($(date +%s) - delete_start))
 
     sleep $DELETION_WAIT
 
@@ -535,10 +537,10 @@ test_disk_deletion() {
     local duration=$(($(date +%s) - start_time))
 
     if [[ -z "$disks_after" ]]; then
-        log_success "VM and disk deleted, cleanup verified (${duration}s)"
+        log_success "VM and disk deleted, cleanup verified (${duration}s, actual deletion: ${delete_duration}s)"
         PASSED_TESTS=$((PASSED_TESTS + 1))
         TEST_RESULTS+=("PASS: $test_name")
-        track_timing "disk_deletion" "$duration"
+        track_timing "disk_deletion" "$delete_duration"
         return 0
     else
         log_error "Orphaned disks remain: $disks_after"
