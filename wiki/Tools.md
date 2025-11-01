@@ -69,32 +69,143 @@ cd tools/
 # Basic usage (development environment only!)
 ./dev-truenas-plugin-full-function-test.sh
 
-# Specify storage and node
-./dev-truenas-plugin-full-function-test.sh tnscale pve-test-node 9001
+# Specify storage and starting VMID
+./dev-truenas-plugin-full-function-test.sh tnscale 9001
+
+# Include backup tests (requires backup storage)
+./dev-truenas-plugin-full-function-test.sh tnscale 9001 --backup-store pbs
 
 # View results
-cat test-results-*.json | jq .
+tail -f test-results-*.log
 ```
 
-### Test Categories
+**Command-line Arguments**:
+- `STORAGE_ID` - TrueNAS storage ID (default: tnscale)
+- `VMID_START` - Starting VMID for test VMs (default: 9001)
+- `--backup-store STORAGE` - Backup storage for backup tests (optional)
 
-#### Disk Allocation Tests
+**Examples**:
+```bash
+# Standalone node (skips cluster tests)
+./dev-truenas-plugin-full-function-test.sh tnscale 9001
 
-Tests disk creation via Proxmox API with various sizes (1GB, 10GB, 32GB, 100GB).
+# Cluster environment with backup storage
+./dev-truenas-plugin-full-function-test.sh tnscale 9001 --backup-store pbs
+
+# Different VMID range
+./dev-truenas-plugin-full-function-test.sh tnscale 8000 --backup-store local
+```
+
+**Cluster Detection**:
+- Script automatically detects if running in a cluster
+- If cluster detected with available nodes: runs migration and cross-node clone tests
+- If standalone node: automatically skips cluster-only tests
+
+**Backup Tests**:
+- Requires `--backup-store` flag
+- If not specified: automatically skips backup tests
+- Tests both online (running VM) and offline (stopped VM) backups
+
+### Test Phases
+
+The Development Test Suite performs comprehensive testing across 16 test phases:
+
+#### Phase 1-9: Core Plugin Functionality
+
+1. **Pre-flight Cleanup** - Remove orphaned resources from previous test runs
+2. **Disk Allocation** - Test disk creation with multiple sizes (1GB, 10GB, 32GB, 100GB)
+3. **TrueNAS Size Verification** - Verify disk sizes match on TrueNAS backend via API
+4. **Disk Deletion** - Test VM and disk deletion with cleanup verification
+5. **Clone & Snapshot** - Test VM cloning, snapshots, and deletion
+6. **Disk Resize** - Test expanding disk from 10GB to 20GB
+7. **Concurrent Operations** - Test parallel disk allocations and deletions
+8. **Performance Benchmarks** - Benchmark disk allocation and deletion timing
+9. **Multiple Disks** - Test VMs with multiple disk attachments
+
+#### Phase 10: EFI Boot Support
+
+10. **EFI VM Creation** - Test VM creation with EFI BIOS and EFI disk configuration
 
 **Verifies**:
-- Proxmox reports correct size (`pvesm list`)
-- Block device has correct size (`blockdev --getsize64`)
-- **TrueNAS zvol has correct size (via API)** ✓
+- VM created with EFI BIOS (OVMF)
+- EFI disk allocated and configured
+- Data disk attached successfully
+- VM configuration contains correct EFI settings
 
-#### Disk Deletion Tests
+#### Phase 11-12: Live Migration (Cluster Only)
 
-Tests disk deletion and verifies cleanup on TrueNAS backend.
+11. **Live Migration** - Test online VM migration between cluster nodes
+12. **Offline Migration** - Test offline VM migration between cluster nodes
 
 **Verifies**:
-- Zvol deleted from TrueNAS
-- iSCSI extent removed
-- No orphaned resources
+- VM successfully migrates to target node
+- VM data remains intact
+- Migration back to original node works
+- Storage remains accessible on both nodes
+
+**Requirements**:
+- Proxmox cluster with multiple nodes
+- All nodes must have access to TrueNAS storage
+- Auto-skipped on standalone nodes
+
+#### Phase 13-14: Backup Operations (Optional)
+
+13. **Online Backup** - Test backup of running VM
+14. **Offline Backup** - Test backup of stopped VM
+
+**Verifies**:
+- Backup completes successfully
+- Backup file is created in backup storage
+- Backup cleanup removes files properly
+
+**Requirements**:
+- Backup storage specified via `--backup-store` flag
+- Auto-skipped if backup storage not provided
+
+#### Phase 15-16: Cross-Node Cloning (Cluster Only)
+
+15. **Cross-Node Clone (Online)** - Test cloning running VM to different node
+16. **Cross-Node Clone (Offline)** - Test cloning stopped VM to different node
+
+**Verifies**:
+- VM successfully cloned to target node
+- Clone has independent disks
+- Both VMs can operate independently
+- Cleanup removes both VMs correctly
+
+**Requirements**:
+- Proxmox cluster with multiple nodes
+- All nodes must have access to TrueNAS storage
+- Auto-skipped on standalone nodes
+
+### Performance Summary Table
+
+After all tests complete, the script displays a comprehensive performance summary:
+
+```
+════════════════════════════════════════════════════════════════════
+  PERFORMANCE SUMMARY
+════════════════════════════════════════════════════════════════════
+
+Operation                        Count   Avg (s)   Min (s)   Max (s)
+────────────────────────────────────────────────────────────────────
+Disk Allocation                      4         3         2         5
+Disk Deletion                        8         2         1         3
+Clone Operation                      1         8         8         8
+Efi Vm Creation                      1         6         6         6
+Live Migration                       2        12        11        13
+Offline Migration                    2         8         7         9
+Online Backup                        1        45        45        45
+Offline Backup                       1        32        32        32
+Cross Node Clone Online              1        15        15        15
+Cross Node Clone Offline             1        12        12        12
+```
+
+This table shows:
+- **Count**: Number of times operation was performed
+- **Avg (s)**: Average duration in seconds
+- **Min (s)**: Fastest operation duration
+- **Max (s)**: Slowest operation duration
 
 ### Output Files
 
@@ -199,11 +310,13 @@ jobs:
 
 ### Limitations
 
-- Creates test VMs (VMIDs 9001-9025 by default)
+- Creates test VMs (VMIDs 9001-9031 by default, expanded for new tests)
 - Consumes storage space during tests
 - May interfere with existing VMs in VMID range
 - Requires API access to TrueNAS
 - Not suitable for concurrent execution
+- Cluster tests require at least 2 nodes with shared storage access
+- Backup tests require backup storage to be configured and accessible
 
 ### See Also
 
