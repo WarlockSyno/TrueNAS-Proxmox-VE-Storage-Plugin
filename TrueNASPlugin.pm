@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '1.1.0';
+our $VERSION = '1.1.1';
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -1480,13 +1480,50 @@ sub volume_resize {
     } elsif ($mode eq 'nvme-tcp') {
         # NVMe namespace size updates automatically when zvol is resized
         # Trigger device rescan to ensure kernel sees updated size
+        # Find NVMe controllers connected to our subsystem and rescan them
         my $nqn = $scfg->{subsystem_nqn};
+        my $rescanned = 0;
+
         eval {
-            _try_run(['nvme', 'ns-rescan', '-n', $nqn], "nvme namespace rescan failed");
+            # Find all NVMe controllers for this subsystem
+            my $subsys_link = readlink("/sys/class/nvme-subsystem/nvme-subsys*");
+            opendir(my $dh, "/sys/class/nvme-subsystem") or die "Cannot open nvme-subsystem: $!";
+            while (my $subsys = readdir($dh)) {
+                next unless $subsys =~ /^nvme-subsys\d+$/;
+                my $subsys_nqn = eval {
+                    open my $fh, '<', "/sys/class/nvme-subsystem/$subsys/subsysnqn" or die;
+                    my $val = <$fh>;
+                    close $fh;
+                    chomp($val);
+                    $val;
+                };
+                next unless $subsys_nqn && $subsys_nqn eq $nqn;
+
+                # Found our subsystem, rescan all its controllers
+                opendir(my $sdh, "/sys/class/nvme-subsystem/$subsys") or next;
+                while (my $entry = readdir($sdh)) {
+                    next unless $entry =~ /^nvme(\d+)$/;
+                    my $ctrl_dev = "/dev/nvme$1";
+                    if (-e $ctrl_dev) {
+                        eval { _try_run(['nvme', 'ns-rescan', $ctrl_dev], "nvme rescan $ctrl_dev"); };
+                        $rescanned++ unless $@;
+                    }
+                }
+                closedir($sdh);
+            }
+            closedir($dh);
         };
-        # Fallback: rescan all NVMe controllers if specific rescan fails
-        if ($@) {
-            eval { _try_run(['nvme', 'ns-rescan', '/dev/nvme0'], "nvme rescan failed"); };
+
+        # Fallback: if we couldn't find/rescan our subsystem, try rescanning all controllers
+        if (!$rescanned) {
+            eval {
+                opendir(my $dh, "/dev") or die "Cannot open /dev: $!";
+                while (my $dev = readdir($dh)) {
+                    next unless $dev =~ /^nvme\d+$/;
+                    eval { _try_run(['nvme', 'ns-rescan', "/dev/$dev"], "nvme rescan /dev/$dev"); };
+                }
+                closedir($dh);
+            };
         }
     }
     run_command(['udevadm','settle'], outfunc => sub {});
@@ -1802,8 +1839,33 @@ sub _preflight_check_alloc {
         if ($@) {
             push @errors, "Cannot verify iSCSI target: $@";
         }
+    } elsif ($mode eq 'nvme-tcp') {
+        eval {
+            my $nqn = $scfg->{subsystem_nqn};
+            if (!$nqn) {
+                push @errors, "NVMe subsystem NQN not configured in storage.cfg";
+                return;
+            }
+
+            # Query subsystem to ensure it exists
+            my $subsystems = _api_call($scfg, 'nvmet.subsys.query',
+                [[ ["subnqn", "=", $nqn] ]],
+                sub { die "REST API not supported for NVMe-oF operations\n"; });
+
+            if (!$subsystems || !@$subsystems) {
+                push @errors, sprintf(
+                    "NVMe subsystem not found: %s\n" .
+                    "  Verify subsystem exists in TrueNAS: Sharing > NVMe-oF > Subsystems\n" .
+                    "  Or it will be auto-created during first volume allocation",
+                    $nqn
+                );
+            }
+        };
+        if ($@) {
+            # Subsystem query failed - will be auto-created on first allocation
+            _log($scfg, 1, 'info', "NVMe subsystem pre-flight check skipped (will auto-create): $@");
+        }
     }
-    # NVMe subsystem validation is done during activation, not pre-flight
 
     # Check 5: Parent dataset exists
     eval {
@@ -2271,28 +2333,92 @@ sub _nvme_disconnect {
     }
 }
 
-# Get device path for namespace by UUID
+# Get device path for namespace by UUID with enhanced validation
 sub _nvme_device_for_uuid {
     my ($scfg, $device_uuid) = @_;
 
     my $uuid_path = "/dev/disk/by-id/nvme-uuid.$device_uuid";
+    my $nqn = $scfg->{subsystem_nqn};
 
-    # Wait for device to appear (up to 5 seconds)
+    _log($scfg, 2, 'debug', "nvme_device_for_uuid: waiting for device with UUID $device_uuid");
+
+    # Wait for device to appear with progressive backoff (up to 5 seconds)
     for (my $i = 0; $i < 50; $i++) {
+        # Check if path exists
         if (-e $uuid_path) {
-            _log($scfg, 2, 'debug', "nvme_device_for_uuid: found device at $uuid_path");
-            return $uuid_path;
+            # Validate it's actually a block device (not just a dangling symlink)
+            if (-b $uuid_path) {
+                _log($scfg, 1, 'info', "nvme_device_for_uuid: device ready at $uuid_path");
+                return $uuid_path;
+            } else {
+                _log($scfg, 1, 'warning', "nvme_device_for_uuid: path exists but is not a block device: $uuid_path");
+            }
         }
 
-        # Trigger udev settle periodically
-        if ($i == 10 || $i == 25 || $i == 40) {
-            run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {});
+        # Progressive interventions to help device discovery
+        if ($i == 5) {
+            # Early settle
+            eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) };
+        } elsif ($i == 15) {
+            # Trigger udev and rescan NVMe controllers for our subsystem
+            eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) };
+            eval {
+                opendir(my $dh, "/sys/class/nvme-subsystem") or die;
+                while (my $subsys = readdir($dh)) {
+                    next unless $subsys =~ /^nvme-subsys\d+$/;
+                    my $subsys_nqn = eval {
+                        open my $fh, '<', "/sys/class/nvme-subsystem/$subsys/subsysnqn" or die;
+                        my $val = <$fh>;
+                        close $fh;
+                        chomp($val);
+                        $val;
+                    };
+                    next unless $subsys_nqn && $subsys_nqn eq $nqn;
+
+                    # Rescan controllers in this subsystem
+                    opendir(my $sdh, "/sys/class/nvme-subsystem/$subsys") or next;
+                    while (my $entry = readdir($sdh)) {
+                        next unless $entry =~ /^nvme(\d+)$/;
+                        my $ctrl_dev = "/dev/nvme$1";
+                        eval { run_command(['nvme', 'ns-rescan', $ctrl_dev], outfunc => sub {}, errfunc => sub {}) };
+                    }
+                    closedir($sdh);
+                }
+                closedir($dh);
+            };
+        } elsif ($i == 30) {
+            # Another settle with trigger
+            eval { run_command(['udevadm', 'trigger'], outfunc => sub {}, errfunc => sub {}) };
+            eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) };
         }
 
         usleep(100_000);  # 100ms
     }
 
-    die "Could not locate NVMe device for UUID $device_uuid at $uuid_path\n";
+    # Device didn't appear - provide detailed troubleshooting
+    my $err_msg = sprintf(
+        "Could not locate NVMe device for UUID %s\n" .
+        "  Expected path: %s\n\n" .
+        "Troubleshooting steps:\n" .
+        "  1. Verify NVMe subsystem connection:\n" .
+        "     -> Check: nvme list | grep '%s'\n" .
+        "  2. Check if namespace is visible:\n" .
+        "     -> Check: ls -la /dev/disk/by-id/ | grep nvme-uuid\n" .
+        "  3. Verify TrueNAS NVMe-oF service is running\n" .
+        "     -> TrueNAS: System Settings > Services > NVMe-oF Target\n" .
+        "  4. Check network connectivity:\n" .
+        "     -> Check: ping %s\n" .
+        "  5. Review kernel logs for NVMe errors:\n" .
+        "     -> Check: dmesg | tail -50 | grep nvme\n\n" .
+        "The namespace exists on TrueNAS but the device did not appear.\n" .
+        "Manual cleanup may be required.",
+        $device_uuid,
+        $uuid_path,
+        $nqn,
+        $scfg->{api_host}
+    );
+
+    die $err_msg;
 }
 
 # Ensure NVMe subsystem exists on TrueNAS
@@ -3086,14 +3212,72 @@ sub _free_image_nvme {
 
     _log($scfg, 1, 'info', "_free_image_nvme: deleting NVMe namespace for $zname");
 
-    # 1) Delete NVMe namespace
-    eval {
-        _nvme_delete_namespace($scfg, $zname, $full_ds);
+    # Helper to detect "in use" errors
+    my $in_use = sub {
+        my ($err) = @_;
+        return $err =~ /in use|busy|mounted|cannot.*delete/i;
     };
-    if ($@) {
+
+    my $need_force_disconnect = 0;
+
+    # 1) Delete NVMe namespace
+    my $ok = eval {
+        _nvme_delete_namespace($scfg, $zname, $full_ds);
+        1;
+    };
+    if (!$ok) {
         my $err = $@ // '';
-        # Only warn if resource actually exists
-        warn "warning: delete NVMe namespace failed: $err" unless $err =~ /does not exist|ENOENT|not found/i;
+        if ($scfg->{force_delete_on_inuse} && $in_use->($err)) {
+            $need_force_disconnect = 1;
+            syslog('info', "NVMe namespace deletion blocked (in use), will retry after disconnect: $err");
+        } elsif ($err !~ /does not exist|ENOENT|not found/i) {
+            # Only warn if resource actually exists
+            warn "warning: delete NVMe namespace failed: $err";
+        }
+    }
+
+    # 2) If TrueNAS reported "in use" and force_delete_on_inuse=1, disconnect and retry
+    if ($need_force_disconnect) {
+        # Check if there are other active namespaces in this subsystem
+        my $active_ns_count = 0;
+        eval {
+            my $nqn = $scfg->{subsystem_nqn};
+            my $subsystems = _api_call($scfg, 'nvmet.subsys.query',
+                [[ ["subnqn", "=", $nqn] ]],
+                sub { die "REST API not supported for NVMe-oF operations\n"; });
+
+            if ($subsystems && @$subsystems) {
+                my $subsys_id = $subsystems->[0]{id};
+                my $namespaces = _api_call($scfg, 'nvmet.namespace.query',
+                    [[ ["subsys_id", "=", $subsys_id] ]],
+                    sub { die "REST API not supported for NVMe-oF operations\n"; });
+                $active_ns_count = $namespaces ? scalar(@$namespaces) : 0;
+            }
+        };
+
+        # Only disconnect if this is the last namespace, or if we can't determine count
+        # This prevents breaking multi-disk operations
+        if ($active_ns_count <= 1 || $@) {
+            syslog('info', "Disconnecting NVMe subsystem to retry namespace deletion (active namespaces: $active_ns_count)");
+            _nvme_disconnect($scfg);
+            # Wait for NVMe disconnect to complete
+            syslog('info', "Waiting for NVMe disconnect to complete...");
+            sleep(1);
+            eval { run_command(['udevadm','settle'], outfunc => sub {}) };
+
+            # Retry namespace deletion
+            eval {
+                _nvme_delete_namespace($scfg, $zname, $full_ds);
+            };
+            if ($@) {
+                syslog('info', "Could not delete namespace for $zname (subsystem may be in use by other cluster nodes). Orphaned resources will be cleaned up by TrueNAS.");
+            } else {
+                # Reconnect after successful deletion
+                eval { _nvme_connect($scfg) };
+            }
+        } else {
+            syslog('info', "Skipping NVMe disconnect during namespace deletion - $active_ns_count other namespaces active (preserves multi-disk operations)");
+        }
     }
 
     # 2) Delete all snapshots before deleting the zvol dataset
@@ -3787,12 +3971,19 @@ sub _clone_image_iscsi {
             insecure_tpc => JSON::PP::true,
         };
 
-        my $ext = _api_call(
-            $scfg,
-            'iscsi.extent.create',
-            [ $extent_payload ],
-            sub { _rest_call($scfg, 'POST', '/iscsi/extent', $extent_payload) },
-        );
+        my $ext = eval {
+            _api_call(
+                $scfg,
+                'iscsi.extent.create',
+                [ $extent_payload ],
+                sub { _rest_call($scfg, 'POST', '/iscsi/extent', $extent_payload) },
+            );
+        };
+        if ($@) {
+            # Cleanup: delete the zvol clone if extent creation failed
+            eval { _tn_dataset_delete($scfg, $target_full) };
+            die "Failed to create iSCSI extent for clone: $@\n";
+        }
         $extent_id = ref($ext) eq 'HASH' ? $ext->{id} : $ext;
     }
 
@@ -3811,12 +4002,23 @@ sub _clone_image_iscsi {
         # Mapping doesn't exist, create it
         _log($scfg, 2, 'debug', "Creating target-extent mapping for clone extent_id=$extent_id to target_id=$target_id");
         my $tx_payload = { target => $target_id, extent => $extent_id };
-        my $tx = _api_call(
-            $scfg,
-            'iscsi.targetextent.create',
-            [ $tx_payload ],
-            sub { _rest_call($scfg, 'POST', '/iscsi/targetextent', $tx_payload) },
-        );
+        my $tx = eval {
+            _api_call(
+                $scfg,
+                'iscsi.targetextent.create',
+                [ $tx_payload ],
+                sub { _rest_call($scfg, 'POST', '/iscsi/targetextent', $tx_payload) },
+            );
+        };
+        if ($@) {
+            # Cleanup: delete extent and zvol if mapping creation failed
+            eval {
+                _api_call($scfg, 'iscsi.extent.delete', [$extent_id],
+                    sub { _rest_call($scfg, 'DELETE', "/iscsi/extent/id/$extent_id", undef) });
+            };
+            eval { _tn_dataset_delete($scfg, $target_full) };
+            die "Failed to create target-extent mapping for clone: $@\n";
+        }
 
         # Invalidate cache after creating new mapping
         _clear_cache($scfg->{storeid} || 'unknown');

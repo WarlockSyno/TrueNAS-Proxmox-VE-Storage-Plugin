@@ -1,5 +1,34 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.1.1 (November 1, 2025)
+
+### 🔧 **Transport Enhancements: NVMe/iSCSI Feature Parity**
+
+Significant improvements to both NVMe/TCP and iSCSI transports, bringing NVMe to feature parity with the mature iSCSI implementation.
+
+#### **NVMe/TCP Improvements**
+- **Added subsystem validation to pre-flight checks** - Validates subsystem existence before allocation, providing early error detection similar to iSCSI target validation
+- **Fixed resize rescan bug** - Corrected critical bug where NVMe resize used subsystem NQN instead of device path for `nvme ns-rescan` command
+- **Implemented force-delete retry logic** - Mirrors iSCSI's disconnect/retry behavior for "in use" errors, with intelligent multi-disk operation protection
+- **Enhanced device readiness validation** - Progressive backoff strategy with block device checks (not just symlink existence), automatic controller rescans, and detailed troubleshooting output
+- **Improved error messages** - Added comprehensive 5-step diagnostic guides with specific commands for troubleshooting device discovery failures
+
+#### **iSCSI Improvements**
+- **Added clone cleanup on failure** - Extent and target-extent mapping creation now properly clean up ZFS clone if operations fail, preventing orphaned resources
+
+#### **Bug Fixes**
+- Fixed NVMe resize using invalid NQN parameter for namespace rescan (now correctly uses controller device paths like `/dev/nvme3`)
+- NVMe device validation now checks for actual block devices using `-b` flag, not just symlink existence
+- Added proper progressive intervention during device wait (settle → rescan → trigger)
+
+#### **Code Quality**
+- Both transports now have equivalent robustness in error handling and retry logic
+- Consistent cleanup patterns across clone operations in both iSCSI and NVMe
+- Better multi-disk operation detection to avoid breaking concurrent tasks
+- Enhanced logging with detailed operation context
+
+---
+
 ## Version 1.1.0 (October 31, 2025)
 
 ### 🚀 **Major Feature: NVMe/TCP Transport Support**
