@@ -41,6 +41,8 @@ This guide covers setting up NVMe over TCP (NVMe/TCP) storage with the TrueNAS P
 - Low-latency network recommended (1GbE minimum, 10GbE+ preferred)
 - For multipath: Multiple network interfaces configured
 
+**Note**: TrueNAS SCALE 25.10+ automatically defaults to port 4420 for NVMe/TCP. Manual port specification is optional unless using a non-standard port.
+
 ## TrueNAS Configuration
 
 ### Enable NVMe-oF Target Service
@@ -82,8 +84,10 @@ The plugin automatically creates subsystems when needed, but you can create them
    - Configure:
      - **Name**: Short identifier (e.g., `proxmox-nvme`)
      - **Subsystem NQN**: Full NQN (e.g., `nqn.2005-10.org.freenas.ctl:proxmox-nvme`)
-     - **Allow Any Host**: Enable for testing, disable for production with DH-CHAP
+     - **Allow Any Host**: Enable for testing, disable for production
    - Click **Save**
+
+   **SECURITY WARNING**: `allow_any_host: true` permits ANY host to access your storage without authentication. This should ONLY be used in isolated test environments. Production deployments MUST disable `allow_any_host` and explicitly link authorized hosts.
 
 2. **Via TrueNAS API:**
    ```bash
@@ -186,6 +190,7 @@ truenasplugin: truenas-nvme
 **Important Notes:**
 - `api_transport ws` is **required** - REST API does not support NVMe operations
 - The default port for NVMe/TCP is `4420` (different from iSCSI's `3260`)
+- TrueNAS SCALE 25.10+ automatically uses port 4420; manual specification is optional
 - `subsystem_nqn` cannot be changed after creation (prevents orphaned volumes)
 
 ### Verify Connection
@@ -278,16 +283,21 @@ DH-HMAC-CHAP provides secure authentication between Proxmox hosts and TrueNAS:
 
 On the Proxmox host, generate authentication secrets:
 
-**Generate host secret:**
+**Generate host secret (256-bit with SHA-256):**
 ```bash
-nvme gen-dhchap-key /dev/nvme0 --key-length=32 --hmac=1
+nvme gen-dhchap-key --key-length 32 --hmac 1
 # Output: DHHC-1:01:l29rbM7waP9bX4gjmx0e6S6eK5sDb7a5c0jZJG2XxcwvDbY0:
 ```
 
 **Generate controller secret (for bidirectional auth):**
 ```bash
-nvme gen-dhchap-key /dev/nvme0 --key-length=32 --hmac=1
+nvme gen-dhchap-key --key-length 32 --hmac 1
 # Output: DHHC-1:01:6Fk0dLGH1uPYPVKlyTNOWf4dk8FNOs9abL1p4cT0Qq2yEXLq:
+```
+
+**Note**: When using HMAC functions (1, 2, or 3), you may need to specify the host NQN:
+```bash
+nvme gen-dhchap-key --key-length 32 --hmac 1 --nqn $(cat /etc/nvme/hostnqn)
 ```
 
 **Secret Format:**
@@ -323,18 +333,38 @@ curl -k -X POST 'https://TRUENAS_IP/api/v2.0/nvmet/host' \
 - `dhchap_ctrl_key`: Controller secret (TrueNAS authenticates to Proxmox) - optional
 - `dhchap_hash`: Hash algorithm (`SHA-256`, `SHA-384`, or `SHA-512`)
 
-**Update Subsystem for Authentication:**
+**Link Host to Subsystem:**
 
-Disable `allow_any_host` to require authentication:
+To restrict access to specific hosts, disable `allow_any_host` and create host-subsystem associations:
 
 ```bash
+# Step 1: Disable allow_any_host on the subsystem
 curl -k -X PUT 'https://TRUENAS_IP/api/v2.0/nvmet/subsys/id/SUBSYS_ID' \
   -H 'Authorization: Bearer YOUR_API_KEY' \
   -H 'Content-Type: application/json' \
   -d '{"allow_any_host": false}'
+
+# Step 2: Get the host ID (query existing hosts)
+curl -k -X GET 'https://TRUENAS_IP/api/v2.0/nvmet/host' \
+  -H 'Authorization: Bearer YOUR_API_KEY'
+# Returns: [{"id": 1, "hostnqn": "nqn.2014-08.org.nvmexpress:uuid:...", ...}]
+
+# Step 3: Get the subsystem ID (query existing subsystems)
+curl -k -X GET 'https://TRUENAS_IP/api/v2.0/nvmet/subsys' \
+  -H 'Authorization: Bearer YOUR_API_KEY'
+# Returns: [{"id": 1, "name": "proxmox-nvme", "subnqn": "nqn.2005-10.org.freenas.ctl:proxmox-nvme", ...}]
+
+# Step 4: Link the host to the subsystem
+curl -k -X POST 'https://TRUENAS_IP/api/v2.0/nvmet/host_subsys' \
+  -H 'Authorization: Bearer YOUR_API_KEY' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "host_id": 1,
+    "subsys_id": 1
+  }'
 ```
 
-Then link the host to the subsystem (exact API endpoint varies - consult TrueNAS docs).
+**Important**: When `allow_any_host: false`, ONLY explicitly linked hosts can connect to the subsystem. DH-CHAP authentication is an optional additional security layer.
 
 ### Configure on Proxmox
 
