@@ -11,7 +11,7 @@ set -euo pipefail
 # CONSTANTS AND CONFIGURATION
 # ============================================================================
 
-readonly INSTALLER_VERSION="1.0.2"
+readonly INSTALLER_VERSION="1.1.0"
 readonly GITHUB_REPO="WarlockSyno/truenasplugin"
 readonly PLUGIN_FILE="/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm"
 readonly STORAGE_CFG="/etc/pve/storage.cfg"
@@ -1763,7 +1763,7 @@ validate_storage_name() {
 storage_name_exists() {
     local name="$1"
     if [[ -f "$STORAGE_CFG" ]]; then
-        grep -q "^truenas: ${name}$" "$STORAGE_CFG"
+        grep -q "^truenasplugin: ${name}$" "$STORAGE_CFG"
     else
         return 1
     fi
@@ -1848,6 +1848,46 @@ verify_dataset() {
     fi
 }
 
+# Discover available TrueNAS portals from network interfaces
+discover_truenas_portals() {
+    local ip="$1"
+    local apikey="$2"
+    local primary_ip="$3"
+
+    local url="https://${ip}/api/v2.0/interface"
+    local tool
+    tool=$(get_download_tool)
+
+    local response
+    case "$tool" in
+        curl)
+            response=$(curl -sk -H "Authorization: Bearer $apikey" "$url" 2>/dev/null)
+            ;;
+        wget)
+            response=$(wget --no-check-certificate --quiet -O - --header="Authorization: Bearer $apikey" "$url" 2>/dev/null)
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    if [[ -z "$response" ]]; then
+        return 1
+    fi
+
+    # Extract IP addresses from interfaces, excluding the primary IP
+    # Parse JSON to find all "address" fields with IPv4 addresses
+    local portals
+    portals=$(echo "$response" | grep -Po '"address":\s*"\K[0-9.]+' | grep -v "^127\." | grep -v "^${primary_ip}$" | sort -u)
+
+    if [[ -z "$portals" ]]; then
+        return 1
+    fi
+
+    echo "$portals"
+    return 0
+}
+
 # Backup storage.cfg
 backup_storage_cfg() {
     if [[ ! -f "$STORAGE_CFG" ]]; then
@@ -1881,6 +1921,8 @@ generate_storage_config() {
     local portal="${6:-}"
     local blocksize="${7:-16k}"
     local sparse="${8:-1}"
+    local use_multipath="${9:-}"
+    local portals="${10:-}"
 
     cat <<EOF
 truenasplugin: ${name}
@@ -1903,6 +1945,17 @@ EOF
     if [[ -n "$sparse" ]]; then
         echo "	tn_sparse ${sparse}"
     fi
+
+    if [[ -n "$use_multipath" ]]; then
+        echo "	use_multipath ${use_multipath}"
+    fi
+
+    if [[ -n "$portals" ]]; then
+        echo "	portals ${portals}"
+    fi
+
+    # Always add content type
+    echo "	content images"
 }
 
 # Add storage configuration to storage.cfg
@@ -2013,12 +2066,109 @@ menu_configure_storage() {
     read -rp "Enable sparse volumes? (0/1) [1]: " sparse
     sparse="${sparse:-1}"
 
+    # Multipath configuration
+    echo
+    info "Advanced Options:"
+    local use_multipath=""
+    local portals=""
+    read -rp "Enable multipath I/O for redundancy/load balancing? (y/N): " enable_mp
+
+    if [[ "$enable_mp" =~ ^[Yy] ]]; then
+        # Check for multipath-tools package
+        if ! command -v multipath &> /dev/null; then
+            warning "multipath-tools package is not installed"
+            info "Multipath requires: apt-get install multipath-tools"
+            read -rp "Continue configuring multipath anyway? (y/N): " continue_mp
+            if [[ ! "$continue_mp" =~ ^[Yy] ]]; then
+                info "Multipath disabled"
+            else
+                use_multipath="1"
+            fi
+        else
+            use_multipath="1"
+        fi
+
+        # If multipath is enabled, discover and select additional portals
+        if [[ "$use_multipath" == "1" ]]; then
+            echo
+            info "Discovering available portals from TrueNAS..."
+            local discovered_portals
+            discovered_portals=$(discover_truenas_portals "$truenas_ip" "$api_key" "$truenas_ip")
+
+            if [[ -n "$discovered_portals" ]]; then
+                success "Found available portal IPs:"
+                local portal_array=()
+                local idx=1
+                while IFS= read -r ip; do
+                    echo "  $idx) $ip"
+                    portal_array+=("$ip")
+                    ((idx++))
+                done <<< "$discovered_portals"
+
+                echo
+                info "Select additional portals for multipath (space-separated numbers, e.g., '1 2')"
+                info "Note: Portals should be on different subnets for proper multipath operation"
+                read -rp "Portal numbers (or press Enter to skip): " portal_choices
+
+                if [[ -n "$portal_choices" ]]; then
+                    local selected_portals=()
+                    local invalid_choices=()
+                    for choice in $portal_choices; do
+                        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -lt "$idx" ]]; then
+                            selected_portals+=("${portal_array[$((choice-1))]}:3260")
+                        elif [[ "$choice" =~ ^[0-9]+$ ]]; then
+                            invalid_choices+=("$choice")
+                        fi
+                    done
+
+                    if [[ ${#invalid_choices[@]} -gt 0 ]]; then
+                        warning "Invalid selections ignored: ${invalid_choices[*]}"
+                    fi
+
+                    if [[ ${#selected_portals[@]} -gt 0 ]]; then
+                        portals=$(IFS=,; echo "${selected_portals[*]}")
+                        success "Selected portals: $portals"
+                    else
+                        warning "No valid portals selected"
+                    fi
+                fi
+            else
+                warning "Could not discover portals automatically"
+                info "You can enter portals manually"
+            fi
+
+            # Fallback to manual entry
+            if [[ -z "$portals" ]]; then
+                echo
+                info "Enter additional portals manually (comma-separated IP:port)"
+                info "Example: 192.168.10.101:3260,192.168.10.102:3260"
+                read -rp "Additional portals (or press Enter to skip): " portals
+
+                # Validate manual portal entry format
+                if [[ -n "$portals" ]]; then
+                    if [[ ! "$portals" =~ ^[0-9.,:]+$ ]]; then
+                        warning "Invalid portal format. Expected: IP:port,IP:port"
+                        info "Clearing invalid portal entry"
+                        portals=""
+                    fi
+                fi
+
+                if [[ -z "$portals" ]]; then
+                    warning "No additional portals configured - multipath will not function"
+                    warning "You must configure multiple portals for multipath to work"
+                fi
+            fi
+        fi
+    else
+        use_multipath="0"
+    fi
+
     # Generate configuration
     echo
     info "Configuration summary:"
     echo "─────────────────────────────────────────────────────────"
     local config
-    config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$target" "$portal" "$blocksize" "$sparse")
+    config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$target" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals")
     echo "$config"
     echo "─────────────────────────────────────────────────────────"
     echo
@@ -2040,6 +2190,15 @@ menu_configure_storage() {
         echo "     qm create 999 --name test-vm && qm set 999 --scsi0 ${storage_name}:10"
         echo "  2. Check storage status: pvesm status"
         echo "  3. View storage details: pvesm list ${storage_name}"
+
+        # Add multipath-specific next steps if enabled
+        if [[ "$use_multipath" == "1" ]]; then
+            echo "  4. Verify multipath configuration: multipath -ll"
+            echo "  5. Check multipath service status: systemctl status multipathd"
+            if ! command -v multipath &> /dev/null; then
+                echo "  6. Install multipath-tools: apt-get install multipath-tools"
+            fi
+        fi
     else
         error "Failed to add configuration"
         return 1

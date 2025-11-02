@@ -188,18 +188,40 @@ TrueNAS IP address: 192.168.1.100
 TrueNAS API key: 1-abc123def456...
 ZFS dataset path: tank/proxmox
 iSCSI target IQN: iqn.2005-10.org.freenas.ctl:proxmox
-Discovery portal (IP:PORT): 192.168.1.100:3260
-Enable multipath? (y/N): n
-Enable API insecure mode? (Y/n): y
+Portal IP (optional, press Enter to use TrueNAS IP): 192.168.1.100
+Block size [16k]: 16k
+Enable sparse volumes? (0/1) [1]: 1
+
+# Advanced Options:
+Enable multipath I/O for redundancy/load balancing? (y/N): y
+
+# If multipath enabled, wizard will:
+# ✓ Check for multipath-tools package installation
+# ✓ Discover available portal IPs from TrueNAS network interfaces
+# ✓ Present selectable list of discovered portals
+# ✓ Allow manual portal entry if discovery fails
+# ✓ Warn if no additional portals configured
+
+# Example multipath portal selection:
+Discovering available portals from TrueNAS...
+Found available portal IPs:
+  1) 192.168.1.101
+  2) 192.168.1.102
+  3) 192.168.2.100
+
+Select additional portals for multipath (space-separated numbers, e.g., '1 2')
+Note: Portals should be on different subnets for proper multipath operation
+Portal numbers (or press Enter to skip): 1 2
 
 # Wizard then:
 # ✓ Tests TrueNAS API connectivity
 # ✓ Verifies dataset exists
-# ✓ Generates configuration block
+# ✓ Generates configuration block with multipath settings
 # ✓ Shows preview for review
 # ✓ Backs up /etc/pve/storage.cfg
 # ✓ Appends new configuration
 # ✓ Confirms success
+# ✓ Provides multipath verification commands (if enabled)
 ```
 
 #### Health Check

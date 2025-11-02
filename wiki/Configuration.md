@@ -248,6 +248,10 @@ prefer_ipv4 1
 
 Configure multiple portals for failover and multipath.
 
+**Configuration Methods**:
+- **Interactive Installer (v1.1.0+)**: Automatically discovers and presents available portal IPs from TrueNAS when multipath is enabled
+- **Manual**: Add comma-separated IP:port pairs to `/etc/pve/storage.cfg`
+
 ```ini
 portals 192.168.1.101:3260,192.168.1.102:3260
 ```

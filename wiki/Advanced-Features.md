@@ -150,7 +150,27 @@ Create multiple portals in **Shares** → **Block Shares (iSCSI)** → **Portals
 
 Multipath provides redundancy and load balancing across multiple network paths to your TrueNAS storage.
 
-#### Quick Start
+#### Configuration Methods
+
+##### Interactive Installer (Recommended)
+
+The interactive installer (v1.1.0+) can automatically discover and configure multipath:
+
+```bash
+./install.sh
+# Choose "Configure storage" from main menu
+# When prompted "Enable multipath I/O for redundancy/load balancing? (y/N)": y
+# Installer will:
+# - Automatically discover available portal IPs from TrueNAS
+# - Present them for selection
+# - Generate proper configuration with use_multipath and portals
+```
+
+This is the easiest method as the installer handles portal discovery and validation automatically.
+
+##### Manual Configuration
+
+Add to your storage configuration in `/etc/pve/storage.cfg`:
 
 ```ini
 use_multipath 1
