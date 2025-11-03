@@ -444,6 +444,190 @@ show_cluster_warning() {
     return 1
 }
 
+# Get current node name from cluster membership
+get_current_node_name() {
+    if [[ ! -f /etc/pve/.members ]]; then
+        echo ""
+        return 1
+    fi
+
+    # Extract nodename from JSON
+    grep -Po '"nodename":\s*"\K[^"]+' /etc/pve/.members 2>/dev/null || echo ""
+}
+
+# Get list of all cluster nodes with their IPs
+# Returns array of "nodename:ip" strings
+get_cluster_nodes() {
+    if [[ ! -f /etc/pve/.members ]]; then
+        return 1
+    fi
+
+    local -a nodes=()
+    local content
+    content=$(cat /etc/pve/.members 2>/dev/null) || return 1
+
+    # Validate basic JSON structure
+    if [[ ! "$content" =~ \{.*nodelist.*\} ]]; then
+        log "ERROR" "Invalid or corrupted /etc/pve/.members file - missing nodelist structure"
+        return 1
+    fi
+
+    # Extract nodelist section and parse each node entry
+    # Look for pattern: "nodename": { ... "ip": "x.x.x.x" ... }
+    local in_nodelist=false
+    local current_node=""
+
+    while IFS= read -r line; do
+        # Check if we're in the nodelist section
+        if [[ "$line" =~ \"nodelist\" ]]; then
+            in_nodelist=true
+            continue
+        fi
+
+        if [[ "$in_nodelist" == true ]]; then
+            # Extract node name from line like: "nodename": {
+            # Supports any valid hostname (alphanumeric, dots, hyphens, underscores)
+            if [[ "$line" =~ \"([a-zA-Z0-9._-]+)\":[[:space:]]*\{ ]]; then
+                current_node="${BASH_REMATCH[1]}"
+            fi
+
+            # Extract IP from line like: "ip": "10.15.14.195"
+            if [[ -n "$current_node" ]] && [[ "$line" =~ \"ip\":[[:space:]]*\"([0-9.]+)\" ]]; then
+                local ip="${BASH_REMATCH[1]}"
+
+                # Validate IP format (basic check for x.x.x.x pattern)
+                if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+                    # Validate each octet is 0-255
+                    local valid=true
+                    IFS='.' read -ra octets <<< "$ip"
+                    for octet in "${octets[@]}"; do
+                        if [[ "$octet" -gt 255 ]]; then
+                            valid=false
+                            break
+                        fi
+                    done
+
+                    if [[ "$valid" == true ]]; then
+                        nodes+=("${current_node}:${ip}")
+                    fi
+                fi
+                current_node=""
+            fi
+
+            # Exit nodelist section when we hit the closing brace for the nodelist object
+            # Only exit if we have nodes and we're not in a node sub-object (current_node is empty)
+            if [[ "$line" =~ ^[[:space:]]*\}[[:space:]]*(,)?[[:space:]]*$ ]]; then
+                if [[ ${#nodes[@]} -gt 0 ]] && [[ -z "$current_node" ]]; then
+                    break
+                fi
+            fi
+        fi
+    done <<< "$content"
+
+    # Output the nodes array
+    printf '%s\n' "${nodes[@]}"
+    return 0
+}
+
+# Get list of remote cluster nodes (excludes current node)
+# Returns array of "nodename:ip" strings
+get_remote_cluster_nodes() {
+    local current_node
+    current_node=$(get_current_node_name)
+
+    if [[ -z "$current_node" ]]; then
+        return 1
+    fi
+
+    local -a all_nodes
+    mapfile -t all_nodes < <(get_cluster_nodes)
+
+    local -a remote_nodes=()
+    for node in "${all_nodes[@]}"; do
+        local name="${node%%:*}"
+        if [[ "$name" != "$current_node" ]]; then
+            remote_nodes+=("$node")
+        fi
+    done
+
+    # Output the remote nodes array
+    printf '%s\n' "${remote_nodes[@]}"
+    return 0
+}
+
+# Validate SSH connectivity to a cluster node
+# Args: $1 = node IP
+# Returns: 0 on success, 1 on failure
+validate_ssh_to_node() {
+    local node_ip="$1"
+
+    if [[ -z "$node_ip" ]]; then
+        return 1
+    fi
+
+    # Test SSH with timeout and batch mode (no password prompts)
+    if ssh -o ConnectTimeout=5 \
+           -o BatchMode=yes \
+           -o StrictHostKeyChecking=accept-new \
+           "root@${node_ip}" "echo test" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Validate SSH connectivity to all cluster nodes
+# Populates arrays: ssh_reachable_nodes, ssh_unreachable_nodes
+# Returns: 0 if all nodes reachable, 1 if any unreachable
+validate_cluster_ssh() {
+    local -a remote_nodes
+    mapfile -t remote_nodes < <(get_remote_cluster_nodes)
+
+    if [[ ${#remote_nodes[@]} -eq 0 ]]; then
+        info "No remote cluster nodes found"
+        return 0
+    fi
+
+    info "Validating SSH connectivity to cluster nodes..."
+    echo
+
+    ssh_reachable_nodes=()
+    ssh_unreachable_nodes=()
+
+    for node_info in "${remote_nodes[@]}"; do
+        local node_name="${node_info%%:*}"
+        local node_ip="${node_info##*:}"
+
+        printf "  Testing %s (%s)... " "$node_name" "$node_ip"
+
+        if validate_ssh_to_node "$node_ip"; then
+            echo "${c3}✓ Reachable${c0}"
+            ssh_reachable_nodes+=("$node_info")
+        else
+            echo "${c5}✗ Unreachable${c0}"
+            ssh_unreachable_nodes+=("$node_info")
+        fi
+    done
+
+    echo
+
+    if [[ ${#ssh_unreachable_nodes[@]} -gt 0 ]]; then
+        warning "Some nodes are not reachable via SSH:"
+        for node_info in "${ssh_unreachable_nodes[@]}"; do
+            local node_name="${node_info%%:*}"
+            local node_ip="${node_info##*:}"
+            echo "  • $node_name ($node_ip)"
+        done
+        echo
+        info "Ensure passwordless SSH is configured between cluster nodes"
+        info "To test manually: ssh root@<node_ip> hostname"
+        return 1
+    fi
+
+    success "All cluster nodes are reachable via SSH"
+    return 0
+}
+
 # ============================================================================
 # INSTALLATION STATE DETECTION
 # ============================================================================
@@ -1072,6 +1256,362 @@ restart_pve_services() {
     return 0
 }
 
+# Install plugin on a remote cluster node
+# Args: $1 = node IP, $2 = local plugin file path, $3 = version string (for backup naming)
+# Returns: 0 on success, 1 on failure, 2 on success with service restart failure
+install_plugin_on_remote_node() {
+    local node_ip="$1"
+    local plugin_file="$2"
+    local version="$3"
+
+    if [[ -z "$node_ip" || ! -f "$plugin_file" ]]; then
+        log "ERROR" "Remote installation: Invalid parameters (ip=$node_ip, file=$plugin_file)"
+        return 1
+    fi
+
+    local temp_remote="/tmp/TrueNASPlugin.pm.$$"
+    log "INFO" "Starting remote installation to $node_ip (version $version)"
+
+    # Transfer plugin file to remote node
+    if ! ssh -o ConnectTimeout=10 -o BatchMode=yes "root@${node_ip}" \
+        "cat > ${temp_remote}" < "$plugin_file" 2>/dev/null; then
+        log "ERROR" "Remote installation to $node_ip: SSH transfer failed"
+        echo "SSH transfer failed"
+        return 1
+    fi
+    log "INFO" "Remote installation to $node_ip: File transferred successfully"
+
+    # Validate plugin syntax on remote node
+    if ! ssh "root@${node_ip}" "perl -c ${temp_remote}" >/dev/null 2>&1; then
+        ssh "root@${node_ip}" "rm -f ${temp_remote}" 2>/dev/null
+        log "ERROR" "Remote installation to $node_ip: Syntax validation failed"
+        echo "Syntax validation failed"
+        return 1
+    fi
+    log "INFO" "Remote installation to $node_ip: Syntax validation passed"
+
+    # Create backup directory on remote if it doesn't exist
+    ssh "root@${node_ip}" "mkdir -p ${BACKUP_DIR}" 2>/dev/null
+
+    # Create backup on remote node (if plugin exists) using remote timestamp
+    local backup_result
+    backup_result=$(ssh "root@${node_ip}" "
+        if [[ -f ${PLUGIN_FILE} ]]; then
+            remote_ts=\$(date +%Y%m%d_%H%M%S)
+            if cp ${PLUGIN_FILE} ${BACKUP_DIR}/TrueNASPlugin.pm.backup.${version}.\${remote_ts} 2>&1; then
+                echo 'success'
+            else
+                echo 'failed'
+            fi
+        else
+            echo 'no-plugin'
+        fi
+    " 2>&1)
+
+    if [[ "$backup_result" == "failed" ]]; then
+        log "WARNING" "Remote installation to $node_ip: Backup creation failed (proceeding anyway)"
+        echo "Backup creation failed (proceeding anyway)" >&2
+    elif [[ "$backup_result" == "success" ]]; then
+        log "INFO" "Remote installation to $node_ip: Backup created successfully"
+    fi
+
+    # Install plugin on remote node atomically with error handling
+    if ! ssh "root@${node_ip}" "
+        set -e
+        mkdir -p \$(dirname ${PLUGIN_FILE})
+        cp ${temp_remote} ${PLUGIN_FILE}
+        chown root:root ${PLUGIN_FILE}
+        chmod 644 ${PLUGIN_FILE}
+        rm -f ${temp_remote}
+    " 2>&1; then
+        # Clean up temp file on failure
+        ssh "root@${node_ip}" "rm -f ${temp_remote}" 2>/dev/null || true
+        log "ERROR" "Remote installation to $node_ip: Installation failed"
+        echo "Installation failed"
+        return 1
+    fi
+    log "INFO" "Remote installation to $node_ip: Plugin installed successfully"
+
+    # Restart services on remote node
+    if ! ssh "root@${node_ip}" "systemctl restart pvedaemon pveproxy" 2>/dev/null; then
+        log "WARNING" "Remote installation to $node_ip: Service restart failed"
+        echo "Service restart failed - manual restart required"
+        return 2  # Special return code: installed but needs manual service restart
+    fi
+    log "INFO" "Remote installation to $node_ip: Services restarted successfully"
+
+    return 0
+}
+
+# Display cluster installation summary
+# Args: arrays successful_nodes, failed_nodes, failure_reasons
+show_cluster_install_summary() {
+    local total=$((${#successful_nodes[@]} + ${#failed_nodes[@]}))
+
+    echo
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    if [[ ${#successful_nodes[@]} -gt 0 ]]; then
+        success "Successfully updated ${#successful_nodes[@]} of $total nodes:"
+        for node in "${successful_nodes[@]}"; do
+            echo "  ${c3}✓${c0} $node"
+        done
+    fi
+
+    if [[ ${#failed_nodes[@]} -gt 0 ]]; then
+        echo
+        warning "Failed to update ${#failed_nodes[@]} nodes:"
+        for i in "${!failed_nodes[@]}"; do
+            echo "  ${c5}✗${c0} ${failed_nodes[$i]}: ${failure_reasons[$i]}"
+        done
+    fi
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+# Perform cluster-wide installation
+# Args: $1 = version (e.g., "latest" or "1.0.7")
+# Returns: 0 if any nodes succeeded, 1 if all failed
+perform_cluster_wide_installation() {
+    local version="${1:-latest}"
+    local include_local="${2:-true}"
+
+    print_header "Installing TrueNAS Plugin (Cluster-Wide)"
+
+    # Check for non-interactive mode
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        error "Cluster-wide installation requires interactive mode"
+        info "In non-interactive mode, the installer only updates the local node"
+        return 1
+    fi
+
+    # Validate cluster and SSH connectivity
+    if ! is_cluster_node; then
+        error "This is not a cluster node"
+        info "Cluster-wide installation is only available for clustered nodes"
+        return 1
+    fi
+
+    # Get remote nodes
+    local -a remote_nodes
+    mapfile -t remote_nodes < <(get_remote_cluster_nodes)
+
+    if [[ ${#remote_nodes[@]} -eq 0 ]]; then
+        warning "No remote cluster nodes found"
+        info "Falling back to local installation only"
+        perform_installation "$version"
+        return $?
+    fi
+
+    # Show cluster information
+    local current_node
+    current_node=$(get_current_node_name)
+    info "Current node: $current_node"
+    info "Remote nodes: ${#remote_nodes[@]}"
+    for node_info in "${remote_nodes[@]}"; do
+        local node_name="${node_info%%:*}"
+        local node_ip="${node_info##*:}"
+        echo "  • $node_name ($node_ip)"
+    done
+    echo
+
+    # Validate SSH connectivity
+    declare -a ssh_reachable_nodes
+    declare -a ssh_unreachable_nodes
+
+    if ! validate_cluster_ssh; then
+        echo
+        read -rp "Continue with only reachable nodes? (y/N): " continue_choice
+        if [[ ! "$continue_choice" =~ ^[Yy] ]]; then
+            info "Cluster installation cancelled"
+            return 1
+        fi
+        # Update remote_nodes to only include reachable ones
+        remote_nodes=("${ssh_reachable_nodes[@]}")
+    fi
+
+    # Confirmation prompt before proceeding
+    echo
+    warning "This will install/update the TrueNAS plugin on all cluster nodes"
+    info "Total nodes to update: $((${#remote_nodes[@]} + 1)) (1 local + ${#remote_nodes[@]} remote)"
+    echo
+    read -rp "Do you want to proceed? (y/N): " confirm_choice
+    if [[ ! "$confirm_choice" =~ ^[Yy] ]]; then
+        info "Cluster installation cancelled"
+        return 1
+    fi
+
+    # Download plugin from GitHub
+    info "Fetching release from GitHub..."
+    local release_data
+    if [[ "$version" == "latest" ]]; then
+        release_data=$(get_latest_release) || return 1
+    else
+        release_data=$(github_api_call "/releases/tags/v${version}") || {
+            error "Version $version not found"
+            return 1
+        }
+    fi
+
+    local install_version
+    install_version=$(get_release_version "$release_data")
+    info "Installing version: $install_version"
+
+    local download_url
+    download_url=$(get_plugin_download_url "$release_data")
+
+    local temp_file="/tmp/TrueNASPlugin.pm.$$"
+    if ! download_plugin "$download_url" "$temp_file"; then
+        error "Failed to download plugin"
+        rm -f "$temp_file"
+        return 1
+    fi
+
+    # Install on local node first if requested
+    if [[ "$include_local" == "true" ]]; then
+        echo
+        info "Installing on local node ($current_node)..."
+
+        if install_plugin_file "$temp_file"; then
+            if restart_pve_services; then
+                success "Local node installation completed"
+            else
+                warning "Local node installed but services may need manual restart"
+            fi
+        else
+            error "Local node installation failed"
+            rm -f "$temp_file"
+            return 1
+        fi
+    fi
+
+    # Install on remote nodes
+    echo
+    info "Installing on remote cluster nodes..."
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo
+
+    declare -a successful_nodes=()
+    declare -a failed_nodes=()
+    declare -a failure_reasons=()
+
+    local total_nodes=${#remote_nodes[@]}
+    local current=0
+
+    for node_info in "${remote_nodes[@]}"; do
+        ((current++))
+        local node_name="${node_info%%:*}"
+        local node_ip="${node_info##*:}"
+
+        printf "[%d/%d] %s (%s): " "$current" "$total_nodes" "$node_name" "$node_ip"
+
+        local error_msg
+        error_msg=$(install_plugin_on_remote_node "$node_ip" "$temp_file" "$install_version" 2>&1)
+        local result=$?
+
+        if [[ $result -eq 0 ]]; then
+            echo "${c3}✓ Success${c0}"
+            successful_nodes+=("$node_name")
+        elif [[ $result -eq 2 ]]; then
+            echo "${c4}⚠ Success (restart needed)${c0}"
+            successful_nodes+=("$node_name (services need restart)")
+        else
+            echo "${c5}✗ Failed${c0}"
+            failed_nodes+=("$node_name")
+            failure_reasons+=("${error_msg:-Unknown error}")
+        fi
+    done
+
+    rm -f "$temp_file"
+
+    # Show summary
+    show_cluster_install_summary
+
+    # Offer retry for failed nodes
+    if [[ ${#failed_nodes[@]} -gt 0 ]]; then
+        echo
+        read -rp "Retry failed nodes? (y/N): " retry_choice
+        if [[ "$retry_choice" =~ ^[Yy] ]]; then
+            info "Waiting 5 seconds before retry..."
+            sleep 5
+
+            # Download plugin again for retry
+            local retry_temp="/tmp/TrueNASPlugin.pm.retry.$$"
+            if download_plugin "$download_url" "$retry_temp"; then
+                echo
+                info "Retrying failed nodes..."
+                echo
+
+                declare -a retry_successful=()
+                declare -a retry_failed=()
+                declare -a retry_reasons=()
+
+                for i in "${!failed_nodes[@]}"; do
+                    local node_name="${failed_nodes[$i]}"
+
+                    # Find node IP from original list
+                    local node_ip=""
+                    for node_info in "${remote_nodes[@]}"; do
+                        if [[ "${node_info%%:*}" == "$node_name" ]]; then
+                            node_ip="${node_info##*:}"
+                            break
+                        fi
+                    done
+
+                    if [[ -z "$node_ip" ]]; then
+                        continue
+                    fi
+
+                    printf "  %s (%s): " "$node_name" "$node_ip"
+
+                    local retry_error
+                    retry_error=$(install_plugin_on_remote_node "$node_ip" "$retry_temp" "$install_version" 2>&1)
+                    local retry_result=$?
+
+                    if [[ $retry_result -eq 0 ]]; then
+                        echo "${c3}✓ Success${c0}"
+                        retry_successful+=("$node_name")
+                        # Move from failed to successful
+                        successful_nodes+=("$node_name")
+                    elif [[ $retry_result -eq 2 ]]; then
+                        echo "${c4}⚠ Success (restart needed)${c0}"
+                        retry_successful+=("$node_name (services need restart)")
+                        successful_nodes+=("$node_name (services need restart)")
+                    else
+                        echo "${c5}✗ Failed${c0}"
+                        retry_failed+=("$node_name")
+                        retry_reasons+=("${retry_error:-Unknown error}")
+                    fi
+                done
+
+                rm -f "$retry_temp"
+
+                # Update failed lists
+                failed_nodes=("${retry_failed[@]}")
+                failure_reasons=("${retry_reasons[@]}")
+
+                # Show updated summary
+                show_cluster_install_summary
+            fi
+        fi
+    fi
+
+    echo
+
+    if [[ ${#successful_nodes[@]} -gt 0 ]]; then
+        success "Cluster-wide installation completed"
+
+        if [[ "$include_local" == "true" ]]; then
+            show_next_steps
+        fi
+
+        return 0
+    else
+        error "All cluster nodes failed to update"
+        return 1
+    fi
+}
+
 # Full installation workflow
 perform_installation() {
     local version="${1:-latest}"
@@ -1216,9 +1756,17 @@ menu_not_installed() {
         local menu_options=("Install latest version" "Install specific version" "View available versions")
         local max_choice=3
 
+        # Add cluster-wide option if in a cluster
+        local cluster_option_position=0
+        if is_cluster_node; then
+            menu_options+=("Install latest version (all cluster nodes)")
+            max_choice=4
+            cluster_option_position=4
+        fi
+
         if [[ "$has_backups" = true ]]; then
             menu_options+=("Restore from backup ($backups available)")
-            max_choice=4
+            max_choice=$((max_choice + 1))
         fi
 
         # Check if backup cleanup should be offered
@@ -1274,7 +1822,16 @@ menu_not_installed() {
                 menu_view_versions
                 ;;
             4)
-                if [[ "$has_backups" = true ]]; then
+                # Check if this is cluster-wide option or backup/manage option
+                if [[ "$cluster_option_position" -eq 4 ]]; then
+                    # Cluster-wide installation
+                    if perform_cluster_wide_installation "latest"; then
+                        read -rp "Press Enter to return to main menu..."
+                        return 0
+                    else
+                        read -rp "Press Enter to return to main menu..."
+                    fi
+                elif [[ "$has_backups" = true ]]; then
                     menu_rollback
                 elif [[ "$should_manage_backups" = true ]]; then
                     menu_manage_backups
@@ -1283,6 +1840,15 @@ menu_not_installed() {
                 fi
                 ;;
             5)
+                if [[ "$has_backups" = true ]]; then
+                    menu_rollback
+                elif [[ "$should_manage_backups" = true ]]; then
+                    menu_manage_backups
+                else
+                    error "Invalid choice"
+                fi
+                ;;
+            6)
                 if [[ "$should_manage_backups" = true ]]; then
                     menu_manage_backups
                 else
@@ -1316,12 +1882,23 @@ menu_installed() {
         fi
 
         # Build menu dynamically
-        local -a menu_items=("Update to latest version" "Install specific version" "Configure storage" "Run health check" "View available versions" "Rollback to backup")
-        local max_choice=6
+        local -a menu_items=("Update to latest version")
+        local max_choice=1
+
+        # Add cluster-wide update option if in a cluster
+        local cluster_option_position=0
+        if is_cluster_node; then
+            menu_items+=("Update all cluster nodes")
+            max_choice=2
+            cluster_option_position=2
+        fi
+
+        menu_items+=("Install specific version" "Configure storage" "Run health check" "View available versions" "Rollback to backup")
+        max_choice=$((max_choice + 5))
 
         if [[ "$should_manage_backups" = true ]]; then
             menu_items+=("Manage backups")
-            max_choice=7
+            max_choice=$((max_choice + 1))
         fi
 
         menu_items+=("Uninstall plugin")
@@ -1338,6 +1915,7 @@ menu_installed() {
                 exit $EXIT_SUCCESS
                 ;;
             1)
+                # Update to latest version (local only)
                 if perform_installation "latest"; then
                     # Offer to run health check after successful update
                     if [[ "$NON_INTERACTIVE" != "true" ]]; then
@@ -1352,35 +1930,55 @@ menu_installed() {
                 read -rp "Press Enter to return to main menu..."
                 ;;
             2)
+                # This could be cluster-wide update OR install specific version
+                if [[ "$cluster_option_position" -eq 2 ]]; then
+                    # Cluster-wide update
+                    if perform_cluster_wide_installation "latest"; then
+                        read -rp "Press Enter to return to main menu..."
+                    else
+                        read -rp "Press Enter to return to main menu..."
+                    fi
+                else
+                    # Install specific version
+                    menu_install_specific_version
+                    read -rp "Press Enter to return to main menu..."
+                fi
+                ;;
+            3)
+                # Install specific version
                 menu_install_specific_version
                 read -rp "Press Enter to return to main menu..."
                 ;;
-            3)
+            4)
+                # Configure storage
                 menu_configure_storage
                 ;;
-            4)
+            5)
+                # Run health check
                 menu_health_check
                 ;;
-            5)
+            6)
+                # View available versions
                 menu_view_versions
                 ;;
-            6)
+            7)
+                # Rollback to backup
                 menu_rollback
                 ;;
-            7)
+            8)
+                # Manage backups OR Uninstall (depends on should_manage_backups)
                 if [[ "$should_manage_backups" = true ]]; then
                     menu_manage_backups
                 else
                     menu_uninstall
                     read -rp "Press Enter to return to main menu..."
-                    # After uninstall, break out of menu loop to re-detect installation state
                     return 0
                 fi
                 ;;
-            8)
+            9)
+                # Uninstall plugin (when manage backups is also present)
                 menu_uninstall
                 read -rp "Press Enter to return to main menu..."
-                # After uninstall, break out of menu loop to re-detect installation state
                 return 0
                 ;;
         esac
@@ -1402,9 +2000,10 @@ menu_view_versions() {
     echo
     echo "$releases" | grep -Po '"tag_name":\s*"\K[^"]+' | head -20 | while IFS= read -r tag; do
         # Extract corresponding name and date for this release
-        release_block=$(echo "$releases" | grep -A 5 "\"tag_name\":\s*\"$tag\"")
-        name=$(echo "$release_block" | grep -Po '"name":\s*"\K[^"]+' | head -1)
-        date=$(echo "$release_block" | grep -Po '"published_at":\s*"\K[^T]+' | head -1)
+        # Use grep -F for literal string matching and -A 10 to capture published_at field
+        release_block=$(echo "$releases" | grep -A 10 -F "\"tag_name\": \"$tag\"" || echo "")
+        name=$(echo "$release_block" | grep -Po '"name":\s*"\K[^"]+' | head -1 || echo "Release")
+        date=$(echo "$release_block" | grep -Po '"published_at":\s*"\K[^T]+' | head -1 || echo "Unknown date")
         version="${tag#v}"
         echo "  • v$version - $name ($date)"
     done
@@ -1474,6 +2073,19 @@ menu_health_check() {
 
     echo
     read -rp "Press Enter to continue..."
+}
+
+# Extract storage configuration block safely
+get_storage_config_value() {
+    local storage_name="$1"
+    local param_name="$2"
+    local config_block
+
+    # Extract only the configuration block for this storage (stop at next storage entry)
+    config_block=$(awk "/^truenasplugin: ${storage_name}\$/{flag=1; next} /^truenasplugin:/{flag=0} flag" "$STORAGE_CFG")
+
+    # Extract parameter from block
+    echo "$config_block" | grep "^\s*${param_name}" | awk '{print $2}' | head -1
 }
 
 # Perform health check on a storage
@@ -1556,7 +2168,7 @@ run_health_check() {
 
     # Check 4: Content type
     local content
-    content=$(grep -A10 "^truenasplugin: ${storage_name}$" "$STORAGE_CFG" | grep "^\s*content" | awk '{print $2}' | head -1)
+    content=$(get_storage_config_value "$storage_name" "content")
     if [[ "$content" == "images" ]]; then
         check_result "Content type" "OK" "images"
     elif [[ -n "$content" ]]; then
@@ -1567,9 +2179,9 @@ run_health_check() {
 
     # Check 5: TrueNAS API reachability
     local api_host
-    api_host=$(grep -A10 "^truenasplugin: ${storage_name}$" "$STORAGE_CFG" | grep "^\s*api_host" | awk '{print $2}' | head -1)
+    api_host=$(get_storage_config_value "$storage_name" "api_host")
     local api_port
-    api_port=$(grep -A10 "^truenasplugin: ${storage_name}$" "$STORAGE_CFG" | grep "^\s*api_port" | awk '{print $2}' | head -1)
+    api_port=$(get_storage_config_value "$storage_name" "api_port")
     api_port=${api_port:-443}
 
     if [[ -n "$api_host" ]]; then
@@ -1592,70 +2204,154 @@ run_health_check() {
 
     # Check 6: Dataset configuration
     local dataset
-    dataset=$(grep -A10 "^truenasplugin: ${storage_name}$" "$STORAGE_CFG" | grep "^\s*dataset" | awk '{print $2}' | head -1)
+    dataset=$(get_storage_config_value "$storage_name" "dataset")
     if [[ -n "$dataset" ]]; then
         check_result "Dataset" "OK" "$dataset"
     else
         check_result "Dataset" "CRITICAL" "Not configured"
     fi
 
-    # Check 7: Target IQN configuration
-    local target_iqn
-    target_iqn=$(grep -A10 "^truenasplugin: ${storage_name}$" "$STORAGE_CFG" | grep "^\s*target_iqn" | awk '{print $2}' | head -1)
-    if [[ -n "$target_iqn" ]]; then
-        check_result "Target IQN" "OK" "$target_iqn"
+    # Detect transport mode
+    local transport_mode
+    transport_mode=$(get_storage_config_value "$storage_name" "transport_mode")
+    transport_mode=${transport_mode:-iscsi}  # Default to iscsi if not specified
+
+    # Check 7: Transport-specific target/subsystem configuration
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        # Check for nvme-cli
+        if check_nvme_cli; then
+            check_result "nvme-cli" "OK" "Installed"
+        else
+            check_result "nvme-cli" "CRITICAL" "Not installed (required for NVMe/TCP)"
+        fi
+
+        # Check subsystem NQN
+        local subsystem_nqn
+        subsystem_nqn=$(get_storage_config_value "$storage_name" "subsystem_nqn")
+        if [[ -n "$subsystem_nqn" ]]; then
+            check_result "Subsystem NQN" "OK" "$subsystem_nqn"
+        else
+            check_result "Subsystem NQN" "CRITICAL" "Not configured"
+        fi
+
+        # Check host NQN
+        local hostnqn
+        hostnqn=$(get_storage_config_value "$storage_name" "hostnqn")
+        if [[ -n "$hostnqn" ]]; then
+            check_result "Host NQN" "OK" "$hostnqn"
+        elif [[ -f /etc/nvme/hostnqn ]]; then
+            local system_hostnqn
+            system_hostnqn=$(cat /etc/nvme/hostnqn 2>/dev/null | tr -d '\n')
+            check_result "Host NQN" "OK" "Using system: $system_hostnqn"
+        else
+            check_result "Host NQN" "WARNING" "Not configured (will use system default)"
+        fi
     else
-        check_result "Target IQN" "CRITICAL" "Not configured"
+        # iSCSI mode - check target IQN
+        local target_iqn
+        target_iqn=$(get_storage_config_value "$storage_name" "target_iqn")
+        if [[ -n "$target_iqn" ]]; then
+            check_result "Target IQN" "OK" "$target_iqn"
+        else
+            check_result "Target IQN" "CRITICAL" "Not configured"
+        fi
     fi
 
     # Check 8: Discovery portal
     local discovery_portal
-    discovery_portal=$(grep -A10 "^truenasplugin: ${storage_name}$" "$STORAGE_CFG" | grep "^\s*discovery_portal" | awk '{print $2}' | head -1)
+    discovery_portal=$(get_storage_config_value "$storage_name" "discovery_portal")
     if [[ -n "$discovery_portal" ]]; then
         check_result "Discovery portal" "OK" "$discovery_portal"
     else
         check_result "Discovery portal" "CRITICAL" "Not configured"
     fi
 
-    # Check 9: iSCSI sessions
-    if [[ -n "$target_iqn" ]]; then
-        printf "%-30s " "iSCSI sessions:"
-        start_spinner
-        local session_count
-        session_count=$(iscsiadm -m session 2>/dev/null | grep -c "$target_iqn" || echo "0")
-        local iscsi_result
-        if [[ "$session_count" -gt 0 ]]; then
-            iscsi_result="${COLOR_GREEN}✓${COLOR_RESET} $session_count active session(s)"
-            ((checks_passed++))
+    # Check 9: Sessions/Connections (transport-specific)
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        if [[ -n "$subsystem_nqn" ]]; then
+            printf "%-30s " "NVMe connections:"
+            start_spinner
+            local nvme_result
+            if check_nvme_cli && nvme list-subsys 2>/dev/null | grep -q "$subsystem_nqn"; then
+                local path_count live_count
+                path_count=$(nvme list-subsys 2>/dev/null | grep -A50 "$subsystem_nqn" | grep -c "transport: tcp" || echo "0")
+                live_count=$(nvme list-subsys 2>/dev/null | grep -A50 "$subsystem_nqn" | grep -c "state: live" || echo "0")
+                nvme_result="${COLOR_GREEN}✓${COLOR_RESET} Connected (${path_count} path(s), ${live_count} live)"
+                ((checks_passed++))
+            else
+                nvme_result="${COLOR_YELLOW}⚠${COLOR_RESET} Not connected"
+                ((warnings++))
+            fi
+            stop_spinner
+            echo -e "\r\033[K$(printf "%-30s " "NVMe connections:")${nvme_result}"
+            ((checks_total++))
         else
-            iscsi_result="${COLOR_YELLOW}⚠${COLOR_RESET} No active sessions"
-            ((warnings++))
+            check_result "NVMe connections" "SKIP" "Cannot check (no subsystem NQN)"
         fi
-        stop_spinner
-        echo -e "\r$(printf "%-30s " "iSCSI sessions:")${iscsi_result}"
-        ((checks_total++))
     else
-        check_result "iSCSI sessions" "SKIP" "Cannot check (no target IQN)"
+        # iSCSI sessions check
+        if [[ -n "$target_iqn" ]]; then
+            printf "%-30s " "iSCSI sessions:"
+            start_spinner
+            local session_count
+            session_count=$(iscsiadm -m session 2>/dev/null | grep -c "$target_iqn" || echo "0")
+            local iscsi_result
+            if [[ "$session_count" -gt 0 ]]; then
+                iscsi_result="${COLOR_GREEN}✓${COLOR_RESET} $session_count active session(s)"
+                ((checks_passed++))
+            else
+                iscsi_result="${COLOR_YELLOW}⚠${COLOR_RESET} No active sessions"
+                ((warnings++))
+            fi
+            stop_spinner
+            echo -e "\r$(printf "%-30s " "iSCSI sessions:")${iscsi_result}"
+            ((checks_total++))
+        else
+            check_result "iSCSI sessions" "SKIP" "Cannot check (no target IQN)"
+        fi
     fi
 
-    # Check 10: Multipath configuration
-    local use_multipath
-    use_multipath=$(grep -A10 "^truenasplugin: ${storage_name}$" "$STORAGE_CFG" | grep "^\s*use_multipath" | awk '{print $2}' | head -1)
-    if [[ "$use_multipath" == "1" ]]; then
-        ((checks_total++))
-        if command -v multipath &> /dev/null; then
-            local mpath_count
-            mpath_count=$(multipath -ll 2>/dev/null | grep -c "dm-" || echo "0")
-            if [[ "$mpath_count" -gt 0 ]]; then
-                check_result "Multipath" "OK" "$mpath_count device(s)"
+    # Check 10: Multipath configuration (transport-specific)
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        # Check native NVMe multipath
+        local portals
+        portals=$(get_storage_config_value "$storage_name" "portals")
+        if [[ -n "$portals" ]]; then
+            ((checks_total++))
+            if [[ -f /sys/module/nvme_core/parameters/multipath ]]; then
+                local nvme_mp
+                nvme_mp=$(cat /sys/module/nvme_core/parameters/multipath 2>/dev/null)
+                if [[ "$nvme_mp" == "Y" ]]; then
+                    check_result "Native multipath" "OK" "Enabled (kernel)"
+                else
+                    check_result "Native multipath" "WARNING" "Disabled in kernel"
+                fi
             else
-                check_result "Multipath" "WARNING" "Enabled but no devices"
+                check_result "Native multipath" "WARNING" "Cannot detect (nvme_core not loaded)"
             fi
         else
-            check_result "Multipath" "WARNING" "Enabled but multipath-tools not installed"
+            check_result "Native multipath" "SKIP" "No additional portals configured"
         fi
     else
-        check_result "Multipath" "SKIP" "Not enabled"
+        # iSCSI multipath check
+        local use_multipath
+        use_multipath=$(get_storage_config_value "$storage_name" "use_multipath")
+        if [[ "$use_multipath" == "1" ]]; then
+            ((checks_total++))
+            if command -v multipath &> /dev/null; then
+                local mpath_count
+                mpath_count=$(multipath -ll 2>/dev/null | grep -c "dm-" || echo "0")
+                if [[ "$mpath_count" -gt 0 ]]; then
+                    check_result "Multipath" "OK" "$mpath_count device(s)"
+                else
+                    check_result "Multipath" "WARNING" "Enabled but no devices"
+                fi
+            else
+                check_result "Multipath" "WARNING" "Enabled but multipath-tools not installed"
+            fi
+        else
+            check_result "Multipath" "SKIP" "Not enabled"
+        fi
     fi
 
     # Check 11: PVE daemon status
@@ -1765,6 +2461,102 @@ storage_name_exists() {
     if [[ -f "$STORAGE_CFG" ]]; then
         grep -q "^truenasplugin: ${name}$" "$STORAGE_CFG"
     else
+        return 1
+    fi
+}
+
+# Validate NQN format (must start with nqn.YYYY-MM.)
+validate_nqn() {
+    local nqn="$1"
+    if [[ $nqn =~ ^nqn\.[0-9]{4}-[0-9]{2}\. ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Check if nvme-cli is installed
+check_nvme_cli() {
+    if command -v nvme &> /dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+# Get or generate host NQN
+get_hostnqn() {
+    local hostnqn=""
+
+    # Check if hostnqn file exists
+    if [[ -f /etc/nvme/hostnqn ]]; then
+        hostnqn=$(cat /etc/nvme/hostnqn 2>/dev/null | tr -d '\n')
+        if [[ -n "$hostnqn" ]]; then
+            info "Found existing host NQN: $hostnqn"
+            read -rp "Use this host NQN? (Y/n): " use_existing
+            if [[ ! "$use_existing" =~ ^[Nn] ]]; then
+                echo "$hostnqn"
+                return 0
+            fi
+        fi
+    fi
+
+    # Generate new hostnqn
+    warning "No host NQN found or user declined existing one"
+    read -rp "Generate new host NQN? (Y/n): " gen_new
+    if [[ ! "$gen_new" =~ ^[Nn] ]]; then
+        if check_nvme_cli; then
+            mkdir -p /etc/nvme
+            if nvme gen-hostnqn > /etc/nvme/hostnqn 2>/dev/null; then
+                hostnqn=$(cat /etc/nvme/hostnqn 2>/dev/null | tr -d '\n')
+                if [[ -z "$hostnqn" ]]; then
+                    error "Generated hostnqn file is empty"
+                    return 1
+                fi
+                success "Generated new host NQN: $hostnqn"
+                echo "$hostnqn"
+                return 0
+            else
+                error "Failed to generate host NQN"
+                return 1
+            fi
+        else
+            error "nvme-cli not available to generate host NQN"
+            return 1
+        fi
+    fi
+
+    # Manual entry with validation
+    while true; do
+        read -rp "Enter host NQN manually (or press Enter to skip): " hostnqn
+        if [[ -z "$hostnqn" ]]; then
+            warning "No host NQN configured"
+            return 1
+        fi
+        if ! validate_nqn "$hostnqn"; then
+            error "Invalid NQN format. Must start with nqn.YYYY-MM."
+            continue
+        fi
+        break
+    done
+    echo "$hostnqn"
+    return 0
+}
+
+# Check NVMe native multipath status
+check_nvme_multipath() {
+    if [[ -f /sys/module/nvme_core/parameters/multipath ]]; then
+        local nvme_mp
+        nvme_mp=$(cat /sys/module/nvme_core/parameters/multipath 2>/dev/null)
+        if [[ "$nvme_mp" == "Y" ]]; then
+            info "Native NVMe multipath: ENABLED"
+            return 0
+        else
+            warning "Native NVMe multipath: DISABLED (may reduce redundancy)"
+            info "To enable: echo 'options nvme_core multipath=Y' > /etc/modprobe.d/nvme.conf"
+            info "Then reboot or reload nvme_core module"
+            return 1
+        fi
+    else
+        warning "Cannot detect NVMe multipath status (nvme_core module not loaded)"
         return 1
     fi
 }
@@ -1917,22 +2709,32 @@ generate_storage_config() {
     local ip="$2"
     local apikey="$3"
     local dataset="$4"
-    local target="$5"
+    local target_or_nqn="$5"  # target_iqn for iSCSI, subsystem_nqn for NVMe
     local portal="${6:-}"
     local blocksize="${7:-16k}"
     local sparse="${8:-1}"
     local use_multipath="${9:-}"
     local portals="${10:-}"
+    local transport_mode="${11:-iscsi}"  # Default to iscsi for backward compatibility
+    local hostnqn="${12:-}"
 
     cat <<EOF
 truenasplugin: ${name}
 	api_host ${ip}
 	api_key ${apikey}
 	dataset ${dataset}
-	target_iqn ${target}
-	api_insecure 1
-	shared 1
 EOF
+
+    # Add transport mode if not default iSCSI
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        echo "	transport_mode nvme-tcp"
+        echo "	subsystem_nqn ${target_or_nqn}"
+    else
+        echo "	target_iqn ${target_or_nqn}"
+    fi
+
+    echo "	api_insecure 1"
+    echo "	shared 1"
 
     if [[ -n "$portal" ]]; then
         echo "	discovery_portal ${portal}"
@@ -1946,12 +2748,18 @@ EOF
         echo "	tn_sparse ${sparse}"
     fi
 
-    if [[ -n "$use_multipath" ]]; then
+    # Only add use_multipath for iSCSI (NVMe uses native multipath)
+    if [[ -n "$use_multipath" ]] && [[ "$transport_mode" == "iscsi" ]]; then
         echo "	use_multipath ${use_multipath}"
     fi
 
     if [[ -n "$portals" ]]; then
         echo "	portals ${portals}"
+    fi
+
+    # Add hostnqn for NVMe if provided
+    if [[ -n "$hostnqn" ]] && [[ "$transport_mode" == "nvme-tcp" ]]; then
+        echo "	hostnqn ${hostnqn}"
     fi
 
     # Always add content type
@@ -2041,19 +2849,104 @@ menu_configure_storage() {
     # Verify dataset if API connection worked
     verify_dataset "$truenas_ip" "$api_key" "$dataset" || true
 
-    # iSCSI Target
-    local target
-    read -rp "iSCSI target (e.g., iqn.2025-01.com.truenas:target0): " target
-    if [[ -z "$target" ]]; then
-        error "iSCSI target cannot be empty"
-        return 1
+    # Transport mode selection
+    echo
+    info "Select transport protocol:"
+    echo "  1) iSCSI (traditional, widely compatible)"
+    echo "  2) NVMe/TCP (modern, lower latency)"
+    read -rp "Transport mode (1-2) [1]: " transport_choice
+    transport_choice=${transport_choice:-1}
+
+    local transport_mode
+    case "$transport_choice" in
+        1) transport_mode="iscsi" ;;
+        2) transport_mode="nvme-tcp" ;;
+        *)
+            error "Invalid choice, defaulting to iSCSI"
+            transport_mode="iscsi"
+            ;;
+    esac
+
+    # Transport-specific configuration
+    local target=""
+    local subsystem_nqn=""
+    local hostnqn=""
+
+    if [[ "$transport_mode" == "iscsi" ]]; then
+        # iSCSI Target
+        read -rp "iSCSI target (e.g., iqn.2025-01.com.truenas:target0): " target
+        if [[ -z "$target" ]]; then
+            error "iSCSI target cannot be empty"
+            return 1
+        fi
+    else
+        # NVMe/TCP configuration
+        # Check nvme-cli
+        if ! check_nvme_cli; then
+            warning "nvme-cli package is not installed"
+            info "NVMe/TCP requires nvme-cli for management"
+            read -rp "Install nvme-cli now? (Y/n): " install_nvme
+            if [[ ! "$install_nvme" =~ ^[Nn] ]]; then
+                info "Installing nvme-cli..."
+                if ! apt-get update; then
+                    error "Failed to update package lists (check network/repositories)"
+                    return 1
+                fi
+                if ! apt-get install -y nvme-cli; then
+                    error "Failed to install nvme-cli package"
+                    return 1
+                fi
+                if ! check_nvme_cli; then
+                    error "nvme-cli installed but 'nvme' command not found in PATH"
+                    info "Try running: hash -r  # to refresh PATH"
+                    return 1
+                fi
+                success "nvme-cli installed successfully"
+            else
+                warning "Proceeding without nvme-cli (some features may not work)"
+            fi
+        fi
+
+        # Subsystem NQN
+        while true; do
+            read -rp "NVMe subsystem NQN (e.g., nqn.2005-10.org.freenas.ctl:proxmox): " subsystem_nqn
+            if [[ -z "$subsystem_nqn" ]]; then
+                error "Subsystem NQN cannot be empty"
+                continue
+            fi
+            if ! validate_nqn "$subsystem_nqn"; then
+                error "Invalid NQN format. Must start with nqn.YYYY-MM."
+                continue
+            fi
+            break
+        done
+
+        # Host NQN
+        hostnqn=$(get_hostnqn)
+        if [[ -z "$hostnqn" ]]; then
+            warning "No host NQN configured (plugin will use system default)"
+        fi
+
+        # Check native multipath
+        echo
+        check_nvme_multipath || true
     fi
 
-    # Portal (optional)
+    # Portal (optional) - set default port based on transport
     local portal
+    local default_port
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        default_port="4420"
+    else
+        default_port="3260"
+    fi
+
     read -rp "Portal IP (optional, press Enter to use TrueNAS IP): " portal
     if [[ -z "$portal" ]]; then
-        portal="$truenas_ip"
+        portal="${truenas_ip}:${default_port}"
+    elif [[ ! "$portal" =~ : ]]; then
+        # Add default port if not specified
+        portal="${portal}:${default_port}"
     fi
 
     # Blocksize (optional)
@@ -2074,22 +2967,28 @@ menu_configure_storage() {
     read -rp "Enable multipath I/O for redundancy/load balancing? (y/N): " enable_mp
 
     if [[ "$enable_mp" =~ ^[Yy] ]]; then
-        # Check for multipath-tools package
-        if ! command -v multipath &> /dev/null; then
-            warning "multipath-tools package is not installed"
-            info "Multipath requires: apt-get install multipath-tools"
-            read -rp "Continue configuring multipath anyway? (y/N): " continue_mp
-            if [[ ! "$continue_mp" =~ ^[Yy] ]]; then
-                info "Multipath disabled"
+        if [[ "$transport_mode" == "iscsi" ]]; then
+            # Check for multipath-tools package (iSCSI only)
+            if ! command -v multipath &> /dev/null; then
+                warning "multipath-tools package is not installed"
+                info "Multipath requires: apt-get install multipath-tools"
+                read -rp "Continue configuring multipath anyway? (y/N): " continue_mp
+                if [[ ! "$continue_mp" =~ ^[Yy] ]]; then
+                    info "Multipath disabled"
+                else
+                    use_multipath="1"
+                fi
             else
                 use_multipath="1"
             fi
         else
-            use_multipath="1"
+            # NVMe/TCP uses native multipath
+            info "NVMe/TCP uses native kernel multipath (no dm-multipath required)"
+            use_multipath=""  # Don't set use_multipath flag for NVMe
         fi
 
-        # If multipath is enabled, discover and select additional portals
-        if [[ "$use_multipath" == "1" ]]; then
+        # If multipath is enabled (or for NVMe), discover and select additional portals
+        if [[ "$use_multipath" == "1" ]] || [[ "$transport_mode" == "nvme-tcp" ]]; then
             echo
             info "Discovering available portals from TrueNAS..."
             local discovered_portals
@@ -2115,7 +3014,7 @@ menu_configure_storage() {
                     local invalid_choices=()
                     for choice in $portal_choices; do
                         if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -lt "$idx" ]]; then
-                            selected_portals+=("${portal_array[$((choice-1))]}:3260")
+                            selected_portals+=("${portal_array[$((choice-1))]}:${default_port}")
                         elif [[ "$choice" =~ ^[0-9]+$ ]]; then
                             invalid_choices+=("$choice")
                         fi
@@ -2141,21 +3040,36 @@ menu_configure_storage() {
             if [[ -z "$portals" ]]; then
                 echo
                 info "Enter additional portals manually (comma-separated IP:port)"
-                info "Example: 192.168.10.101:3260,192.168.10.102:3260"
+                if [[ "$transport_mode" == "nvme-tcp" ]]; then
+                    info "Example: 192.168.10.101:4420,192.168.10.102:4420"
+                else
+                    info "Example: 192.168.10.101:3260,192.168.10.102:3260"
+                fi
                 read -rp "Additional portals (or press Enter to skip): " portals
 
                 # Validate manual portal entry format
                 if [[ -n "$portals" ]]; then
-                    if [[ ! "$portals" =~ ^[0-9.,:]+$ ]]; then
-                        warning "Invalid portal format. Expected: IP:port,IP:port"
-                        info "Clearing invalid portal entry"
+                    local portal_valid=true
+                    IFS=',' read -ra portal_list <<< "$portals"
+                    for p in "${portal_list[@]}"; do
+                        if [[ ! "$p" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}:[0-9]+$ ]]; then
+                            warning "Invalid portal format: $p"
+                            portal_valid=false
+                        fi
+                    done
+                    if [[ "$portal_valid" == "false" ]]; then
+                        warning "Clearing invalid portal entries"
                         portals=""
                     fi
                 fi
 
                 if [[ -z "$portals" ]]; then
-                    warning "No additional portals configured - multipath will not function"
-                    warning "You must configure multiple portals for multipath to work"
+                    if [[ "$transport_mode" == "iscsi" && "$use_multipath" == "1" ]]; then
+                        warning "No additional portals configured - multipath will not function"
+                        warning "You must configure multiple portals for multipath to work"
+                    elif [[ "$transport_mode" == "nvme-tcp" ]]; then
+                        info "Using single portal (you can add more later for native multipath redundancy)"
+                    fi
                 fi
             fi
         fi
@@ -2166,9 +3080,14 @@ menu_configure_storage() {
     # Generate configuration
     echo
     info "Configuration summary:"
+    info "Transport mode: ${transport_mode}"
     echo "─────────────────────────────────────────────────────────"
     local config
-    config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$target" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals")
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$subsystem_nqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "$hostnqn")
+    else
+        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$target" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "")
+    fi
     echo "$config"
     echo "─────────────────────────────────────────────────────────"
     echo

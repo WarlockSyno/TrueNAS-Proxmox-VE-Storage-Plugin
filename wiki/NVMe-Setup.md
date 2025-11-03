@@ -140,6 +140,30 @@ nvme gen-hostnqn > /etc/nvme/hostnqn
 
 ### Configure Storage
 
+**Option 1: Using Interactive Installer (Recommended)**
+
+The installer (v1.1.0+) includes a built-in configuration wizard that simplifies NVMe/TCP setup:
+
+```bash
+./install.sh
+# Choose "Configure storage" from main menu
+# Select "2) NVMe/TCP (modern, lower latency)" when prompted for transport mode
+```
+
+**The installer will automatically:**
+- Check for nvme-cli package (offers to install if missing)
+- Auto-populate host NQN from `/etc/nvme/hostnqn` (or generate one)
+- Prompt for subsystem NQN with format validation
+- Default to port 4420 for NVMe/TCP discovery portal
+- Detect native NVMe multipath status
+- Discover available portals from TrueNAS automatically
+- Generate complete storage configuration
+- Validate all settings before applying
+
+This is the easiest method for first-time NVMe/TCP setup.
+
+**Option 2: Manual Configuration**
+
 Edit `/etc/pve/storage.cfg` to add NVMe/TCP storage:
 
 **Minimal Configuration:**

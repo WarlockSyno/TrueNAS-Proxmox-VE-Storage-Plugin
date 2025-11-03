@@ -154,19 +154,34 @@ Multipath provides redundancy and load balancing across multiple network paths t
 
 ##### Interactive Installer (Recommended)
 
-The interactive installer (v1.1.0+) can automatically discover and configure multipath:
+The interactive installer (v1.1.0+) can automatically discover and configure multipath for both iSCSI and NVMe/TCP:
 
 ```bash
 ./install.sh
 # Choose "Configure storage" from main menu
+
+# Select transport mode:
+#   1) iSCSI (traditional, widely compatible)
+#   2) NVMe/TCP (modern, lower latency)
+
+# For iSCSI:
 # When prompted "Enable multipath I/O for redundancy/load balancing? (y/N)": y
 # Installer will:
+# - Check for multipath-tools package
 # - Automatically discover available portal IPs from TrueNAS
-# - Present them for selection
+# - Present them for selection (port 3260)
 # - Generate proper configuration with use_multipath and portals
+
+# For NVMe/TCP:
+# Installer will:
+# - Detect native NVMe multipath status (nvme_core.multipath)
+# - Automatically discover available portal IPs from TrueNAS
+# - Present them for selection (port 4420)
+# - Generate proper configuration with portals (no use_multipath flag needed)
+# - NVMe uses native kernel multipath automatically
 ```
 
-This is the easiest method as the installer handles portal discovery and validation automatically.
+This is the easiest method as the installer handles portal discovery, validation, and transport-specific configuration automatically.
 
 ##### Manual Configuration
 
@@ -868,18 +883,56 @@ truenasplugin: cluster-storage
 - Multiple portals - For redundancy
 - `use_multipath 1` - For failover
 
-### Cluster Deployment Script
+### Cluster Deployment
 
-Use the included deployment script to install on all nodes:
+#### Interactive Installer (Recommended)
+
+The installer provides native cluster-wide deployment from v1.1.0+:
+
+```bash
+# Run installer on any cluster node
+./install.sh
+
+# From the main menu:
+# - Option 1: "Install latest version (all cluster nodes)" (if not installed)
+# - Option 2: "Update all cluster nodes" (if already installed)
+
+# The installer will:
+# 1. Detect all cluster nodes from /etc/pve/.members
+# 2. Validate SSH connectivity to each node
+# 3. Download plugin from GitHub
+# 4. Install on local node first
+# 5. Deploy to remote nodes sequentially with progress tracking
+# 6. Create backups on each node before installation
+# 7. Restart services (pvedaemon, pveproxy) on each node
+# 8. Report success/failure for each node
+# 9. Offer automatic retry for failed nodes
+```
+
+**Advantages**:
+- Single command for entire cluster
+- Pre-flight validation prevents partial failures
+- Automatic backup on each node
+- Detailed progress and error reporting
+- Built-in retry logic
+
+**Requirements**:
+- Passwordless SSH between cluster nodes (Proxmox configures automatically)
+- Interactive mode (use main menu, not --non-interactive flag)
+
+#### Manual Deployment Script
+
+For automated deployments, use the standalone cluster script:
 
 ```bash
 # Deploy to specific nodes
+cd tools/
 ./update-cluster.sh node1 node2 node3
 
 # Script will:
 # 1. Copy TrueNASPlugin.pm to each node
 # 2. Install to /usr/share/perl5/PVE/Storage/Custom/
-# 3. Restart pvedaemon, pveproxy, pvestatd on each node
+# 3. Restart pvedaemon, pveproxy on each node
 # 4. Verify installation
 ```
 

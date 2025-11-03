@@ -76,9 +76,10 @@ curl -sSL https://raw.githubusercontent.com/WarlockSyno/truenasplugin/alpha/inst
 The installer provides:
 - ✅ Interactive menu-driven setup
 - ✅ Automatic version detection and updates
-- ✅ Built-in configuration wizard
+- ✅ Built-in configuration wizard (supports iSCSI and NVMe/TCP)
 - ✅ Health check validation
 - ✅ Backup and rollback support
+- ✅ Cluster-wide installation (install/update on all nodes simultaneously)
 - ✅ Cluster node compatibility
 
 **Alternative: Manual Installation**

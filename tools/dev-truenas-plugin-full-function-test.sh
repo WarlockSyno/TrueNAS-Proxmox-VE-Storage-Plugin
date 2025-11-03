@@ -1942,7 +1942,7 @@ print_performance_summary() {
 
 main() {
     echo "╔════════════════════════════════════════════════════════════════════╗" | tee "$LOG_FILE"
-    echo "║         TrueNAS Plugin Comprehensive Test Suite v1.0               ║" | tee -a "$LOG_FILE"
+    echo "║         TrueNAS Plugin Comprehensive Test Suite v1.1               ║" | tee -a "$LOG_FILE"
     echo "╚════════════════════════════════════════════════════════════════════╝" | tee -a "$LOG_FILE"
     echo | tee -a "$LOG_FILE"
 

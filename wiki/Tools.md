@@ -822,9 +822,13 @@ EOF
 
 ### Overview
 
-The cluster update script (`update-cluster.sh`) automates deployment of the TrueNAS plugin to all nodes in a Proxmox VE cluster. It copies the plugin file, installs it to the correct location, and restarts required services on each node.
+**Note**: As of installer v1.1.0, cluster-wide deployment is now available natively in the interactive installer. This standalone script (`update-cluster.sh`) remains available for automated deployments and CI/CD integration.
+
+The cluster update script automates deployment of the TrueNAS plugin to all nodes in a Proxmox VE cluster. It copies the plugin file, installs it to the correct location, and restarts required services on each node.
 
 **Location**: `tools/update-cluster.sh`
+
+**Recommendation**: For interactive deployments, use the built-in cluster-wide installation feature in `install.sh` (see [Installation Guide - Cluster Installation](Installation.md#cluster-installation-with-installer)). Use this standalone script for automation, scripts, or CI/CD pipelines.
 
 ### Features
 
