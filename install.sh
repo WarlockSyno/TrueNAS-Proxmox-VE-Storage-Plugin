@@ -2340,7 +2340,8 @@ run_health_check() {
             ((checks_total++))
             if command -v multipath &> /dev/null; then
                 local mpath_count
-                mpath_count=$(multipath -ll 2>/dev/null | grep -c "dm-" || echo "0")
+                mpath_count=$(multipath -ll 2>/dev/null | grep -c "dm-" 2>/dev/null || echo "0")
+                mpath_count=$(echo "$mpath_count" | head -1 | tr -d '\n ')
                 if [[ "$mpath_count" -gt 0 ]]; then
                     check_result "Multipath" "OK" "$mpath_count device(s)"
                 else
@@ -2429,6 +2430,31 @@ menu_install_specific_version() {
 # CONFIGURATION WIZARD
 # ============================================================================
 
+# List all TrueNAS plugin storage names
+list_truenas_storages() {
+    if [[ ! -f "$STORAGE_CFG" ]]; then
+        return 1
+    fi
+
+    grep "^truenasplugin:" "$STORAGE_CFG" 2>/dev/null | awk '{print $2}'
+}
+
+# Get all configuration values for a storage
+# Returns associative array-like output: "key=value" per line
+get_all_storage_config_values() {
+    local storage_name="$1"
+
+    if [[ ! -f "$STORAGE_CFG" ]]; then
+        return 1
+    fi
+
+    # Extract the entire configuration block for this storage
+    awk "/^truenasplugin: ${storage_name}\$/{flag=1; next} /^[a-z].*:/{flag=0} flag" "$STORAGE_CFG" | \
+    grep -v "^\s*$" | \
+    sed 's/^\s*//' | \
+    awk '{print $1 "=" $2}'
+}
+
 # Validate IP address format
 validate_ip() {
     local ip="$1"
@@ -2490,7 +2516,7 @@ get_hostnqn() {
     if [[ -f /etc/nvme/hostnqn ]]; then
         hostnqn=$(cat /etc/nvme/hostnqn 2>/dev/null | tr -d '\n')
         if [[ -n "$hostnqn" ]]; then
-            info "Found existing host NQN: $hostnqn"
+            info "Found existing host NQN: $hostnqn" >&2
             read -rp "Use this host NQN? (Y/n): " use_existing
             if [[ ! "$use_existing" =~ ^[Nn] ]]; then
                 echo "$hostnqn"
@@ -2615,12 +2641,16 @@ verify_dataset() {
     start_spinner
 
     local response
+    local http_code
     case "$tool" in
         curl)
-            response=$(curl -sk -H "Authorization: Bearer $apikey" "$url" 2>/dev/null)
+            response=$(curl -sk -w "\n%{http_code}" -H "Authorization: Bearer $apikey" "$url" 2>/dev/null)
+            http_code=$(echo "$response" | tail -n1)
+            response=$(echo "$response" | head -n-1)
             ;;
         wget)
             response=$(wget --no-check-certificate --quiet -O - --header="Authorization: Bearer $apikey" "$url" 2>/dev/null)
+            http_code="200"
             ;;
         *)
             stop_spinner
@@ -2631,7 +2661,13 @@ verify_dataset() {
 
     stop_spinner
     echo ""
-    if [[ -n "$response" ]] && echo "$response" | grep -Eq '\[\s*\{[^}]*"id"\s*:\s*"[^"]+"\s*[,}]'; then
+
+    if [[ "$http_code" != "200" ]]; then
+        warning "Dataset '$dataset' not found or not accessible"
+        return 1
+    fi
+
+    if [[ -n "$response" ]] && echo "$response" | grep -q "\"id\": \"${dataset}\""; then
         success "Dataset '$dataset' verified"
         return 0
     else
@@ -2785,6 +2821,245 @@ add_storage_config() {
     return 0
 }
 
+# Update existing storage configuration in storage.cfg
+update_storage_config() {
+    local storage_name="$1"
+    local new_config="$2"
+
+    if [[ ! -f "$STORAGE_CFG" ]]; then
+        error "Storage configuration file not found: $STORAGE_CFG"
+        return 1
+    fi
+
+    # Backup first
+    backup_storage_cfg || {
+        error "Failed to backup storage.cfg"
+        return 1
+    }
+
+    # Create temporary file
+    local temp_file="${STORAGE_CFG}.tmp.$$"
+
+    # Remove old storage block and write everything except that storage
+    awk -v storage="truenasplugin: ${storage_name}" '
+        $0 ~ "^" storage "$" { skip=1; next }
+        /^[a-z].*:/ { skip=0 }
+        !skip { print }
+    ' "$STORAGE_CFG" > "$temp_file"
+
+    # Append new configuration
+    echo "" >> "$temp_file"
+    echo "$new_config" >> "$temp_file"
+
+    # Replace original file
+    if mv "$temp_file" "$STORAGE_CFG"; then
+        success "Storage configuration updated in $STORAGE_CFG"
+        log "INFO" "Storage '$storage_name' configuration updated"
+        return 0
+    else
+        error "Failed to update storage configuration"
+        rm -f "$temp_file"
+        return 1
+    fi
+}
+
+# Edit existing storage configuration
+menu_edit_storage() {
+    local storage_name="$1"
+
+    print_header "Edit Storage Configuration: $storage_name"
+
+    info "Loading existing configuration for '$storage_name'..."
+    echo
+
+    # Load all existing configuration values
+    declare -A config_values
+    while IFS='=' read -r key value; do
+        config_values["$key"]="$value"
+    done < <(get_all_storage_config_values "$storage_name")
+
+    # Display immutable fields (read-only)
+    info "Current Configuration (read-only fields):"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # Transport mode (immutable)
+    local transport_mode="${config_values[transport_mode]:-iscsi}"
+    echo "  Transport mode:     $transport_mode ${c3}(cannot be changed)${c0}"
+
+    # Dataset (immutable - changing would orphan volumes)
+    local dataset="${config_values[dataset]}"
+    echo "  Dataset:            $dataset ${c3}(cannot be changed)${c0}"
+
+    # Block size (immutable - cannot change after volumes created)
+    local blocksize="${config_values[zvol_blocksize]:-16k}"
+    echo "  Block size:         $blocksize ${c3}(cannot be changed)${c0}"
+
+    # Transport-specific immutable fields
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        local subsystem_nqn="${config_values[subsystem_nqn]}"
+        echo "  Subsystem NQN:      $subsystem_nqn ${c3}(cannot be changed)${c0}"
+    else
+        local target_iqn="${config_values[target_iqn]}"
+        echo "  Target IQN:         $target_iqn ${c3}(cannot be changed)${c0}"
+    fi
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo
+
+    warning "Note: Fields marked as 'cannot be changed' are immutable to prevent orphaning existing volumes"
+    echo
+
+    # Prompt for mutable fields with current values as defaults
+    info "Editable Configuration:"
+    echo
+
+    # TrueNAS API settings
+    local current_api_host="${config_values[api_host]}"
+    local truenas_ip
+    read -rp "TrueNAS IP address [$current_api_host]: " truenas_ip
+    truenas_ip="${truenas_ip:-$current_api_host}"
+
+    if [[ -z "$truenas_ip" ]]; then
+        error "TrueNAS IP address cannot be empty"
+        return 1
+    fi
+
+    if ! validate_ip "$truenas_ip"; then
+        error "Invalid IP address format"
+        return 1
+    fi
+
+    # API Key
+    local current_api_key="${config_values[api_key]}"
+    info "Current API key: ${current_api_key:0:20}... (hidden)"
+    local api_key
+    read -rp "New TrueNAS API key (press Enter to keep current): " api_key
+    api_key="${api_key:-$current_api_key}"
+
+    if [[ -z "$api_key" ]]; then
+        error "API key cannot be empty"
+        return 1
+    fi
+
+    # Test connectivity
+    if ! test_truenas_api "$truenas_ip" "$api_key"; then
+        error "Failed to connect to TrueNAS. Please check IP and API key."
+        read -rp "Continue anyway? (y/N): " choice
+        [[ "$choice" =~ ^[Yy] ]] || return 1
+    fi
+
+    # Portal configuration
+    local current_portal="${config_values[discovery_portal]}"
+    local default_port
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        default_port="4420"
+    else
+        default_port="3260"
+    fi
+
+    local portal
+    read -rp "Portal IP:port [$current_portal]: " portal
+    portal="${portal:-$current_portal}"
+
+    if [[ -z "$portal" ]]; then
+        portal="${truenas_ip}:${default_port}"
+    elif [[ ! "$portal" =~ : ]]; then
+        portal="${portal}:${default_port}"
+    fi
+
+    # Sparse volumes
+    local current_sparse="${config_values[tn_sparse]:-1}"
+    local sparse
+    read -rp "Enable sparse volumes? (0/1) [$current_sparse]: " sparse
+    sparse="${sparse:-$current_sparse}"
+
+    # Multipath configuration
+    echo
+    info "Multipath Configuration:"
+    local current_use_multipath="${config_values[use_multipath]:-0}"
+    local current_portals="${config_values[portals]:-}"
+
+    if [[ "$transport_mode" == "iscsi" ]]; then
+        echo "  Current multipath setting: $current_use_multipath"
+        if [[ -n "$current_portals" ]]; then
+            echo "  Current portals: $current_portals"
+        fi
+        echo
+
+        local use_multipath
+        read -rp "Enable multipath I/O? (0/1) [$current_use_multipath]: " use_multipath
+        use_multipath="${use_multipath:-$current_use_multipath}"
+
+        local portals="$current_portals"
+        if [[ "$use_multipath" == "1" ]]; then
+            read -rp "Additional portals (comma-separated IP:port) [$current_portals]: " portals
+            portals="${portals:-$current_portals}"
+        else
+            portals=""
+        fi
+    else
+        # NVMe/TCP - only portals matter
+        echo "  Current portals: ${current_portals:-none}"
+        echo
+        local portals
+        read -rp "Portals for native multipath (comma-separated IP:port) [$current_portals]: " portals
+        portals="${portals:-$current_portals}"
+        use_multipath=""  # Not used for NVMe
+    fi
+
+    # Host NQN for NVMe (optional, can be changed)
+    local hostnqn="${config_values[hostnqn]:-}"
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        echo
+        info "Current host NQN: ${hostnqn:-system default}"
+        read -rp "Update host NQN? (y/N): " update_hostnqn
+        if [[ "$update_hostnqn" =~ ^[Yy] ]]; then
+            read -rp "New host NQN: " hostnqn
+        fi
+    fi
+
+    # Generate updated configuration
+    echo
+    info "Updated Configuration Summary:"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    local config
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        local subsystem_nqn="${config_values[subsystem_nqn]}"
+        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$subsystem_nqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "$hostnqn")
+    else
+        local target_iqn="${config_values[target_iqn]}"
+        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$target_iqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "")
+    fi
+    echo "$config"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo
+
+    read -rp "Apply these changes to $STORAGE_CFG? (Y/n): " confirm
+    if [[ "$confirm" =~ ^[Nn] ]]; then
+        warning "Configuration changes cancelled"
+        return 1
+    fi
+
+    # Update configuration (remove old, add new)
+    if update_storage_config "$storage_name" "$config"; then
+        echo
+        success "Storage configuration updated successfully!"
+        info "Storage '$storage_name' has been reconfigured"
+        echo
+        info "Next steps:"
+        echo "  1. Restart pvedaemon and pveproxy if needed"
+        echo "  2. Check storage status: pvesm status"
+        echo "  3. Verify connectivity with existing volumes"
+        echo
+        read -rp "Press Enter to continue..."
+    else
+        error "Failed to update configuration"
+        return 1
+    fi
+
+    return 0
+}
+
 # Configuration wizard
 menu_configure_storage() {
     print_header "Storage Configuration Wizard"
@@ -2792,7 +3067,78 @@ menu_configure_storage() {
     info "This wizard will help you configure TrueNAS storage for Proxmox"
     echo
 
-    # Storage name
+    # Check for existing storage entries
+    local existing_storages
+    existing_storages=$(list_truenas_storages 2>/dev/null || true)
+
+    local storage_name=""
+
+    if [[ -n "$existing_storages" ]]; then
+        # Count existing storages
+        local storage_count
+        storage_count=$(echo "$existing_storages" | wc -l)
+
+        # Present menu (don't show storage list yet)
+        info "Found $storage_count existing TrueNAS storage configuration(s)"
+        echo
+        info "What would you like to do?"
+        echo "  1) Edit an existing storage"
+        echo "  2) Add a new storage"
+        echo "  0) Cancel"
+        echo
+
+        local menu_choice
+        while true; do
+            read -rp "Select option [0-2]: " menu_choice
+            if [[ "$menu_choice" =~ ^[0-2]$ ]]; then
+                break
+            else
+                error "Invalid choice. Please enter 0, 1, or 2"
+            fi
+        done
+
+        case "$menu_choice" in
+            0)
+                info "Configuration cancelled"
+                return 0
+                ;;
+            1)
+                # Edit mode - NOW show the storage list
+                echo
+                info "Available storage configurations:"
+                local idx=1
+                local -a storage_array=()
+                while IFS= read -r storage; do
+                    echo "  $idx) $storage"
+                    storage_array+=("$storage")
+                    ((idx++))
+                done <<< "$existing_storages"
+                echo
+
+                local storage_idx
+                while true; do
+                    read -rp "Select storage to edit [1-${#storage_array[@]}] or 0 to cancel: " storage_idx
+                    if [[ "$storage_idx" == "0" ]]; then
+                        info "Configuration cancelled"
+                        return 0
+                    elif [[ "$storage_idx" =~ ^[0-9]+$ ]] && [[ "$storage_idx" -ge 1 ]] && [[ "$storage_idx" -le "${#storage_array[@]}" ]]; then
+                        storage_name="${storage_array[$((storage_idx-1))]}"
+                        # Call edit function and return
+                        menu_edit_storage "$storage_name"
+                        return $?
+                    else
+                        error "Invalid selection. Please enter a number between 1 and ${#storage_array[@]}"
+                    fi
+                done
+                ;;
+            2)
+                # Add new storage mode - continue with existing workflow below
+                ;;
+        esac
+    fi
+
+    # Continue with "Add New Storage" workflow
+    # Prompt for storage name
     local storage_name
     while true; do
         read -rp "Storage name (e.g., truenas-main): " storage_name
@@ -2840,14 +3186,29 @@ menu_configure_storage() {
 
     # Dataset
     local dataset
-    read -rp "ZFS dataset path (e.g., tank/proxmox): " dataset
-    if [[ -z "$dataset" ]]; then
-        error "Dataset cannot be empty"
-        return 1
-    fi
+    while true; do
+        read -rp "ZFS dataset path (e.g., tank/proxmox): " dataset
+        if [[ -z "$dataset" ]]; then
+            error "Dataset cannot be empty"
+            continue
+        fi
 
-    # Verify dataset if API connection worked
-    verify_dataset "$truenas_ip" "$api_key" "$dataset" || true
+        # Verify dataset if API connection worked
+        if ! verify_dataset "$truenas_ip" "$api_key" "$dataset"; then
+            echo
+            warning "Dataset verification failed. The dataset may not exist or may not be accessible."
+            read -rp "Continue anyway? (y/N): " continue_choice
+            if [[ "$continue_choice" =~ ^[Yy] ]]; then
+                warning "Proceeding with unverified dataset '$dataset'"
+                break
+            else
+                echo
+                info "Please enter a different dataset name"
+                continue
+            fi
+        fi
+        break
+    done
 
     # Transport mode selection
     echo
