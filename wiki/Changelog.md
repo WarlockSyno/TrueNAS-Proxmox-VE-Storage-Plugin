@@ -1,5 +1,62 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.1.2 (November 4, 2025)
+
+### 🐛 **Critical Bug Fixes**
+
+#### **NVMe Device Detection - Support for Controller-Specific Naming**
+- **Fixed NVMe device detection to support multipath controller-specific naming** - Device discovery now works with both standard and controller-specific NVMe device paths
+  - **Error resolved**: "Could not locate NVMe device for UUID <uuid>"
+  - **Issue**: Device detection only scanned `/sys/class/nvme-subsystem/` which doesn't contain controller-specific devices (`nvme3c3n1`, `nvme3c4n1`)
+  - **Root cause**: When NVMe multipath is active, Linux creates controller-specific devices that exist in `/sys/block` but not in subsystem directory
+  - **Impact**: NVMe disk creation failed to find newly created namespaces after TrueNAS NVMe-oF service created them
+  - **Solution**: Rewrote device discovery to scan `/sys/block` directly
+    - Matches both standard (`nvme3n1`) and controller-specific (`nvme3c3n1`) device naming patterns
+    - Verifies each device belongs to our subsystem by checking subsystem NQN in sysfs
+    - Tries to match by NSID from TrueNAS API first
+    - Falls back to "newest device" detection (created within last 10 seconds)
+    - Returns actual device path like `/dev/nvme3n1` or `/dev/nvme3c3n1`
+
+#### **Multipath Portal Login**
+- **Fixed multipath failing to connect to all portals** - Storage now establishes sessions to ALL configured portals
+  - **Issue**: `_iscsi_login_all()` short-circuited when ANY session existed, never connecting to additional portals
+  - **Root cause**: Function returned early if `_target_sessions_active()` found any session, without checking if all configured portals were connected
+  - **Impact**: Multipath configurations only connected to primary `discovery_portal`, never logged into additional portals in `portals` list, defeating multipath redundancy
+  - **Solution**: Added `_all_portals_connected()` function
+    - Checks each configured portal (discovery_portal + portals list) individually
+    - Verifies active iSCSI session exists to each portal
+    - Only skips login when ALL portals have active sessions
+    - Ensures proper multipath setup with multiple paths for redundancy
+
+### ✨ **Enhancements**
+
+#### **NVMe/TCP Automatic Multipath Portal Login**
+- **Added automatic portal login for NVMe/TCP multipath configurations** - NVMe storage now automatically connects to all configured portals, matching iSCSI behavior
+  - **Feature**: Plugin ensures all NVMe portals are connected during storage and volume activation
+  - **Benefit**: Provides true multipath redundancy for NVMe/TCP storage with multiple I/O paths
+  - **Configuration**: Use `discovery_portal` for primary portal and `portals` for additional portals (comma-separated)
+  - **Example**: `discovery_portal 10.20.30.20:4420` + `portals 10.20.30.20:4420,10.20.31.20:4420`
+  - **Automatic activation**: NVMe portals connect when:
+    - Storage is activated (`activate_storage`)
+    - Volumes are activated (`activate_volume`)
+    - Namespaces are created or accessed
+  - **Multipath support**: Works with native NVMe multipath (ANA) for automatic failover and load balancing
+  - **Validation**: Successfully tested with 2-portal configuration, both portals connect automatically after disconnect
+
+### 🔧 **Technical Details**
+- **New functions added**:
+  - `_nvme_find_device_by_subsystem()` (lines 2368-2467) - Scans `/sys/block` for NVMe devices matching subsystem NQN, handles both standard and controller-specific naming
+  - `_nvme_get_namespace_info()` (lines 2469-2482) - Queries TrueNAS WebSocket API for namespace details by device_uuid
+  - `_all_portals_connected()` (lines 2018-2047) - Validates that all configured portals have active iSCSI sessions
+- **Modified `_nvme_device_for_uuid()`** (lines 2484-2565) - Now calls `_nvme_find_device_by_subsystem()` for device discovery instead of checking `/dev/disk/by-id/nvme-uuid.*`
+- **Modified `_iscsi_login_all()`** (line 2052) - Changed from `_target_sessions_active()` to `_all_portals_connected()` for proper multipath portal checking
+
+### 📊 **Impact**
+- **NVMe storage**: Device allocation and detection now works correctly with multipath controllers
+- **Multipath iSCSI**: All configured portals connect properly, providing true redundancy
+- **Testing**: Successfully tested allocation, device detection, and deletion with TrueNAS SCALE 25.10.0
+---
+
 ## Version 1.1.1 (November 1, 2025)
 
 ### 🔧 **Transport Enhancements: NVMe/iSCSI Feature Parity**

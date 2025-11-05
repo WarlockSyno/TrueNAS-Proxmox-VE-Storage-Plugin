@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '1.1.1';
+our $VERSION = '1.1.2';
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -2015,9 +2015,41 @@ sub _target_sessions_active($scfg) {
     return 0;
 }
 
+# Check if all configured portals have active sessions for this target
+sub _all_portals_connected($scfg) {
+    my $iqn = $scfg->{target_iqn};
+
+    # Get all configured portals
+    my @portals = ();
+    push @portals, _normalize_portal($scfg->{discovery_portal}) if $scfg->{discovery_portal};
+    push @portals, map { _normalize_portal($_) } split(/\s*,\s*/, $scfg->{portals}) if $scfg->{portals};
+
+    return 0 if !@portals; # No portals configured
+
+    # Get active sessions
+    my @session_lines = eval { _run_lines(['iscsiadm', '-m', 'session']) };
+    return 0 if $@; # If command fails (no sessions exist), return false
+
+    # Check each portal has an active session
+    for my $portal (@portals) {
+        my $found = 0;
+        for my $line (@session_lines) {
+            # Session line format: tcp: [1] 10.15.14.172:3260,1 iqn.2005-10.org.freenas.ctl:target0
+            if ($line =~ /\Q$portal\E.*\Q$iqn\E/) {
+                $found = 1;
+                last;
+            }
+        }
+        return 0 if !$found; # This portal is not connected
+    }
+
+    return 1; # All portals are connected
+}
+
 sub _iscsi_login_all($scfg) {
-    # Skip login if sessions are already active
-    return if _target_sessions_active($scfg);
+    # Skip login if all configured portals are already connected
+    # This ensures multipath configurations establish sessions to ALL portals
+    return if _all_portals_connected($scfg);
 
     my $primary = _normalize_portal($scfg->{discovery_portal});
     my @extra   = $scfg->{portals} ? map { _normalize_portal($_) } split(/\s*,\s*/, $scfg->{portals}) : ();
@@ -2333,26 +2365,137 @@ sub _nvme_disconnect {
     }
 }
 
-# Get device path for namespace by UUID with enhanced validation
+# Find NVMe device by matching subsystem NQN and TrueNAS namespace UUID
+# Returns device path like /dev/nvme0n1 or undef if not found
+sub _nvme_find_device_by_subsystem {
+    my ($scfg, $device_uuid) = @_;
+
+    my $nqn = $scfg->{subsystem_nqn};
+
+    # Find subsystem matching our NQN
+    opendir(my $dh, "/sys/class/nvme-subsystem") or return undef;
+    while (my $subsys = readdir($dh)) {
+        next unless $subsys =~ /^nvme-subsys\d+$/;
+
+        my $subsys_nqn = eval {
+            open my $fh, '<', "/sys/class/nvme-subsystem/$subsys/subsysnqn" or die;
+            my $val = <$fh>;
+            close $fh;
+            chomp($val);
+            $val;
+        };
+        next unless $subsys_nqn && $subsys_nqn eq $nqn;
+
+        # Found our subsystem - collect all namespace devices from /sys/block
+        # Controller-specific devices don't appear in subsystem directory
+        my @devices;
+        opendir(my $bdh, "/sys/block") or next;
+        while (my $entry = readdir($bdh)) {
+            my ($ctrl_id, $nsid, $type);
+
+            # Match both nvme3n1 and nvme3c3n1 patterns
+            if ($entry =~ /^nvme(\d+)n(\d+)$/) {
+                ($ctrl_id, $nsid, $type) = ($1, $2, 'standard');
+            } elsif ($entry =~ /^nvme(\d+)c(\d+)n(\d+)$/) {
+                ($ctrl_id, $nsid, $type) = ($1, $3, 'controller');
+            } else {
+                next;
+            }
+
+            # Verify this device belongs to our subsystem by checking NQN
+            my $dev_nqn = eval {
+                # For standard devices, check via subsystem link
+                if ($type eq 'standard' && -e "/sys/block/$entry/device/subsysnqn") {
+                    open my $fh, '<', "/sys/block/$entry/device/subsysnqn" or return undef;
+                    my $val = <$fh>;
+                    close $fh;
+                    chomp($val);
+                    return $val;
+                }
+                # For controller devices, navigate to controller then subsystem
+                if ($type eq 'controller' && -e "/sys/block/$entry/device/../subsysnqn") {
+                    open my $fh, '<', "/sys/block/$entry/device/../subsysnqn" or return undef;
+                    my $val = <$fh>;
+                    close $fh;
+                    chomp($val);
+                    return $val;
+                }
+                return undef;
+            };
+
+            if ($dev_nqn && $dev_nqn eq $nqn) {
+                push @devices, {path => "/dev/$entry", nsid => $nsid, type => $type, name => $entry};
+            }
+        }
+        closedir($bdh);
+
+        # Query TrueNAS once for namespace info
+        my $ns_info = eval { _nvme_get_namespace_info($scfg, $device_uuid) };
+
+        # Try to match by NSID first if we have namespace info
+        if ($ns_info && defined $ns_info->{nsid}) {
+            for my $dev (@devices) {
+                if ($dev->{nsid} == $ns_info->{nsid}) {
+                    closedir($dh);
+                    _log($scfg, 2, 'debug', "nvme_find_device: found device $dev->{path} for UUID $device_uuid (NSID: $dev->{nsid}, type: $dev->{type})");
+                    return $dev->{path};
+                }
+            }
+        }
+
+        # Fallback: find newest device (most recently created)
+        # This works because we just created the namespace
+        my $newest_device;
+        my $newest_time = 0;
+        for my $dev (@devices) {
+            my $mtime = (stat("/sys/block/$dev->{name}"))[9] || 0;
+            if ($mtime > $newest_time) {
+                $newest_time = $mtime;
+                $newest_device = $dev;
+            }
+        }
+
+        if ($newest_device && $newest_time > (time() - 10)) {
+            closedir($dh);
+            _log($scfg, 2, 'debug', "nvme_find_device: found newest device $newest_device->{path} for UUID $device_uuid (created within 10s, type: $newest_device->{type})");
+            return $newest_device->{path};
+        }
+    }
+    closedir($dh);
+
+    return undef;
+}
+
+# Get namespace info from TrueNAS by device UUID
+sub _nvme_get_namespace_info {
+    my ($scfg, $device_uuid) = @_;
+
+    # Query TrueNAS for namespace with this device_uuid
+    my $namespaces = eval {
+        _api_call($scfg, 'nvmet.namespace.query', [
+            [["device_uuid", "=", $device_uuid]]
+        ], sub { die "REST API not supported for NVMe-oF operations\n"; });
+    };
+
+    return undef if $@ || !$namespaces || !@$namespaces;
+    return $namespaces->[0];
+}
+
+# Get device path for namespace by matching subsystem NQN and namespace properties
 sub _nvme_device_for_uuid {
     my ($scfg, $device_uuid) = @_;
 
-    my $uuid_path = "/dev/disk/by-id/nvme-uuid.$device_uuid";
     my $nqn = $scfg->{subsystem_nqn};
 
-    _log($scfg, 2, 'debug', "nvme_device_for_uuid: waiting for device with UUID $device_uuid");
+    _log($scfg, 2, 'debug', "nvme_device_for_uuid: searching for namespace with UUID $device_uuid in subsystem $nqn");
 
     # Wait for device to appear with progressive backoff (up to 5 seconds)
     for (my $i = 0; $i < 50; $i++) {
-        # Check if path exists
-        if (-e $uuid_path) {
-            # Validate it's actually a block device (not just a dangling symlink)
-            if (-b $uuid_path) {
-                _log($scfg, 1, 'info', "nvme_device_for_uuid: device ready at $uuid_path");
-                return $uuid_path;
-            } else {
-                _log($scfg, 1, 'warning', "nvme_device_for_uuid: path exists but is not a block device: $uuid_path");
-            }
+        # Search for device by subsystem NQN
+        my $device = eval { _nvme_find_device_by_subsystem($scfg, $device_uuid) };
+        if ($device && -b $device) {
+            _log($scfg, 1, 'info', "nvme_device_for_uuid: device ready at $device");
+            return $device;
         }
 
         # Progressive interventions to help device discovery
@@ -2397,13 +2540,13 @@ sub _nvme_device_for_uuid {
 
     # Device didn't appear - provide detailed troubleshooting
     my $err_msg = sprintf(
-        "Could not locate NVMe device for UUID %s\n" .
-        "  Expected path: %s\n\n" .
+        "Could not locate NVMe device for TrueNAS UUID %s\n" .
+        "  Subsystem NQN: %s\n\n" .
         "Troubleshooting steps:\n" .
         "  1. Verify NVMe subsystem connection:\n" .
         "     -> Check: nvme list | grep '%s'\n" .
         "  2. Check if namespace is visible:\n" .
-        "     -> Check: ls -la /dev/disk/by-id/ | grep nvme-uuid\n" .
+        "     -> Check: nvme list-subsys | grep -A10 '%s'\n" .
         "  3. Verify TrueNAS NVMe-oF service is running\n" .
         "     -> TrueNAS: System Settings > Services > NVMe-oF Target\n" .
         "  4. Check network connectivity:\n" .
@@ -2413,7 +2556,8 @@ sub _nvme_device_for_uuid {
         "The namespace exists on TrueNAS but the device did not appear.\n" .
         "Manual cleanup may be required.",
         $device_uuid,
-        $uuid_path,
+        $nqn,
+        $nqn,
         $nqn,
         $scfg->{api_host}
     );
