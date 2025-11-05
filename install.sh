@@ -2377,12 +2377,43 @@ run_health_check() {
             local session_count
             session_count=$(iscsiadm -m session 2>/dev/null | grep -c "$target_iqn" || echo "0")
             session_count=$(echo "$session_count" | head -1 | tr -d '\n ')
+
+            # Check node.startup configuration for all portals
+            local auto_startup_count=0
+            local total_nodes=0
+            if command -v iscsiadm &> /dev/null; then
+                while IFS= read -r line; do
+                    # Format is: portal,tpgt iqn
+                    local portal
+                    portal=$(echo "$line" | awk '{print $1}')
+                    local iqn
+                    iqn=$(echo "$line" | awk '{print $2}')
+                    if [[ "$iqn" == "$target_iqn" ]] && [[ -n "$portal" ]]; then
+                        ((total_nodes++))
+                        local startup_val
+                        startup_val=$(iscsiadm -m node --targetname "$target_iqn" -p "$portal" -o show 2>/dev/null | grep "^node.startup" | awk '{print $NF}' | head -1)
+                        if [[ "$startup_val" == "automatic" ]]; then
+                            ((auto_startup_count++))
+                        fi
+                    fi
+                done < <(iscsiadm -m node 2>/dev/null | grep "$target_iqn")
+            fi
+
             local iscsi_result
             if [[ "$session_count" -gt 0 ]]; then
                 iscsi_result="${COLOR_GREEN}✓${COLOR_RESET} $session_count active session(s)"
                 ((checks_passed++))
+            elif [[ "$auto_startup_count" -gt 0 ]]; then
+                # No active sessions but auto-startup is configured - this is OK
+                iscsi_result="${COLOR_GREEN}✓${COLOR_RESET} Configured (auto-reconnect: ${auto_startup_count}/${total_nodes} portals)"
+                ((checks_passed++))
+            elif [[ "$total_nodes" -gt 0 ]]; then
+                # Nodes exist but no auto-startup configured
+                iscsi_result="${COLOR_YELLOW}⚠${COLOR_RESET} Not configured for auto-startup"
+                ((warnings++))
             else
-                iscsi_result="${COLOR_YELLOW}⚠${COLOR_RESET} No active sessions"
+                # No nodes configured at all
+                iscsi_result="${COLOR_YELLOW}⚠${COLOR_RESET} No sessions or nodes configured"
                 ((warnings++))
             fi
             stop_spinner
