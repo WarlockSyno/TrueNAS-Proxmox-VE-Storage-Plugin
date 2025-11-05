@@ -4,6 +4,11 @@
 #
 # TrueNAS Proxmox VE Plugin Installer
 # Interactive installation, update, and configuration wizard
+#
+# TODO: Orphan resource detection currently only supports iSCSI mode.
+#       NVMe/TCP orphan detection requires WebSocket API support which is
+#       not yet implemented in bash. Future enhancement should add WebSocket
+#       client for nvmet.subsys.query and nvmet.namespace.query calls.
 
 set -euo pipefail
 
@@ -2088,6 +2093,75 @@ get_storage_config_value() {
     echo "$config_block" | grep "^\s*${param_name}" | awk '{print $2}' | head -1
 }
 
+# Detect orphaned resources (transport-aware)
+detect_orphaned_resources() {
+    local storage_name="$1"
+    local transport_mode="$2"
+    local api_host="$3"
+    local api_key="$4"
+    local dataset="$5"
+    local api_insecure="$6"
+
+    # Set curl options
+    local curl_opts="-s"
+    [[ "$api_insecure" == "1" ]] && curl_opts="$curl_opts -k"
+
+    local orphan_count=0
+
+    if [[ "$transport_mode" == "iscsi" ]]; then
+        # iSCSI orphan detection
+
+        # Fetch extents
+        local extents
+        extents=$(curl $curl_opts -H "Authorization: Bearer $api_key" "https://$api_host/api/v2.0/iscsi/extent" 2>/dev/null) || return 1
+
+        # Fetch zvols
+        local zvols
+        zvols=$(curl $curl_opts -H "Authorization: Bearer $api_key" "https://$api_host/api/v2.0/pool/dataset" 2>/dev/null) || return 1
+
+        # Extract extent IDs and disks using grep/sed
+        # Parse JSON: look for "id": <number> and "disk": "zvol/..."
+        local extent_data
+        extent_data=$(echo "$extents" | grep -o '"id": *[0-9]*' | sed 's/"id": *//')
+
+        for extent_id in $extent_data; do
+            # Extract disk path for this extent ID
+            local extent_disk
+            extent_disk=$(echo "$extents" | sed -n "/{/,/}/{ /"'"'"id"'"'": *${extent_id}/,/}/p }" | \
+                         grep -o '"disk": *"zvol/[^"]*"' | sed 's/"disk": *"zvol\///' | sed 's/"$//' | head -1)
+
+            [[ -z "$extent_disk" ]] && continue
+
+            # Check if zvol is under our dataset and exists
+            if [[ "$extent_disk" == "$dataset/"* ]]; then
+                if ! echo "$zvols" | grep -q "\"id\": *\"${extent_disk}\""; then
+                    ((orphan_count++))
+                fi
+            fi
+        done
+
+        # Check for orphaned zvols (zvols without extents)
+        # Extract zvol IDs that match our dataset and type VOLUME
+        local zvol_ids
+        zvol_ids=$(echo "$zvols" | grep -B2 -A2 "\"type\": *\"VOLUME\"" | \
+                  grep "\"id\": *\"${dataset}/" | sed 's/.*"id": *"\([^"]*\)".*/\1/')
+
+        for zvol_id in $zvol_ids; do
+            local zvol_disk="zvol/${zvol_id}"
+            if ! echo "$extents" | grep -q "\"disk\": *\"${zvol_disk}\""; then
+                ((orphan_count++))
+            fi
+        done
+
+    else
+        # NVMe/TCP mode - not supported yet (requires WebSocket API)
+        # Return 0 to indicate no orphans found (skip check)
+        return 0
+    fi
+
+    echo "$orphan_count"
+}
+
 # Perform health check on a storage
 run_health_check() {
     local storage_name="$1"
@@ -2361,7 +2435,46 @@ run_health_check() {
         fi
     fi
 
-    # Check 11: PVE daemon status
+    # Check 11: Orphaned resources (iSCSI only)
+    if [[ "$transport_mode" == "iscsi" ]]; then
+        local api_host
+        api_host=$(get_storage_config_value "$storage_name" "api_host")
+        local api_key
+        api_key=$(get_storage_config_value "$storage_name" "api_key")
+        local api_insecure
+        api_insecure=$(get_storage_config_value "$storage_name" "api_insecure")
+
+        if [[ -n "$api_host" ]] && [[ -n "$api_key" ]] && [[ -n "$dataset" ]]; then
+            printf "%-30s " "Orphaned resources:"
+            start_spinner
+            local orphan_result
+            local orphan_count
+            orphan_count=$(detect_orphaned_resources "$storage_name" "$transport_mode" "$api_host" "$api_key" "$dataset" "$api_insecure" 2>/dev/null)
+
+            if [[ $? -eq 0 ]] && [[ -n "$orphan_count" ]]; then
+                if [[ "$orphan_count" -eq 0 ]]; then
+                    orphan_result="${COLOR_GREEN}✓${COLOR_RESET} None found"
+                    ((checks_passed++))
+                else
+                    orphan_result="${COLOR_YELLOW}⚠${COLOR_RESET} Found $orphan_count orphan(s) (run cleanup-orphans.sh)"
+                    ((warnings++))
+                fi
+            else
+                orphan_result="${COLOR_YELLOW}⚠${COLOR_RESET} Check skipped (API error)"
+                ((warnings++))
+            fi
+            stop_spinner
+            echo -e "\r$(printf "%-30s " "Orphaned resources:")${orphan_result}"
+            ((checks_total++))
+        else
+            check_result "Orphaned resources" "SKIP" "Cannot check (missing API config)"
+        fi
+    else
+        # NVMe/TCP mode - skip orphan check (not yet supported)
+        check_result "Orphaned resources" "SKIP" "Not available for NVMe/TCP"
+    fi
+
+    # Check 12: PVE daemon status
     if systemctl is-active --quiet pvedaemon; then
         check_result "PVE daemon" "OK" "Running"
     else
