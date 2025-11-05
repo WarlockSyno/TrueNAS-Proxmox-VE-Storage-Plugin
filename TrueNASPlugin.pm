@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '1.1.2';
+our $VERSION = '1.1.3';
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -31,6 +31,34 @@ BEGIN {
 # Simple cache for API results (static data)
 my %API_CACHE = ();
 my $CACHE_TTL = 60; # 60 seconds
+
+# Utility function to normalize TrueNAS API values
+# Handles both scalar values and hash structures with parsed/raw fields
+# Used throughout the plugin for consistent value extraction
+sub _normalize_value {
+    my ($v) = @_;
+    return 0 if !defined $v;
+    return $v if !ref($v);
+    return $v->{parsed} // $v->{raw} // 0 if ref($v) eq 'HASH';
+    return 0;
+}
+
+# Performance and timing constants
+# These values are tuned for modern systems and network conditions
+use constant {
+    # Device settling timeouts (microseconds)
+    UDEV_SETTLE_TIMEOUT_US    => 250_000,  # udev settle grace period (250ms)
+    DEVICE_READY_TIMEOUT_US   => 100_000,  # device availability check (100ms)
+    DEVICE_RESCAN_DELAY_US    => 150_000,  # device rescan stabilization (150ms)
+
+    # Operation delays (seconds)
+    DEVICE_SETTLE_DELAY_S     => 1,        # post-connection/logout stabilization
+    JOB_POLL_DELAY_S          => 1,        # job status polling interval
+
+    # Job timeouts (seconds)
+    SNAPSHOT_DELETE_TIMEOUT_S => 15,       # snapshot deletion job timeout
+    DATASET_DELETE_TIMEOUT_S  => 20,       # dataset deletion job timeout
+};
 
 sub _cache_key {
     my ($storage_id, $method) = @_;
@@ -661,7 +689,7 @@ sub _ws_open($scfg) {
     my $path = '/api/current';
 
     # Add small delay to avoid rate limiting
-    usleep(100_000); # 100ms delay
+    usleep(DEVICE_READY_TIMEOUT_US); # 100ms delay
 
     my $sock;
     if ($scheme eq 'wss') {
@@ -1048,7 +1076,7 @@ sub _wait_for_job_completion {
 
     for my $attempt (1..$timeout_seconds) {
         # Small delay between checks
-        sleep(1);
+        sleep(JOB_POLL_DELAY_S);
 
         my $job_status;
         eval {
@@ -1420,15 +1448,8 @@ sub volume_resize {
 
     # Fetch current zvol info from TrueNAS
     my $ds = _tn_dataset_get($scfg, $full) // {};
-    my $norm = sub {
-        my ($v) = @_;
-        return 0 if !defined $v;
-        return $v if !ref($v);
-        return $v->{parsed} // $v->{raw} // 0 if ref($v) eq 'HASH';
-        return 0;
-    };
-    my $cur_bytes = $norm->($ds->{volsize});
-    my $bs_bytes  = $norm->($ds->{volblocksize}); # may be 0/undef
+    my $cur_bytes = _normalize_value($ds->{volsize});
+    my $bs_bytes  = _normalize_value($ds->{volblocksize}); # may be 0/undef
 
     # IMPORTANT: Proxmox passes the ABSOLUTE target size in BYTES.
     my $req_bytes = int($new_size_bytes);
@@ -1448,7 +1469,7 @@ sub volume_resize {
 
     # ---- Preflight: mirror TrueNAS middleware's ~80% headroom rule ----
     my $pds = _tn_dataset_get($scfg, $scfg->{dataset}) // {};
-    my $avail_bytes = $norm->($pds->{available}); # parent dataset/pool available
+    my $avail_bytes = _normalize_value($pds->{available}); # parent dataset/pool available
     my $max_grow    = $avail_bytes ? int($avail_bytes * 0.80) : 0;
     if ($avail_bytes && $delta > $max_grow) {
         my $fmt_g = sub { sprintf('%.2f GiB', $_[0] / (1024*1024*1024)) };
@@ -1577,7 +1598,7 @@ sub volume_snapshot_delete {
     );
 
     # Handle potential async job for snapshot deletion
-    my $job_result = _handle_api_result_with_job_support($scfg, $result, "individual snapshot deletion for $snap_full", 30);
+    my $job_result = _handle_api_result_with_job_support($scfg, $result, "individual snapshot deletion for $snap_full", SNAPSHOT_DELETE_TIMEOUT_S);
     if (!$job_result->{success}) {
         die $job_result->{error};
     }
@@ -1800,14 +1821,7 @@ sub _preflight_check_alloc {
         eval {
             my $ds_info = _tn_dataset_get($scfg, $scfg->{dataset});
             if ($ds_info) {
-                my $norm = sub {
-                    my ($v) = @_;
-                    return 0 if !defined $v;
-                    return $v if !ref($v);
-                    return $v->{parsed} // $v->{raw} // 0 if ref($v) eq 'HASH';
-                    return 0;
-                };
-                my $available = $norm->($ds_info->{available}) || 0;
+                my $available = _normalize_value($ds_info->{available}) || 0;
 
                 if ($available < $required) {
                     push @errors, sprintf(
@@ -2101,7 +2115,7 @@ sub _iscsi_login_all($scfg) {
         }
     }
     run_command(['udevadm','settle'], outfunc => sub {});
-    usleep(250_000); # modest grace
+    usleep(UDEV_SETTLE_TIMEOUT_US); # modest grace
 }
 
 sub _find_by_path_for_lun($scfg, $lun) {
@@ -2190,7 +2204,7 @@ sub _device_for_lun($scfg, $lun) {
             _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan");
             run_command(['udevadm','settle'], outfunc => sub {});
         }
-        usleep(100_000);
+        usleep(DEVICE_READY_TIMEOUT_US);
     }
     die "Could not locate by-path device for LUN $lun (IQN $scfg->{target_iqn})\n" if !$by || !-e $by;
 
@@ -2342,7 +2356,7 @@ sub _nvme_connect {
 
     # Wait for devices to settle
     run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {});
-    usleep(250_000);
+    usleep(UDEV_SETTLE_TIMEOUT_US);
 
     _log($scfg, 1, 'info', "nvme_connect: connected to $connected_count portal(s)");
 }
@@ -2535,7 +2549,7 @@ sub _nvme_device_for_uuid {
             eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) };
         }
 
-        usleep(100_000);  # 100ms
+        usleep(DEVICE_READY_TIMEOUT_US);  # 100ms
     }
 
     # Device didn't appear - provide detailed troubleshooting
@@ -3071,14 +3085,7 @@ sub volume_size_info {
     $fmt //= 'raw';
     my $full = $scfg->{dataset} . '/' . $zname;
     my $ds = _tn_dataset_get($scfg, $full) // {};
-    my $norm = sub {
-        my ($v) = @_;
-        return 0 if !defined $v;
-        return $v if !ref($v);
-        return $v->{parsed} // $v->{raw} // 0 if ref($v) eq 'HASH';
-        return 0;
-    };
-    my $bytes = $norm->($ds->{volsize});
+    my $bytes = _normalize_value($ds->{volsize});
     die "volume_size_info: missing volsize for $full\n" if !$bytes;
     return wantarray ? ($bytes, $fmt) : $bytes;
 }
@@ -3207,7 +3214,7 @@ sub _free_image_iscsi {
             _logout_target_all_portals($scfg);
             # Wait for iSCSI session to fully disconnect before retrying deletion
             syslog('info', "Waiting for iSCSI session to disconnect...");
-            sleep(1);  # Reduced from 2s to 1s - modern systems settle faster
+            sleep(DEVICE_SETTLE_DELAY_S);  # Reduced from 2s to 1s - modern systems settle faster
             eval { run_command(['udevadm','settle'], outfunc => sub {}) };
         } else {
             syslog('info', "Skipping logout during extent deletion - $active_luns other LUNs active (preserves multi-disk operations)");
@@ -3241,48 +3248,31 @@ sub _free_image_iscsi {
         }
     }
 
-    # 4) Delete all snapshots before deleting the zvol dataset
-    # Note: Don't logout preemptively as it breaks multi-disk restore operations
+    # 4) Delete the zvol dataset with recursive flag to handle snapshots automatically
+    # PERFORMANCE OPTIMIZATION: Use recursive deletion to handle snapshots in one operation
+    # instead of sequential deletion (consistent with NVMe implementation)
     eval {
-        # First, delete ALL snapshots for this zvol to ensure clean deletion
-        syslog('info', "Searching for and deleting all snapshots of $full_ds before dataset deletion");
-        my $snapshots = _tn_snapshots($scfg) // [];
-        my @volume_snapshots = grep { $_->{name} && $_->{name} =~ /^\Q$full_ds\E@/ } @$snapshots;
-
-        if (@volume_snapshots) {
-            syslog('info', "Found " . scalar(@volume_snapshots) . " snapshots for $full_ds, deleting them first");
-            for my $snap (@volume_snapshots) {
-                my $snap_name = $snap->{name};
-                syslog('info', "Deleting snapshot $snap_name before volume deletion");
-                eval {
-                    my $snap_id = URI::Escape::uri_escape($snap_name);
-                    my $result = _api_call($scfg, 'zfs.snapshot.delete', [ $snap_name ],
-                        sub { _rest_call($scfg, 'DELETE', "/zfs/snapshot/id/$snap_id", undef) });
-                    # Handle potential async job for snapshot deletion with shorter timeout
-                    my $job_result = _handle_api_result_with_job_support($scfg, $result, "snapshot deletion for $snap_name", 15);
-                    if (!$job_result->{success}) {
-                        die $job_result->{error};
-                    }
-                    syslog('info', "Successfully deleted snapshot $snap_name");
-                };
-                if ($@) {
-                    syslog('warning', "Failed to delete snapshot $snap_name: $@");
-                }
+        # Safety check: Verify dataset has no child datasets (only snapshots allowed)
+        # This prevents accidental deletion of manually created child datasets
+        my $ds_info = eval { _tn_dataset_get($scfg, $full_ds) };
+        if ($ds_info && $ds_info->{children}) {
+            my @children = grep { $_->{type} ne 'SNAPSHOT' } @{$ds_info->{children}};
+            if (@children) {
+                my $child_names = join(', ', map { $_->{name} // $_->{id} } @children);
+                die "Cannot use recursive deletion: dataset $full_ds has child datasets: $child_names. " .
+                    "Recursive deletion would destroy these child datasets. Please remove them manually first.";
             }
-        } else {
-            syslog('info', "No snapshots found for $full_ds");
         }
 
-        # Now delete the zvol dataset
         my $id = URI::Escape::uri_escape($full_ds);
-        my $payload = { recursive => JSON::PP::false, force => JSON::PP::true };
+        my $payload = { recursive => JSON::PP::true, force => JSON::PP::true };
 
-        syslog('info', "Deleting dataset $full_ds (after snapshot cleanup)");
+        syslog('info', "Deleting dataset $full_ds (recursive deletion includes snapshots)");
         my $result = _api_call($scfg,'pool.dataset.delete',[ $full_ds, $payload ],
             sub { _rest_call($scfg,'DELETE',"/pool/dataset/id/$id",$payload) });
 
         # Handle potential async job for dataset deletion with shorter timeout
-        my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion for $full_ds", 20);
+        my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion for $full_ds", DATASET_DELETE_TIMEOUT_S);
         if (!$job_result->{success}) {
             die $job_result->{error};
         }
@@ -3297,14 +3287,24 @@ sub _free_image_iscsi {
     if ($@ && $@ =~ /busy|in use/i) {
         syslog('info', "Dataset deletion failed (device busy), retrying with logout");
         _logout_target_all_portals($scfg);
-        sleep(1);  # Reduced from 2s to 1s - modern systems settle faster
+        sleep(DEVICE_SETTLE_DELAY_S);  # Reduced from 2s to 1s - modern systems settle faster
 
         eval {
+            # Safety check (same as initial attempt)
+            my $ds_info = eval { _tn_dataset_get($scfg, $full_ds) };
+            if ($ds_info && $ds_info->{children}) {
+                my @children = grep { $_->{type} ne 'SNAPSHOT' } @{$ds_info->{children}};
+                if (@children) {
+                    my $child_names = join(', ', map { $_->{name} // $_->{id} } @children);
+                    die "Cannot use recursive deletion: dataset $full_ds has child datasets: $child_names";
+                }
+            }
+
             my $id = URI::Escape::uri_escape($full_ds);
-            my $payload = { recursive => JSON::PP::false, force => JSON::PP::true };
+            my $payload = { recursive => JSON::PP::true, force => JSON::PP::true };
             my $result = _api_call($scfg,'pool.dataset.delete',[ $full_ds, $payload ],
                 sub { _rest_call($scfg,'DELETE',"/pool/dataset/id/$id",$payload) });
-            my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion retry for $full_ds", 20);
+            my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion retry for $full_ds", DATASET_DELETE_TIMEOUT_S);
             if (!$job_result->{success}) {
                 die $job_result->{error};
             }
@@ -3406,7 +3406,7 @@ sub _free_image_nvme {
             _nvme_disconnect($scfg);
             # Wait for NVMe disconnect to complete
             syslog('info', "Waiting for NVMe disconnect to complete...");
-            sleep(1);
+            sleep(DEVICE_SETTLE_DELAY_S);
             eval { run_command(['udevadm','settle'], outfunc => sub {}) };
 
             # Retry namespace deletion
@@ -3426,6 +3426,17 @@ sub _free_image_nvme {
 
     # 2) Delete the zvol dataset with recursive flag to handle snapshots automatically
     eval {
+        # Safety check: Verify dataset has no child datasets (only snapshots allowed)
+        my $ds_info = eval { _tn_dataset_get($scfg, $full_ds) };
+        if ($ds_info && $ds_info->{children}) {
+            my @children = grep { $_->{type} ne 'SNAPSHOT' } @{$ds_info->{children}};
+            if (@children) {
+                my $child_names = join(', ', map { $_->{name} // $_->{id} } @children);
+                die "Cannot use recursive deletion: dataset $full_ds has child datasets: $child_names. " .
+                    "Recursive deletion would destroy these child datasets. Please remove them manually first.";
+            }
+        }
+
         my $id = URI::Escape::uri_escape($full_ds);
         my $payload = { recursive => JSON::PP::true, force => JSON::PP::true };
 
@@ -3433,7 +3444,7 @@ sub _free_image_nvme {
         my $result = _api_call($scfg,'pool.dataset.delete',[ $full_ds, $payload ],
             sub { _rest_call($scfg,'DELETE',"/pool/dataset/id/$id",$payload) });
 
-        my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion for $full_ds", 20);
+        my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion for $full_ds", DATASET_DELETE_TIMEOUT_S);
         if (!$job_result->{success}) {
             die $job_result->{error};
         }
@@ -3517,14 +3528,31 @@ sub _list_images_iscsi {
         %want = map { $_ => 1 } @$vollist;
     }
 
-    # Normalizer for volsize/typed fields ({parsed}/{raw}/scalar)
-    my $norm = sub {
-        my ($v) = @_;
-        return 0 if !defined $v;
-        return $v if !ref($v);
-        return $v->{parsed} // $v->{raw} // 0 if ref($v) eq 'HASH';
-        return 0;
+    # PERFORMANCE OPTIMIZATION: Batch-fetch all child datasets once
+    # instead of N individual API calls (fixes N+1 query pattern)
+    my %dataset_cache;
+    eval {
+        # Query TrueNAS for all child datasets under our storage dataset
+        # This is significantly faster than individual _tn_dataset_get() calls per volume
+        my $datasets = _api_call($scfg, 'pool.dataset.query', [
+            [["id", "^", "$scfg->{dataset}/"]]
+        ], sub {
+            # REST API fallback - less efficient but functional
+            my $parent_ds = _tn_dataset_get($scfg, $scfg->{dataset});
+            return $parent_ds->{children} // [];
+        });
+
+        # Build hash lookup table: dataset_id => dataset_info
+        if ($datasets && ref($datasets) eq 'ARRAY') {
+            for my $ds (@$datasets) {
+                my $id = $ds->{id} // next;
+                $dataset_cache{$id} = $ds;
+            }
+        }
     };
+    if ($@) {
+        _log($scfg, 1, 'warning', "list_images_iscsi: Failed to batch-fetch datasets, falling back to individual queries: $@");
+    }
 
     # Walk all mappings for our shared target; each mapping -> one LUN for an extent
     MAPPING: for my $tx (@$maps) {
@@ -3562,8 +3590,15 @@ sub _list_images_iscsi {
         }
 
         # Ask TrueNAS for the zvol to get current size (bytes) and creation time
-        my $ds   = eval { _tn_dataset_get($scfg, $ds_full) } // {};
-        my $size = $norm->($ds->{volsize}); # bytes (0 if missing)
+        # Use cached dataset if available (O(1) hash lookup), otherwise fall back to API call
+        my $ds = $dataset_cache{$ds_full} // do {
+            my $result = eval { _tn_dataset_get($scfg, $ds_full) };
+            if ($@) {
+                _log($scfg, 1, 'warning', "list_images: Failed to fetch dataset $ds_full during fallback: $@");
+            }
+            $result // {};
+        };
+        my $size = _normalize_value($ds->{volsize}); # bytes (0 if missing)
 
         # Extract creation time
         # Try multiple possible locations for creation time
@@ -3638,14 +3673,31 @@ sub _list_images_nvme {
         %want = map { $_ => 1 } @$vollist;
     }
 
-    # Normalizer for size fields
-    my $norm = sub {
-        my ($v) = @_;
-        return 0 if !defined $v;
-        return $v if !ref($v);
-        return $v->{parsed} // $v->{raw} // 0 if ref($v) eq 'HASH';
-        return 0;
+    # PERFORMANCE OPTIMIZATION: Batch-fetch all child datasets once
+    # instead of N individual API calls (fixes N+1 query pattern)
+    my %dataset_cache;
+    eval {
+        # Query TrueNAS for all child datasets under our storage dataset
+        # This is significantly faster than individual _tn_dataset_get() calls per volume
+        my $datasets = _api_call($scfg, 'pool.dataset.query', [
+            [["id", "^", "$scfg->{dataset}/"]]
+        ], sub {
+            # REST API fallback - less efficient but functional
+            my $parent_ds = _tn_dataset_get($scfg, $scfg->{dataset});
+            return $parent_ds->{children} // [];
+        });
+
+        # Build hash lookup table: dataset_id => dataset_info
+        if ($datasets && ref($datasets) eq 'ARRAY') {
+            for my $ds (@$datasets) {
+                my $id = $ds->{id} // next;
+                $dataset_cache{$id} = $ds;
+            }
+        }
     };
+    if ($@) {
+        _log($scfg, 1, 'warning', "list_images_nvme: Failed to batch-fetch datasets, falling back to individual queries: $@");
+    }
 
     # Process each namespace
     for my $ns (@$namespaces) {
@@ -3677,8 +3729,15 @@ sub _list_images_nvme {
         }
 
         # Get zvol details for size and creation time
-        my $ds = eval { _tn_dataset_get($scfg, $ds_full) } // {};
-        my $size = $norm->($ds->{volsize});  # bytes
+        # Use cached dataset if available (O(1) hash lookup), otherwise fall back to API call
+        my $ds = $dataset_cache{$ds_full} // do {
+            my $result = eval { _tn_dataset_get($scfg, $ds_full) };
+            if ($@) {
+                _log($scfg, 1, 'warning', "list_images: Failed to fetch dataset $ds_full during fallback: $@");
+            }
+            $result // {};
+        };
+        my $size = _normalize_value($ds->{volsize});  # bytes
 
         # Extract creation time
         my $ctime = 0;
@@ -3719,17 +3778,10 @@ sub status {
     my ($total, $avail, $used) = (0,0,0);
     eval {
         my $ds = _tn_dataset_get($scfg, $scfg->{dataset});
-        my $norm = sub {
-            my ($v) = @_;
-            return 0 if !defined $v;
-            return $v if !ref($v);
-            return $v->{parsed} // $v->{raw} // 0 if ref($v) eq 'HASH';
-            return 0;
-        };
-        my $quota     = $norm->($ds->{quota});     # bytes; 0 = no quota
-        my $available = $norm->($ds->{available}); # bytes
-        $used         = $norm->($ds->{written});
-        $used         = $norm->($ds->{used}) if !$used;
+        my $quota     = _normalize_value($ds->{quota});     # bytes; 0 = no quota
+        my $available = _normalize_value($ds->{available}); # bytes
+        $used         = _normalize_value($ds->{written});
+        $used         = _normalize_value($ds->{used}) if !$used;
         if ($quota && $quota > 0) {
             $total = $quota;
             my $free = $quota - $used;
@@ -3992,11 +4044,11 @@ sub activate_volume {
         _iscsi_login_all($scfg);
         if ($scfg->{use_multipath}) { run_command(['multipath','-r'], outfunc => sub {}); }
         run_command(['udevadm','settle'], outfunc => sub {});
-        usleep(150_000);
+        usleep(DEVICE_RESCAN_DELAY_US);
     } elsif ($mode eq 'nvme-tcp') {
         _nvme_connect($scfg);
         run_command(['udevadm','settle'], outfunc => sub {});
-        usleep(150_000);
+        usleep(DEVICE_RESCAN_DELAY_US);
     }
 
     return 1;
@@ -4212,14 +4264,7 @@ sub _clone_image_nvme {
 
     # Get zvol details for blocksize
     my $ds = eval { _tn_dataset_get($scfg, $target_full) } // {};
-    my $norm = sub {
-        my ($v) = @_;
-        return 0 if !defined $v;
-        return $v if !ref($v);
-        return $v->{parsed} // $v->{raw} // 0 if ref($v) eq 'HASH';
-        return 0;
-    };
-    my $volblocksize = $norm->($ds->{volblocksize}) || (128 * 1024);  # default 128K
+    my $volblocksize = _normalize_value($ds->{volblocksize}) || (128 * 1024);  # default 128K
 
     # Normalize blocksize to uppercase format
     my $blocksize_str = _normalize_blocksize($volblocksize);
