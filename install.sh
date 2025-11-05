@@ -2153,6 +2153,10 @@ run_health_check() {
     if pvesm status 2>/dev/null | grep -q "$storage_name.*active"; then
         local total_kb used_kb percent
         read -r total_kb used_kb percent < <(pvesm status 2>/dev/null | grep "$storage_name" | awk '{print $4, $5, $7}')
+        # Sanitize values (remove any whitespace/newlines)
+        total_kb=$(echo "$total_kb" | tr -d '\n ')
+        used_kb=$(echo "$used_kb" | tr -d '\n ')
+        percent=$(echo "$percent" | tr -d '\n ')
         # Convert KB to GB
         local used_gb=$(awk "BEGIN {printf \"%.2f\", $used_kb/1024/1024}")
         local total_gb=$(awk "BEGIN {printf \"%.2f\", $total_kb/1024/1024}")
@@ -2274,8 +2278,11 @@ run_health_check() {
             local nvme_result
             if check_nvme_cli && nvme list-subsys 2>/dev/null | grep -q "$subsystem_nqn"; then
                 local path_count live_count
-                path_count=$(nvme list-subsys 2>/dev/null | grep -A50 "$subsystem_nqn" | grep -c "transport: tcp" || echo "0")
-                live_count=$(nvme list-subsys 2>/dev/null | grep -A50 "$subsystem_nqn" | grep -c "state: live" || echo "0")
+                path_count=$(nvme list-subsys 2>/dev/null | grep -A50 "$subsystem_nqn" | grep -c " tcp " || echo "0")
+                live_count=$(nvme list-subsys 2>/dev/null | grep -A50 "$subsystem_nqn" | grep -c " live$" || echo "0")
+                # Sanitize values (remove any whitespace/newlines)
+                path_count=$(echo "$path_count" | head -1 | tr -d '\n ')
+                live_count=$(echo "$live_count" | head -1 | tr -d '\n ')
                 nvme_result="${COLOR_GREEN}✓${COLOR_RESET} Connected (${path_count} path(s), ${live_count} live)"
                 ((checks_passed++))
             else
@@ -2295,6 +2302,7 @@ run_health_check() {
             start_spinner
             local session_count
             session_count=$(iscsiadm -m session 2>/dev/null | grep -c "$target_iqn" || echo "0")
+            session_count=$(echo "$session_count" | head -1 | tr -d '\n ')
             local iscsi_result
             if [[ "$session_count" -gt 0 ]]; then
                 iscsi_result="${COLOR_GREEN}✓${COLOR_RESET} $session_count active session(s)"
@@ -2317,7 +2325,6 @@ run_health_check() {
         local portals
         portals=$(get_storage_config_value "$storage_name" "portals")
         if [[ -n "$portals" ]]; then
-            ((checks_total++))
             if [[ -f /sys/module/nvme_core/parameters/multipath ]]; then
                 local nvme_mp
                 nvme_mp=$(cat /sys/module/nvme_core/parameters/multipath 2>/dev/null)
@@ -2337,7 +2344,6 @@ run_health_check() {
         local use_multipath
         use_multipath=$(get_storage_config_value "$storage_name" "use_multipath")
         if [[ "$use_multipath" == "1" ]]; then
-            ((checks_total++))
             if command -v multipath &> /dev/null; then
                 local mpath_count
                 mpath_count=$(multipath -ll 2>/dev/null | grep -c "dm-" 2>/dev/null || echo "0")

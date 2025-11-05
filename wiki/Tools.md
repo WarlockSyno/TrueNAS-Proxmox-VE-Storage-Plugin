@@ -20,7 +20,6 @@ The plugin includes several tools to simplify installation, testing, cluster man
 ```
 tools/
 ├── truenas-plugin-test-suite.sh              # Production test suite
-├── health-check.sh                            # Health validation tool
 ├── cleanup-orphans.sh                         # Orphan resource cleanup
 ├── update-cluster.sh                          # Cluster deployment script
 ├── check-version.sh                           # Version checker for cluster
@@ -549,115 +548,80 @@ Complete test suite documentation: [Testing Guide](Testing.md)
 
 ### Overview
 
-The health check tool (`health-check.sh`) performs quick validation of the plugin installation and storage health. It's designed for monitoring integration and troubleshooting.
+The health check functionality is now integrated into the interactive installer (`install.sh`). It performs comprehensive validation of the plugin installation and storage health, supporting both iSCSI and NVMe/TCP transport modes.
 
-**Location**: `tools/health-check.sh`
+**Access Method**: Run `bash install.sh` and select "Run health check" from the menu
 
 ### Features
 
-- **12 Comprehensive Checks** - Validates all critical components
-- **Multiple Output Modes** - Normal, quiet, and JSON output
-- **Monitoring Integration** - Standard exit codes for alerting systems
-- **Orphan Detection** - Integrates with cleanup tool to detect issues
+- **13 Comprehensive Checks** - Validates all critical components
+- **Transport-Aware** - Adapts checks based on iSCSI or NVMe/TCP mode
 - **Color-coded Results** - Clear visual status indicators
+- **Exit Codes** - Standard return codes (0=healthy, 1=warning, 2=critical)
+- **Multi-storage Support** - Can check any configured TrueNAS storage
 
 ### Usage
 
-#### Basic Syntax
+#### Interactive Method (Recommended)
 
 ```bash
-./health-check.sh [storage-name] [--quiet] [--json]
+bash install.sh
+# Select: "Run health check" from the menu
+# Choose storage to check from the list
 ```
 
-**Parameters**:
-- `storage-name`: Name of TrueNAS storage to check
-- `--quiet`: Minimal output (summary only)
-- `--json`: JSON output for monitoring tools
+#### Example Output
 
-**Exit Codes**:
-- `0` - All checks passed (HEALTHY)
-- `1` - Warnings detected (WARNING)
-- `2` - Critical errors detected (CRITICAL)
-
-#### Examples
-
-**Normal Mode (Detailed)**:
-```bash
-cd tools/
-./health-check.sh truenas-storage
-
-# Output:
-# === TrueNAS Plugin Health Check ===
-# Storage: truenas-storage
-#
-# ✓ Plugin file: Installed v1.0.0
-# ✓ Storage configuration: Configured
-# ✓ Storage status: Active (264% free)
-# ✓ Content type: images
-# ✓ TrueNAS API: Reachable on 10.15.14.172:443
-# ✓ Dataset: pve_test/pve-storage
-# ✓ Target IQN: iqn.2005-10.org.freenas.ctl:proxmox
-# ✓ Discovery portal: 10.15.14.172:3260
-# ✓ iSCSI sessions: 1 active session(s)
-# ⊘ Multipath: Not enabled
-# ✓ Orphaned resources: No orphans found
-# ✓ PVE daemon: Running
-#
-# === Health Summary ===
-# Checks passed: 11/12
-# Warnings: 0
-# Errors: 0
-# Status: HEALTHY
 ```
+TrueNAS Plugin Health Check
+---------------------------
 
-**Quiet Mode (Summary Only)**:
-```bash
-cd tools/
-./health-check.sh truenas-storage --quiet
+Running health check on storage: tn-nvme
 
-# Output:
-# === Health Summary ===
-# Checks passed: 11/12
-# Status: HEALTHY
-```
+Plugin file:                   ✓ Installed v1.1.3
+Storage configuration:         ✓ Configured
+Storage status:                ✓ Active (41.35GB / 1708.80GB used, 2.42%)
+Content type:                  ✓ images
+TrueNAS API:                   ✓ Reachable on 10.15.14.172:443
+Dataset:                       ✓ flash/nvme-testing
+nvme-cli:                      ✓ Installed
+Subsystem NQN:                 ✓ nqn.2011-06.com.truenas:uuid:...:nvme-proxmox
+Host NQN:                      ✓ nqn.2014-08.org.nvmexpress:uuid:...
+Discovery portal:              ✓ 10.20.30.20:4420
+NVMe connections:              ✓ Connected (2 path(s), 2 live)
+Native multipath:              ✓ Enabled (kernel)
+PVE daemon:                    ✓ Running
 
-**JSON Mode (Monitoring)**:
-```bash
-cd tools/
-./health-check.sh truenas-storage --json
-
-# Output:
-# {
-#   "storage": "truenas-storage",
-#   "status": "HEALTHY",
-#   "checks": [
-#     {"check": "Plugin file", "status": "OK", "message": "Installed v1.0.0"},
-#     {"check": "Storage configuration", "status": "OK", "message": "Configured"},
-#     ...
-#   ],
-#   "errors": 0,
-#   "warnings": 0,
-#   "passed": 11,
-#   "total": 12
-# }
+Health Summary:
+Checks passed: 13/13
+Status: HEALTHY
 ```
 
 ### Health Checks Performed
 
-The tool performs these 12 checks:
+The tool performs up to 13 checks depending on transport mode:
 
+**Common Checks (All Modes)**:
 1. **Plugin File** - Verifies plugin is installed and detects version
 2. **Storage Configuration** - Checks `/etc/pve/storage.cfg` has storage entry
-3. **Storage Status** - Validates storage is active and reports free space
+3. **Storage Status** - Validates storage is active and reports space usage
 4. **Content Type** - Ensures content type is set to "images"
-5. **TrueNAS API** - Tests API reachability and authentication
+5. **TrueNAS API** - Tests API reachability on configured host:port
 6. **Dataset** - Verifies dataset is configured
-7. **Target IQN** - Validates iSCSI target IQN is set
-8. **Discovery Portal** - Checks discovery portal is configured
-9. **iSCSI Sessions** - Counts active iSCSI sessions to TrueNAS
-10. **Multipath** - Checks multipath configuration (skip if disabled)
-11. **Orphaned Resources** - Scans for orphaned iSCSI resources
-12. **PVE Daemon** - Verifies pvedaemon is running
+7. **Discovery Portal** - Checks discovery portal is configured
+8. **PVE Daemon** - Verifies pvedaemon is running
+
+**iSCSI-Specific Checks**:
+9. **Target IQN** - Validates iSCSI target IQN is set
+10. **iSCSI Sessions** - Counts active iSCSI sessions to TrueNAS
+11. **Multipath** (conditional) - Checks multipath-tools if enabled
+
+**NVMe/TCP-Specific Checks**:
+9. **nvme-cli** - Verifies nvme-cli package is installed
+10. **Subsystem NQN** - Validates NVMe subsystem NQN is configured
+11. **Host NQN** - Checks host NQN (configured or system default)
+12. **NVMe Connections** - Counts TCP paths and live connections
+13. **Native Multipath** (conditional) - Checks kernel NVMe multipath if multiple portals configured
 
 ### Output Interpretation
 
@@ -665,21 +629,13 @@ The tool performs these 12 checks:
 - `✓` (Green) - Check passed (OK)
 - `✗` (Red) - Check failed (CRITICAL)
 - `⚠` (Yellow) - Check passed with warning (WARNING)
-- `⊘` (Gray) - Check skipped (SKIP)
 
 **Overall Status**:
-- `HEALTHY` - All checks passed or skipped
+- `HEALTHY` - All checks passed
 - `WARNING` - One or more warnings detected
 - `CRITICAL` - One or more critical errors detected
 
 ### When to Run
-
-**Monitoring Integration**:
-```bash
-# Cron job for hourly health checks
-0 * * * * /path/to/tools/health-check.sh truenas-storage --quiet || \
-  echo "TrueNAS storage health issue" | mail -s "Storage Alert" admin@example.com
-```
 
 **Troubleshooting**:
 - Before reporting issues - gather diagnostic info
@@ -693,68 +649,29 @@ The tool performs these 12 checks:
 - Before cluster maintenance
 - Before plugin updates
 
-### Monitoring Integration
+### Programmatic Access
 
-#### Nagios/Icinga
+For automation or monitoring integration, you can extract and use the `run_health_check()` function from `install.sh`:
 
 ```bash
-#!/bin/bash
-# /usr/lib/nagios/plugins/check_truenas_storage.sh
-OUTPUT=$(/path/to/tools/health-check.sh truenas-storage --quiet)
+# Source the installer to access health check function
+source install.sh
+
+# Run health check programmatically
+run_health_check "truenas-storage"
 EXIT_CODE=$?
-echo "$OUTPUT"
-exit $EXIT_CODE
+
+# Exit codes:
+# 0 = HEALTHY
+# 1 = WARNING
+# 2 = CRITICAL
 ```
 
-**Nagios config**:
-```
-define service {
-    service_description     TrueNAS Storage Health
-    check_command           check_truenas_storage
-    use                     generic-service
-}
-```
-
-#### Zabbix
-
-```bash
-# UserParameter in zabbix_agentd.conf
-UserParameter=truenas.health[*],/path/to/tools/health-check.sh $1 --json
-```
-
-**Zabbix item**:
-- Key: `truenas.health[truenas-storage]`
-- Type: Zabbix agent
-- Value type: Text
-
-#### Prometheus
-
-```bash
-#!/bin/bash
-# /var/lib/node_exporter/textfile_collector/truenas_health.prom
-OUTPUT=$(/path/to/tools/health-check.sh truenas-storage --json)
-STATUS=$(echo "$OUTPUT" | jq -r '.status')
-PASSED=$(echo "$OUTPUT" | jq -r '.passed')
-TOTAL=$(echo "$OUTPUT" | jq -r '.total')
-
-cat <<EOF > /var/lib/node_exporter/textfile_collector/truenas_health.prom
-# HELP truenas_health_status TrueNAS storage health status (0=healthy, 1=warning, 2=critical)
-# TYPE truenas_health_status gauge
-truenas_health_status{storage="truenas-storage"} $([ "$STATUS" = "HEALTHY" ] && echo 0 || [ "$STATUS" = "WARNING" ] && echo 1 || echo 2)
-
-# HELP truenas_health_checks_passed Number of health checks passed
-# TYPE truenas_health_checks_passed gauge
-truenas_health_checks_passed{storage="truenas-storage"} $PASSED
-
-# HELP truenas_health_checks_total Total number of health checks
-# TYPE truenas_health_checks_total gauge
-truenas_health_checks_total{storage="truenas-storage"} $TOTAL
-EOF
-```
+**Note**: The integrated health check does not currently support `--json` or `--quiet` output modes. For monitoring integration requiring these features, you may need to parse the standard output or implement a wrapper script.
 
 ### Troubleshooting
 
-**"Error: Storage 'name' not found"**:
+**"Storage 'name' not found"**:
 - Storage name is incorrect
 - Storage is not a TrueNAS plugin storage
 - Check: `grep truenasplugin /etc/pve/storage.cfg`
@@ -762,59 +679,51 @@ EOF
 **"Plugin file: Not installed"**:
 - Plugin not installed
 - Use: `ls -la /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm`
-- Fix: Run installation or `update-cluster.sh`
+- Fix: Run `bash install.sh` and install the plugin
 
 **"TrueNAS API: Not reachable"**:
 - TrueNAS is offline
 - Network connectivity issue
-- Firewall blocking port 443
+- Firewall blocking the API port
 - Check: `ping TRUENAS_IP` and `curl -k https://TRUENAS_IP/api/v2.0/system/info`
 
 **"Storage status: Inactive"**:
 - Storage is disabled in Proxmox
 - Fix: `pvesm set truenas-storage --disable 0`
 
-**"iSCSI sessions: No active sessions"**:
+**"iSCSI sessions: No active sessions"** (iSCSI mode):
 - iSCSI connection lost
 - Discovery portal unreachable
 - Check: `iscsiadm -m session`
 - Reconnect: `iscsiadm -m discovery -t st -p PORTAL_IP:3260`
 
-**"Orphaned resources: Found X orphans"**:
-- Orphaned iSCSI resources detected
-- Fix: Run `./cleanup-orphans.sh truenas-storage`
+**"NVMe connections: Not connected"** (NVMe/TCP mode):
+- NVMe subsystem not connected
+- Discovery or portal configuration issue
+- Check: `nvme list-subsys` and `nvme discover -t tcp -a PORTAL_IP -s 4420`
+- Reconnect: See [NVMe Setup Guide](NVMe-Setup.md)
 
 ### Best Practices
 
-1. **Schedule Regular Checks**:
+1. **Run After Installation**:
+   - Always run health check after installing or updating the plugin
+   - Verify all components are working before deploying VMs
+
+2. **Run After Configuration Changes**:
+   - After modifying storage configuration
+   - After network changes
+   - After TrueNAS updates
+
+3. **Document Results**:
    ```bash
-   # Hourly health check
-   0 * * * * /path/to/tools/health-check.sh truenas-storage --quiet
+   # Capture health check output for baseline
+   bash install.sh # then select health check
+   # Save output for comparison
    ```
 
-2. **Integrate with Monitoring**:
-   - Use JSON output for parsing
-   - Alert on exit code 2 (CRITICAL)
-   - Warn on exit code 1 (WARNING)
-
-3. **Document Baselines**:
-   ```bash
-   # Capture healthy baseline
-   ./health-check.sh truenas-storage > baseline-health.txt
-   ```
-
-4. **Run Before Changes**:
-   ```bash
-   # Pre-change validation
-   ./health-check.sh truenas-storage || echo "WARNING: Starting with unhealthy storage"
-   ```
-
-5. **Combine with Other Tools**:
-   ```bash
-   # Comprehensive health check
-   ./health-check.sh truenas-storage && \
-   ./cleanup-orphans.sh truenas-storage --dry-run
-   ```
+4. **Check Before Troubleshooting**:
+   - Run health check first when experiencing storage issues
+   - Helps identify root cause quickly
 
 ---
 
@@ -1290,7 +1199,7 @@ done
 | Tool | Purpose | Location | Documentation |
 |------|---------|----------|---------------|
 | Test Suite | Automated testing and validation | `tools/truenas-plugin-test-suite.sh` | [Testing Guide](Testing.md) |
-| Health Check | Quick health validation for monitoring | `tools/health-check.sh` | This page |
+| Health Check | Quick health validation for monitoring | Integrated in `install.sh` | This page |
 | Cluster Update | Deploy plugin to cluster nodes | `tools/update-cluster.sh` | This page |
 | Version Check | Check plugin version across cluster | `tools/check-version.sh` | This page |
 | Orphan Cleanup | Find and remove orphaned iSCSI resources | `tools/cleanup-orphans.sh` | This page |
