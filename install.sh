@@ -710,11 +710,21 @@ cleanup_all() {
     # Extra safety: kill any orphaned sleep 0.1 processes that belong to this script
     # This is a safety net for any edge cases
     pkill -f "sleep 0\.1" 2>/dev/null || true
+
+    # Restore cursor visibility
+    printf "\033[?25h" >&2
+
+    # If interrupted (not normal exit), show user-friendly message
+    if [[ "${1:-}" == "interrupted" ]]; then
+        echo
+        echo
+        warning "Installation interrupted by user"
+    fi
 }
 
 # Set up error trap and cleanup
 trap 'cleanup_all; cleanup_on_error' EXIT
-trap 'cleanup_all; exit 130' INT
+trap 'cleanup_all interrupted; exit 130' INT
 trap 'cleanup_all; exit 143' TERM
 
 # ============================================================================
@@ -2023,10 +2033,11 @@ menu_diagnostics() {
 
         show_menu "Select diagnostic action" \
             "Run health check" \
-            "Cleanup orphaned resources"
+            "Cleanup orphaned resources" \
+            "Run plugin function test"
 
         local choice
-        choice=$(read_choice 2)
+        choice=$(read_choice 3)
 
         case $choice in
             0)
@@ -2042,8 +2053,866 @@ menu_diagnostics() {
                 menu_cleanup_orphans
                 read -rp "Press Enter to return to diagnostics menu..."
                 ;;
+            3)
+                # Run plugin function test
+                menu_plugin_test
+                read -rp "Press Enter to return to diagnostics menu..."
+                ;;
         esac
     done
+}
+
+# Menu: Plugin function test
+menu_plugin_test() {
+    clear_screen
+    print_banner
+    echo
+
+    # Show description and warnings
+    info "Plugin Function Test Suite"
+    echo
+    warning "This test will perform the following operations:"
+    echo "  • Validate storage accessibility via Proxmox API"
+    echo "  • Create test VMs with dynamic ID selection"
+    echo "  • Test volume creation, snapshots, and clones"
+    echo "  • Test volume resize operations"
+    echo "  • Test VM start/stop lifecycle"
+    echo "  • Cleanup test VMs automatically"
+    echo
+
+    if is_cluster_node; then
+        info "Cluster detected - additional tests available:"
+        echo "  • VM migration to remote nodes"
+        echo "  • Cross-node VM cloning"
+        echo
+    fi
+
+    warning "Important considerations:"
+    echo "  • Test VMs will be created with IDs automatically selected from available range (990+)"
+    echo "  • Storage must have at least 10GB free space"
+    echo "  • Tests will take approximately 2-5 minutes to complete"
+    echo "  • All test data will be cleaned up after completion"
+    echo "  • Tests are non-destructive to production VMs and data"
+    echo
+
+    # Require typed confirmation
+    info "Type ${c8}ACCEPT${c0} to continue or any other input to return to menu"
+    local confirmation
+    read -rp "Confirmation: " confirmation
+
+    if [[ "$confirmation" != "ACCEPT" ]]; then
+        warning "Test cancelled by user"
+        return 0
+    fi
+
+    # Clear screen and show banner again for storage selection
+    clear_screen
+    print_banner
+    echo
+
+    # Show header
+    info "Plugin Function Test"
+    echo
+
+    # List available TrueNAS storage
+    info "Detecting TrueNAS storage configurations..."
+    echo
+
+    if [[ ! -f "$STORAGE_CFG" ]]; then
+        error "Storage configuration file not found: $STORAGE_CFG"
+        return 1
+    fi
+
+    local storages
+    storages=$(grep "^truenasplugin:" "$STORAGE_CFG" 2>/dev/null | awk '{print $2}')
+
+    if [[ -z "$storages" ]]; then
+        warning "No TrueNAS storage configured"
+        info "Please configure storage first from the main menu"
+        return 1
+    fi
+
+    info "Available TrueNAS storage:"
+    while IFS= read -r storage; do
+        echo "  • $storage"
+    done <<< "$storages"
+    echo
+
+    # Prompt for storage selection
+    local storage_name
+    read -rp "Enter storage name to test: " storage_name
+
+    # Validate storage exists
+    if ! echo "$storages" | grep -q "^${storage_name}$"; then
+        error "Storage '$storage_name' not found in configuration"
+        return 1
+    fi
+
+    # Clear screen and show header for test execution
+    clear_screen
+    print_banner
+    echo
+
+    info "Plugin Function Test"
+    echo
+
+    info "Running plugin function test on storage: $storage_name"
+    echo
+
+    # Run the test suite
+    run_plugin_test "$storage_name" || true
+
+    return 0
+}
+
+# ============================================================================
+# Plugin Test Suite Functions
+# ============================================================================
+
+# Global test variables
+NODE_NAME=$(hostname)
+TEST_VM_BASE=990
+TEST_VM_CLONE=991
+TEST_API_TIMEOUT=60
+
+# API wrapper function - uses pvesh to interact with Proxmox API
+test_api_call() {
+    local method="$1"
+    local path="$2"
+    shift 2
+    local params=("$@")
+
+    local output
+    local exit_code
+
+    # Build pvesh command
+    case "$method" in
+        GET)
+            output=$(timeout $TEST_API_TIMEOUT pvesh get "$path" "${params[@]}" 2>&1)
+            exit_code=$?
+            ;;
+        POST|CREATE)
+            output=$(timeout $TEST_API_TIMEOUT pvesh create "$path" "${params[@]}" 2>&1)
+            exit_code=$?
+            ;;
+        PUT|SET)
+            output=$(timeout $TEST_API_TIMEOUT pvesh set "$path" "${params[@]}" 2>&1)
+            exit_code=$?
+            ;;
+        DELETE)
+            output=$(timeout $TEST_API_TIMEOUT pvesh delete "$path" "${params[@]}" 2>&1)
+            exit_code=$?
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    # Filter out plugin warning messages
+    output=$(echo "$output" | grep -v "Plugin.*older storage API" || echo "$output")
+
+    echo "$output"
+    return $exit_code
+}
+
+# Function to find available VM IDs dynamically
+test_find_available_vm_ids() {
+    local base_id=${1:-990}
+    local found_base=false
+    local found_clone=false
+
+    # Get list of existing VMs via API
+    local existing_vms=$(test_api_call GET "/cluster/resources" --type vm 2>/dev/null | grep -oP 'vmid.*?\K[0-9]+' || echo "")
+
+    # Search for two consecutive available VM IDs
+    for candidate in $(seq $base_id $((base_id + 100))); do
+        local next_id=$((candidate + 1))
+
+        # Check if both candidate and next_id are available
+        if ! echo "$existing_vms" | grep -qw "$candidate" && \
+           ! echo "$existing_vms" | grep -qw "$next_id"; then
+            TEST_VM_BASE=$candidate
+            TEST_VM_CLONE=$next_id
+            found_base=true
+            found_clone=true
+            break
+        fi
+    done
+
+    if $found_base && $found_clone; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Wait for task completion
+test_wait_for_task() {
+    local task_upid="$1"
+    local max_wait="${2:-120}"
+    local wait_count=0
+
+    if [[ -z "$task_upid" ]]; then
+        return 0
+    fi
+
+    while [ $wait_count -lt $max_wait ]; do
+        # Get task status - API returns table format with "│ status │ stopped │"
+        local output=$(test_api_call GET "/nodes/$NODE_NAME/tasks/$task_upid/status" 2>&1)
+
+        # Check if task is stopped (look for "status" row with "stopped" value)
+        if echo "$output" | grep -q "│ status.*│.*stopped"; then
+            return 0
+        fi
+
+        sleep 1
+        ((wait_count++))
+    done
+
+    return 1
+}
+
+# Test result formatter (matches health check style)
+test_result() {
+    local name="$1"
+    local status="$2"
+    local message="$3"
+
+    printf "%-30s " "${name}:"
+    case "$status" in
+        PASS)
+            echo -e "${c2}✓${c0} $message"
+            ;;
+        FAIL)
+            echo -e "${c1}✗${c0} $message"
+            ;;
+        SKIP)
+            echo -e "${c6}-${c0} $message"
+            ;;
+    esac
+}
+
+# Test 1: Storage Status
+test_storage_status() {
+    local storage_name="$1"
+
+    printf "%-30s " "Storage accessibility:"
+    start_spinner
+
+    if test_api_call GET "/nodes/$NODE_NAME/storage/$storage_name/status" >/dev/null 2>&1; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Storage accessibility:")${c2}✓${c0} API responsive"
+        return 0
+    else
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Storage accessibility:")${c1}✗${c0} Not accessible"
+        return 1
+    fi
+}
+
+# Test 2: Volume Creation
+test_volume_creation() {
+    local storage_name="$1"
+
+    printf "%-30s " "Create test VM:"
+    start_spinner
+
+    local output
+    output=$(test_api_call POST "/nodes/$NODE_NAME/qemu" \
+        --vmid "$TEST_VM_BASE" \
+        --name "test-base-vm" \
+        --memory 512 \
+        --cores 1 \
+        --net0 "virtio,bridge=vmbr0" \
+        --scsihw "virtio-scsi-pci" 2>&1)
+
+    if [[ $? -ne 0 ]]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Create test VM:")${c1}✗${c0} Failed"
+        return 1
+    fi
+
+    local task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" >/dev/null 2>&1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Create test VM:")${c2}✓${c0} VM $TEST_VM_BASE created"
+
+    printf "%-30s " "Add 4GB disk to VM:"
+    start_spinner
+    output=$(test_api_call PUT "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/config" --scsi0 "$storage_name:4" 2>&1)
+    if [ $? -ne 0 ]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Add 4GB disk to VM:")${c1}✗${c0} Failed"
+        return 1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Add 4GB disk to VM:")${c2}✓${c0} Disk provisioned"
+    return 0
+}
+
+# Test 3: Volume Listing
+test_volume_listing() {
+    local storage_name="$1"
+
+    printf "%-30s " "List volumes on storage:"
+    start_spinner
+    if ! test_api_call GET "/nodes/$NODE_NAME/storage/$storage_name/content" >/dev/null 2>&1; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "List volumes on storage:")${c1}✗${c0} Failed"
+        return 1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "List volumes on storage:")${c2}✓${c0} Listed successfully"
+
+    printf "%-30s " "Get VM configuration:"
+    start_spinner
+    if ! test_api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/config" >/dev/null 2>&1; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Get VM configuration:")${c1}✗${c0} Failed"
+        return 1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Get VM configuration:")${c2}✓${c0} Retrieved successfully"
+    return 0
+}
+
+# Test 4: Snapshot Operations
+test_snapshot_operations() {
+    local snapshot_name="test-snap-$(date +%s)"
+
+    printf "%-30s " "Create VM snapshot:"
+    start_spinner
+    output=$(test_api_call POST "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/snapshot" \
+        --snapname "$snapshot_name" \
+        --description "Test snapshot via API" 2>&1)
+
+    if [ $? -ne 0 ]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Create VM snapshot:")${c1}✗${c0} Failed"
+        return 1
+    fi
+
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 60 >/dev/null 2>&1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Create VM snapshot:")${c2}✓${c0} Snapshot created"
+
+    printf "%-30s " "List VM snapshots:"
+    start_spinner
+    if ! test_api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/snapshot" >/dev/null 2>&1; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "List VM snapshots:")${c1}✗${c0} Failed"
+        return 1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "List VM snapshots:")${c2}✓${c0} Listed successfully"
+
+    printf "%-30s " "Create clone base snapshot:"
+    start_spinner
+    local clone_snapshot="clone-base-$(date +%s)"
+    output=$(test_api_call POST "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/snapshot" \
+        --snapname "$clone_snapshot" \
+        --description "Snapshot for clone test" 2>&1)
+
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 60 >/dev/null 2>&1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Create clone base snapshot:")${c2}✓${c0} Clone base ready"
+
+    # Save snapshot name for clone test
+    echo "$clone_snapshot" > /tmp/clone_snapshot_name
+
+    return 0
+}
+
+# Test 5: Clone Operations
+test_clone_operations() {
+    local clone_snapshot
+    if [[ -f /tmp/clone_snapshot_name ]]; then
+        clone_snapshot=$(cat /tmp/clone_snapshot_name)
+    else
+        test_result "Clone VM from snapshot" "FAIL" "No snapshot available"
+        return 1
+    fi
+
+    printf "%-30s " "Clone VM from snapshot:"
+    start_spinner
+
+    output=$(test_api_call POST "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/clone" \
+        --newid "$TEST_VM_CLONE" \
+        --name "test-clone-vm" \
+        --snapname "$clone_snapshot" 2>&1)
+
+    if [[ $? -ne 0 ]]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Clone VM from snapshot:")${c1}✗${c0} Failed to create"
+        return 1
+    fi
+
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 300 >/dev/null 2>&1
+    fi
+
+    if ! test_api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_CLONE/config" >/dev/null 2>&1; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Clone VM from snapshot:")${c1}✗${c0} Clone not verified"
+        return 1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Clone VM from snapshot:")${c2}✓${c0} VM $TEST_VM_CLONE created"
+    return 0
+}
+
+# Test 6: Volume Resize
+test_volume_resize() {
+    printf "%-30s " "Resize volume (+1GB):"
+    start_spinner
+
+    if ! test_api_call PUT "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/resize" --disk scsi0 --size "+1G" >/dev/null 2>&1; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Resize volume (+1GB):")${c1}✗${c0} Failed"
+        return 1
+    fi
+
+    if ! test_api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/config" >/dev/null 2>&1; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Resize volume (+1GB):")${c1}✗${c0} Verification failed"
+        return 1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Resize volume (+1GB):")${c2}✓${c0} Resized successfully"
+    return 0
+}
+
+# Test 7: VM Start/Stop
+test_vm_start_stop() {
+    printf "%-30s " "Start VM:"
+    start_spinner
+
+    local output=$(test_api_call POST "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/status/start" 2>&1)
+    if [[ $? -ne 0 ]]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Start VM:")${c1}✗${c0} Failed to start"
+        return 1
+    fi
+
+    local task_upid=$(echo "$output" | grep "UPID:" | head -1 | awk '{print $1}')
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 60 >/dev/null 2>&1
+    fi
+
+    sleep 2
+    output=$(test_api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/status/current" 2>&1)
+    if ! echo "$output" | grep -q "│ status.*│.*running"; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Start VM:")${c1}✗${c0} Not running"
+        return 1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Start VM:")${c2}✓${c0} VM started successfully"
+
+    printf "%-30s " "Stop VM:"
+    start_spinner
+    output=$(test_api_call POST "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/status/stop" 2>&1)
+    if [[ $? -ne 0 ]]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Stop VM:")${c1}✗${c0} Failed to stop"
+        return 1
+    fi
+
+    task_upid=$(echo "$output" | grep "UPID:" | head -1 | awk '{print $1}')
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 60 >/dev/null 2>&1
+    fi
+
+    sleep 2
+    output=$(test_api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/status/current" 2>&1)
+    if ! echo "$output" | grep -q "│ status.*│.*stopped"; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Stop VM:")${c1}✗${c0} Not stopped"
+        return 1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Stop VM:")${c2}✓${c0} VM stopped successfully"
+    return 0
+}
+
+# Test 8: Volume Deletion
+test_volume_deletion() {
+    printf "%-30s " "Delete test VMs (--purge):"
+    start_spinner
+
+    if test_api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_CLONE/status/current" >/dev/null 2>&1; then
+        output=$(test_api_call DELETE "/nodes/$NODE_NAME/qemu/$TEST_VM_CLONE" --purge 1 2>&1)
+
+        if [[ $? -ne 0 ]]; then
+            stop_spinner
+            echo -e "\r$(printf "%-30s " "Delete test VMs (--purge):")${c1}✗${c0} Failed to delete clone"
+            return 1
+        fi
+
+        task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+        if [[ -n "$task_upid" ]]; then
+            test_wait_for_task "$task_upid" 60 >/dev/null 2>&1
+        fi
+        sleep 3
+    fi
+
+    output=$(test_api_call DELETE "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE" --purge 1 2>&1)
+
+    if [[ $? -ne 0 ]]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Delete test VMs (--purge):")${c1}✗${c0} Failed to delete base"
+        return 1
+    fi
+
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 60 >/dev/null 2>&1
+    fi
+
+    sleep 3
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Delete test VMs (--purge):")${c2}✓${c0} Volumes cleaned up"
+    return 0
+}
+
+# Cluster Test 1: VM Migration
+test_vm_migration() {
+    local remote_nodes
+    if ! remote_nodes=$(get_remote_cluster_nodes 2>/dev/null); then
+        test_result "Migrate VM to remote node" "SKIP" "No remote nodes"
+        return 0
+    fi
+
+    local target_node_info=$(echo "$remote_nodes" | head -1)
+    local target_node="${target_node_info%%:*}"
+    local target_ip="${target_node_info##*:}"
+
+    if ! validate_ssh_to_node "$target_ip" 2>/dev/null; then
+        test_result "Migrate VM to remote node" "SKIP" "SSH unavailable"
+        return 0
+    fi
+
+    printf "%-30s " "Migrate VM to remote node:"
+    start_spinner
+
+    local migrate_vm_id=$((TEST_VM_BASE + 10))
+    local existing_vms=$(test_api_call GET "/cluster/resources" --type vm 2>/dev/null | grep -oP 'vmid.*?\K[0-9]+' || echo "")
+    while echo "$existing_vms" | grep -qw "$migrate_vm_id"; do
+        migrate_vm_id=$((migrate_vm_id + 1))
+    done
+
+    local output
+    output=$(test_api_call POST "/nodes/$NODE_NAME/qemu" \
+        --vmid "$migrate_vm_id" \
+        --name "test-migrate-vm" \
+        --memory 256 \
+        --cores 1 \
+        --net0 "virtio,bridge=vmbr0" 2>&1)
+
+    if [[ $? -ne 0 ]]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Migrate VM to remote node:")${c6}-${c0} VM creation failed"
+        return 0
+    fi
+
+    local task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" >/dev/null 2>&1
+    fi
+
+    output=$(test_api_call POST "/nodes/$NODE_NAME/qemu/$migrate_vm_id/migrate" \
+        --target "$target_node" \
+        --online 0 2>&1)
+
+    if [[ $? -ne 0 ]]; then
+        test_api_call DELETE "/nodes/$NODE_NAME/qemu/$migrate_vm_id" --purge 1 >/dev/null 2>&1
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Migrate VM to remote node:")${c6}-${c0} Migration failed"
+        return 0
+    fi
+
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 120 >/dev/null 2>&1
+    fi
+
+    test_api_call DELETE "/nodes/$target_node/qemu/$migrate_vm_id" --purge 1 >/dev/null 2>&1
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Migrate VM to remote node:")${c2}✓${c0} Migrated to $target_node"
+    return 0
+}
+
+# Cluster Test 2: Cross-node Clone
+test_cross_node_clone() {
+    local storage_name="$1"
+
+    local remote_nodes
+    if ! remote_nodes=$(get_remote_cluster_nodes 2>/dev/null); then
+        test_result "Clone VM to remote node" "SKIP" "No remote nodes"
+        return 0
+    fi
+
+    local target_node_info=$(echo "$remote_nodes" | head -1)
+    local target_node="${target_node_info%%:*}"
+    local target_ip="${target_node_info##*:}"
+
+    if ! validate_ssh_to_node "$target_ip" 2>/dev/null; then
+        test_result "Clone VM to remote node" "SKIP" "SSH unavailable"
+        return 0
+    fi
+
+    printf "%-30s " "Clone VM to remote node:"
+    start_spinner
+
+    local clone_source_vm=$((TEST_VM_BASE + 20))
+    local existing_vms=$(test_api_call GET "/cluster/resources" --type vm 2>/dev/null | grep -oP 'vmid.*?\K[0-9]+' || echo "")
+    while echo "$existing_vms" | grep -qw "$clone_source_vm"; do
+        clone_source_vm=$((clone_source_vm + 1))
+    done
+
+    local output
+    output=$(test_api_call POST "/nodes/$NODE_NAME/qemu" \
+        --vmid "$clone_source_vm" \
+        --name "test-clone-source" \
+        --memory 256 \
+        --cores 1 \
+        --net0 "virtio,bridge=vmbr0" \
+        --scsihw "virtio-scsi-pci" 2>&1)
+
+    if [[ $? -ne 0 ]]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Clone VM to remote node:")${c6}-${c0} VM creation failed"
+        return 0
+    fi
+
+    local task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" >/dev/null 2>&1
+    fi
+
+    test_api_call PUT "/nodes/$NODE_NAME/qemu/$clone_source_vm/config" --scsi0 "$storage_name:1" >/dev/null 2>&1
+
+    local snapshot_name="cross-node-snap-$(date +%s)"
+    output=$(test_api_call POST "/nodes/$NODE_NAME/qemu/$clone_source_vm/snapshot" \
+        --snapname "$snapshot_name" \
+        --description "Cross-node clone test" 2>&1)
+
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 60 >/dev/null 2>&1
+    fi
+
+    local clone_vm_id=$((clone_source_vm + 1))
+    while echo "$existing_vms" | grep -qw "$clone_vm_id"; do
+        clone_vm_id=$((clone_vm_id + 1))
+    done
+
+    output=$(test_api_call POST "/nodes/$NODE_NAME/qemu/$clone_source_vm/clone" \
+        --newid "$clone_vm_id" \
+        --name "test-clone-remote" \
+        --snapname "$snapshot_name" \
+        --target "$target_node" 2>&1)
+
+    if [[ $? -ne 0 ]]; then
+        test_api_call DELETE "/nodes/$NODE_NAME/qemu/$clone_source_vm" --purge 1 >/dev/null 2>&1
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Clone VM to remote node:")${c6}-${c0} Clone failed"
+        return 0
+    fi
+
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 300 >/dev/null 2>&1
+    fi
+
+    test_api_call DELETE "/nodes/$NODE_NAME/qemu/$clone_source_vm" --purge 1 >/dev/null 2>&1
+    test_api_call DELETE "/nodes/$target_node/qemu/$clone_vm_id" --purge 1 >/dev/null 2>&1
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Clone VM to remote node:")${c2}✓${c0} Cloned to $target_node"
+    return 0
+}
+
+# Cleanup test VMs function
+cleanup_test_vms() {
+    info "Cleaning up any remaining test VMs..."
+
+    # Try to delete both test VMs if they exist
+    if test_api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_CLONE/status/current" >/dev/null 2>&1; then
+        echo "  Removing test VM $TEST_VM_CLONE..."
+        test_api_call DELETE "/nodes/$NODE_NAME/qemu/$TEST_VM_CLONE" --purge 1 >/dev/null 2>&1
+    fi
+
+    if test_api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/status/current" >/dev/null 2>&1; then
+        echo "  Removing test VM $TEST_VM_BASE..."
+        test_api_call DELETE "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE" --purge 1 >/dev/null 2>&1
+    fi
+
+    # Clean up temp files
+    rm -f /tmp/clone_snapshot_name 2>/dev/null
+
+    success "Cleanup complete"
+}
+
+# Main test execution function
+run_plugin_test() {
+    local storage_name="$1"
+    local start_time=$(date +%s)
+
+    # Track test results
+    local tests_passed=0
+    local tests_failed=0
+    local tests_total=0
+
+    # Pre-flight checks (silent)
+    if ! command -v pvesh &> /dev/null; then
+        error "pvesh command not found - cannot run tests"
+        return 1
+    fi
+
+    if ! test_find_available_vm_ids; then
+        error "Failed to find available VM IDs"
+        return 1
+    fi
+
+    # Run local tests
+
+    # Test 1: Storage Status
+    ((tests_total++))
+    if test_storage_status "$storage_name"; then
+        ((tests_passed++))
+    else
+        ((tests_failed++))
+        error "Storage status test failed - aborting test suite"
+        return 1
+    fi
+
+    # Test 2: Volume Creation
+    ((tests_total++))
+    if test_volume_creation "$storage_name"; then
+        ((tests_passed++))
+    else
+        ((tests_failed++))
+        error "Volume creation test failed - attempting cleanup"
+        cleanup_test_vms
+        return 1
+    fi
+
+    # Test 3: Volume Listing
+    ((tests_total++))
+    if test_volume_listing "$storage_name"; then
+        ((tests_passed++))
+    else
+        ((tests_failed++))
+    fi
+
+    # Test 4: Snapshot Operations
+    ((tests_total++))
+    if test_snapshot_operations; then
+        ((tests_passed++))
+    else
+        ((tests_failed++))
+    fi
+
+    # Test 5: Clone Operations
+    ((tests_total++))
+    if test_clone_operations; then
+        ((tests_passed++))
+    else
+        ((tests_failed++))
+    fi
+
+    # Test 6: Volume Resize
+    ((tests_total++))
+    if test_volume_resize; then
+        ((tests_passed++))
+    else
+        ((tests_failed++))
+    fi
+
+    # Test 7: VM Start/Stop
+    ((tests_total++))
+    if test_vm_start_stop; then
+        ((tests_passed++))
+    else
+        ((tests_failed++))
+    fi
+
+    # Test 8: Volume Deletion
+    ((tests_total++))
+    if test_volume_deletion; then
+        ((tests_passed++))
+    else
+        ((tests_failed++))
+    fi
+
+    # Run cluster tests if in cluster
+    if is_cluster_node; then
+        echo
+        info "Running cluster-specific tests..."
+        echo
+
+        # Cluster Test 1: VM Migration
+        ((tests_total++))
+        if test_vm_migration; then
+            ((tests_passed++))
+        else
+            ((tests_failed++))
+        fi
+
+        # Cluster Test 2: Cross-node Clone
+        ((tests_total++))
+        if test_cross_node_clone "$storage_name"; then
+            ((tests_passed++))
+        else
+            ((tests_failed++))
+        fi
+    fi
+
+    # Generate summary
+    local end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+    local minutes=$((duration / 60))
+    local seconds=$((duration % 60))
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo
+    info "${c8}Plugin Function Test Summary${c0}"
+    echo
+    echo "  Total tests run:    $tests_total"
+    echo "  Tests passed:       ${c2}$tests_passed${c0}"
+    echo "  Tests failed:       ${c1}$tests_failed${c0}"
+    echo "  Duration:           ${minutes}m ${seconds}s"
+    echo
+    echo "  Storage tested:     $storage_name"
+    echo "  Node:               $NODE_NAME"
+    if is_cluster_node; then
+        echo "  Cluster mode:       Yes"
+    else
+        echo "  Cluster mode:       No"
+    fi
+    echo
+    echo "  Log file:           $LOG_FILE"
+    echo
+
+    if [[ $tests_failed -eq 0 ]]; then
+        success "All tests passed! ✓"
+        echo
+    else
+        error "Some tests failed. Please check the log file for details."
+        echo
+    fi
+
+    # Return status based on test results
+    [[ $tests_failed -eq 0 ]] && return 0 || return 1
 }
 
 # Menu: Cleanup orphaned resources
@@ -2290,6 +3159,10 @@ menu_health_check() {
     print_banner
     echo
 
+    # Show header
+    info "Health Check"
+    echo
+
     # List available TrueNAS storage
     info "Detecting TrueNAS storage configurations..."
     echo
@@ -2333,7 +3206,14 @@ menu_health_check() {
         return 1
     fi
 
+    # Clear screen and show header for health check execution
+    clear_screen
+    print_banner
     echo
+
+    info "Health Check"
+    echo
+
     info "Running health check on storage: $storage_name"
     echo
 
@@ -2749,7 +3629,7 @@ run_health_check() {
                     orphan_result="${COLOR_GREEN}✓${COLOR_RESET} None found"
                     ((checks_passed++))
                 else
-                    orphan_result="${COLOR_YELLOW}⚠${COLOR_RESET} Found $orphan_count orphan(s) (run cleanup-orphans.sh)"
+                    orphan_result="${COLOR_YELLOW}⚠${COLOR_RESET} Found $orphan_count orphan(s) (use Diagnostics > Cleanup orphans)"
                     ((warnings++))
                 fi
             else

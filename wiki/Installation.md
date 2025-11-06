@@ -100,6 +100,13 @@ Choose an option:
   - Displays detailed orphan list with reasons
   - Typed "DELETE" confirmation required for safety
   - Ordered deletion (mappings, then extents, then zvols)
+- Integrated plugin function testing
+  - 8 core tests validating plugin operations (storage, volumes, snapshots, clones, resize, VM lifecycle)
+  - Interactive confirmation with typed "ACCEPT"
+  - Storage selection from configured TrueNAS storages
+  - Health-check style display with spinners and inline status
+  - Automatic cleanup of test VMs
+  - Dynamic VM ID selection (990+)
 - Color-coded status indicators
 - Animated spinners during checks
 
@@ -286,28 +293,33 @@ Portal numbers (or press Enter to skip): 1 2
 # Diagnostics sub-menu:
 #   1) Run health check
 #   2) Cleanup orphaned resources
+#   3) Run plugin function test
 #   0) Back to main menu
 
 # === Option 1: Health Check ===
-# Health check validates (with spinners):
-# ✓ Plugin file exists
-# ✓ Plugin syntax valid
-# ✓ Storage configuration found
-# ✓ TrueNAS API connectivity
-# ✓ Storage status active
-# ✓ Dataset exists on TrueNAS
-# ✓ Target IQN/Subsystem NQN configured (transport-specific)
-# ✓ Discovery portal configured
-# ✓ iSCSI sessions established or NVMe connections active (transport-specific)
-# ✓ Orphaned resources check (iSCSI only)
-# ✓ Service pvedaemon running
-# ✓ Service pveproxy running
-# ✓ Multipath configuration (dm-multipath or native NVMe, if enabled)
+# Select storage from list
+# Screen clears and displays "Health Check" header
+# Shows "Running health check on storage: X" message
+# Health check validates (with spinners and 30-character label formatting):
+# Plugin file:                   ✓ Installed v1.1.3
+# Storage configuration:         ✓ Configured
+# Storage status:                ✓ Active (space usage shown)
+# Content type:                  ✓ images
+# TrueNAS API:                   ✓ Reachable on IP:port
+# Dataset:                       ✓ dataset/path
+# Target IQN/Subsystem NQN:      ✓ (transport-specific)
+# Discovery portal:              ✓ IP:port
+# iSCSI sessions/NVMe connections: ✓ (transport-specific)
+# Orphaned resources:            ✓ None detected (iSCSI only)
+# Service pvedaemon:             ✓ Running
+# Service pveproxy:              ✓ Running
+# Multipath configuration:       ✓ (dm-multipath or native NVMe, if enabled)
 
 # Summary: 12/12 checks passed (0 warnings, 0 critical)
 
 # Note: Health checks automatically detect transport mode and perform
 # transport-specific validation (iSCSI vs NVMe/TCP)
+# All labels use 30-character fixed width for consistent alignment
 
 # === Option 2: Cleanup Orphaned Resources ===
 # Select storage from list
@@ -319,6 +331,28 @@ Portal numbers (or press Enter to skip): 1 2
 # Type "DELETE" (in caps) to confirm cleanup
 # Deletes orphans in safe order (mappings → extents → zvols)
 # Note: iSCSI only - NVMe/TCP shows unsupported message
+
+# === Option 3: Run Plugin Function Test ===
+# Displays "Plugin Function Test" header after storage selection
+# Shows test description and requirements
+# Shows what operations will be performed
+# Type "ACCEPT" (in caps) to confirm
+# Select storage to test from configured list
+# Screen clears and shows "Running plugin function test on storage: X"
+# Displays detected transport mode (iSCSI or NVMe/TCP)
+# Runs 8 comprehensive tests with 30-character label formatting:
+#   Storage accessibility         ✓ Storage active and accessible
+#   Volume creation                ✓ Created 4GB disk successfully
+#   Volume listing                 ✓ Retrieved volume configuration
+#   Snapshot operations            ✓ Snapshot created and verified
+#   Clone operations               ✓ Cloned VM from snapshot
+#   Volume resize                  ✓ Expanded disk by 1GB
+#   VM start/stop lifecycle        ✓ VM started and stopped
+#   Volume deletion                ✓ Cleaned up test resources
+# Summary: "Plugin Function Test Summary: 8/8 tests passed" (or failure count)
+# All test VMs automatically cleaned up
+# Note: Uses health-check style display with spinners and inline status updates
+# Ctrl+C gracefully interrupts with cleanup and user-friendly message
 ```
 
 #### Rollback to Previous Version

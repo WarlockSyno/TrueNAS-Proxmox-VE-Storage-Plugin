@@ -77,7 +77,8 @@ The installer provides:
 - ✅ Interactive menu-driven setup
 - ✅ Automatic version detection and updates
 - ✅ Built-in configuration wizard (supports iSCSI and NVMe/TCP)
-- ✅ Health check validation
+- ✅ Health check validation with consistent 30-character label formatting
+- ✅ Plugin function testing with graceful interrupt handling (Ctrl+C)
 - ✅ Backup and rollback support
 - ✅ Cluster-wide installation (install/update on all nodes simultaneously)
 - ✅ Cluster node compatibility
@@ -235,7 +236,8 @@ pvesm status
 The installer supports additional features:
 - **Version management** - Install, update, or rollback to specific versions
 - **Configuration wizard** - Interactive guided setup with validation
-- **Health checks** - 11-point system validation
+- **Health checks** - 12-point system validation supporting both iSCSI and NVMe/TCP with consistent 30-character label formatting
+- **Plugin testing** - Integrated 8-test validation of core plugin operations with graceful interrupt handling and health-check style output
 - **Cluster support** - Automatic cluster detection and warnings
 - **Backup management** - Automatic backups with rollback capability
 
