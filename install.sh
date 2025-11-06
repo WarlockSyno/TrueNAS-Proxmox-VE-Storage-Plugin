@@ -272,6 +272,11 @@ clear_screen() {
     printf '\033[2J\033[H'
 }
 
+# Clear from cursor to end of screen
+clear_below() {
+    printf '\033[0J'
+}
+
 # Display ASCII banner with gradient colors
 print_banner() {
     # Banner lines array
@@ -1864,6 +1869,66 @@ menu_not_installed() {
     done
 }
 
+# Sub-menu for choosing update target (local or cluster-wide)
+menu_update_choice() {
+    local current_version="$1"
+
+    clear_screen
+    print_banner
+    echo
+
+    # Build menu options
+    local -a menu_items=("Update this node only")
+    local max_choice=1
+
+    # Add cluster-wide option if in a cluster
+    if is_cluster_node; then
+        menu_items+=("Update all cluster nodes")
+        max_choice=2
+    fi
+
+    show_menu "Select update target" "${menu_items[@]}"
+
+    local choice
+    choice=$(read_choice "$max_choice")
+
+    case $choice in
+        0)
+            return 0
+            ;;
+        1)
+            # Update local node only
+            if perform_installation "latest"; then
+                # Offer to run health check after successful update
+                if [[ "$NON_INTERACTIVE" != "true" ]]; then
+                    echo
+                    read -rp "Would you like to run a health check now? (y/N): " response
+                    if [[ "$response" =~ ^[Yy] ]]; then
+                        echo
+                        menu_health_check
+                    fi
+                fi
+                return 0
+            else
+                return 1
+            fi
+            ;;
+        2)
+            # Update all cluster nodes
+            if is_cluster_node; then
+                if perform_cluster_wide_installation "latest"; then
+                    return 0
+                else
+                    return 1
+                fi
+            else
+                error "Not running in a cluster"
+                return 1
+            fi
+            ;;
+    esac
+}
+
 # Main menu for when plugin is installed
 menu_installed() {
     local current_version="$1"
@@ -1887,19 +1952,8 @@ menu_installed() {
         fi
 
         # Build menu dynamically
-        local -a menu_items=("Update to latest version")
-        local max_choice=1
-
-        # Add cluster-wide update option if in a cluster
-        local cluster_option_position=0
-        if is_cluster_node; then
-            menu_items+=("Update all cluster nodes")
-            max_choice=2
-            cluster_option_position=2
-        fi
-
-        menu_items+=("Install specific version" "Configure storage" "Run health check" "View available versions" "Rollback to backup")
-        max_choice=$((max_choice + 5))
+        local -a menu_items=("Update plugin" "Install specific version" "Configure storage" "Diagnostics" "Rollback to backup")
+        local max_choice=5
 
         if [[ "$should_manage_backups" = true ]]; then
             menu_items+=("Manage backups")
@@ -1920,57 +1974,27 @@ menu_installed() {
                 exit $EXIT_SUCCESS
                 ;;
             1)
-                # Update to latest version (local only)
-                if perform_installation "latest"; then
-                    # Offer to run health check after successful update
-                    if [[ "$NON_INTERACTIVE" != "true" ]]; then
-                        echo
-                        read -rp "Would you like to run a health check now? (y/N): " response
-                        if [[ "$response" =~ ^[Yy] ]]; then
-                            echo
-                            menu_health_check
-                        fi
-                    fi
-                fi
+                # Update plugin (shows sub-menu for local vs cluster)
+                menu_update_choice "$current_version"
                 read -rp "Press Enter to return to main menu..."
                 ;;
             2)
-                # This could be cluster-wide update OR install specific version
-                if [[ "$cluster_option_position" -eq 2 ]]; then
-                    # Cluster-wide update
-                    if perform_cluster_wide_installation "latest"; then
-                        read -rp "Press Enter to return to main menu..."
-                    else
-                        read -rp "Press Enter to return to main menu..."
-                    fi
-                else
-                    # Install specific version
-                    menu_install_specific_version
-                    read -rp "Press Enter to return to main menu..."
-                fi
-                ;;
-            3)
                 # Install specific version
                 menu_install_specific_version
-                read -rp "Press Enter to return to main menu..."
                 ;;
-            4)
+            3)
                 # Configure storage
                 menu_configure_storage
                 ;;
+            4)
+                # Diagnostics
+                menu_diagnostics
+                ;;
             5)
-                # Run health check
-                menu_health_check
-                ;;
-            6)
-                # View available versions
-                menu_view_versions
-                ;;
-            7)
                 # Rollback to backup
                 menu_rollback
                 ;;
-            8)
+            6)
                 # Manage backups OR Uninstall (depends on should_manage_backups)
                 if [[ "$should_manage_backups" = true ]]; then
                     menu_manage_backups
@@ -1980,7 +2004,7 @@ menu_installed() {
                     return 0
                 fi
                 ;;
-            9)
+            7)
                 # Uninstall plugin (when manage backups is also present)
                 menu_uninstall
                 read -rp "Press Enter to return to main menu..."
@@ -1990,40 +2014,281 @@ menu_installed() {
     done
 }
 
-# Menu: View available versions
-menu_view_versions() {
-    print_header "Available Versions"
+# Menu: Diagnostics
+menu_diagnostics() {
+    while true; do
+        clear_screen
+        print_banner
+        echo
 
-    info "Fetching releases from GitHub..."
-    local releases
-    releases=$(get_all_releases) || {
-        error "Failed to fetch releases"
+        show_menu "Select diagnostic action" \
+            "Run health check" \
+            "Cleanup orphaned resources"
+
+        local choice
+        choice=$(read_choice 2)
+
+        case $choice in
+            0)
+                return 0
+                ;;
+            1)
+                # Run health check
+                menu_health_check
+                read -rp "Press Enter to return to diagnostics menu..."
+                ;;
+            2)
+                # Cleanup orphans
+                menu_cleanup_orphans
+                read -rp "Press Enter to return to diagnostics menu..."
+                ;;
+        esac
+    done
+}
+
+# Menu: Cleanup orphaned resources
+menu_cleanup_orphans() {
+    clear_screen
+    print_banner
+    echo
+
+    # List available TrueNAS storage
+    info "Detecting TrueNAS storage configurations..."
+    echo
+
+    if [[ ! -f "$STORAGE_CFG" ]]; then
+        warning "No storage.cfg found - please configure storage first"
         read -rp "Press Enter to continue..."
+        return 1
+    fi
+
+    local storages
+    storages=$(grep "^truenasplugin:" "$STORAGE_CFG" 2>/dev/null | awk '{print $2}')
+
+    if [[ -z "$storages" ]]; then
+        warning "No TrueNAS storage configured"
+        info "Please configure storage first from the main menu"
+        read -rp "Press Enter to continue..."
+        return 1
+    fi
+
+    # Show available storage
+    info "Available TrueNAS storage:"
+    while IFS= read -r storage; do
+        echo "  • $storage"
+    done <<< "$storages"
+    echo
+
+    # Prompt for storage selection
+    local storage_name
+    read -rp "Enter storage name: " storage_name
+
+    if [[ -z "$storage_name" ]]; then
+        warning "Storage name cannot be empty"
+        return 1
+    fi
+
+    # Verify storage exists
+    if ! echo "$storages" | grep -q "^${storage_name}$"; then
+        error "Storage '$storage_name' not found"
+        return 1
+    fi
+
+    # Get storage configuration
+    local api_host api_key dataset api_insecure transport_mode
+    api_host=$(get_storage_config_value "$storage_name" "api_host" || true)
+    api_key=$(get_storage_config_value "$storage_name" "api_key" || true)
+    dataset=$(get_storage_config_value "$storage_name" "dataset" || true)
+    api_insecure=$(get_storage_config_value "$storage_name" "api_insecure" || true)
+    transport_mode=$(get_storage_config_value "$storage_name" "transport_mode" || true)
+
+    # Default to iscsi if not specified
+    [[ -z "$transport_mode" ]] && transport_mode="iscsi"
+
+    # Check if NVMe mode
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        warning "Orphan cleanup is not supported for NVMe/TCP storage"
+        info "NVMe/TCP orphan detection requires WebSocket API (not yet implemented)"
+        return 0
+    fi
+
+    echo
+    info "Detecting orphaned resources for storage '$storage_name'..."
+    echo
+
+    # Set curl options
+    local curl_opts="-s"
+    [[ "$api_insecure" == "1" ]] && curl_opts="$curl_opts -k"
+
+    # Fetch data from TrueNAS API
+    info "Fetching iSCSI extents..."
+    local extents
+    extents=$(curl $curl_opts -H "Authorization: Bearer $api_key" "https://$api_host/api/v2.0/iscsi/extent" 2>/dev/null) || {
+        error "Failed to fetch extents from TrueNAS API"
+        return 1
+    }
+
+    info "Fetching zvols..."
+    local zvols
+    zvols=$(curl $curl_opts -H "Authorization: Bearer $api_key" "https://$api_host/api/v2.0/pool/dataset" 2>/dev/null) || {
+        error "Failed to fetch zvols from TrueNAS API"
+        return 1
+    }
+
+    info "Fetching target-extent mappings..."
+    local targetextents
+    targetextents=$(curl $curl_opts -H "Authorization: Bearer $api_key" "https://$api_host/api/v2.0/iscsi/targetextent" 2>/dev/null) || {
+        error "Failed to fetch targetextents from TrueNAS API"
         return 1
     }
 
     echo
-    echo "$releases" | grep -Po '"tag_name":\s*"\K[^"]+' | head -20 | while IFS= read -r tag; do
-        # Extract corresponding name and date for this release
-        # Use grep -F for literal string matching and -A 10 to capture published_at field
-        release_block=$(echo "$releases" | grep -A 10 -F "\"tag_name\": \"$tag\"" || echo "")
-        name=$(echo "$release_block" | grep -Po '"name":\s*"\K[^"]+' | head -1 || echo "Release")
-        date=$(echo "$release_block" | grep -Po '"published_at":\s*"\K[^T]+' | head -1 || echo "Unknown date")
-        version="${tag#v}"
-        echo "  • v$version - $name ($date)"
-    done
+    info "Analyzing resources..."
     echo
 
-    if [[ $(echo "$releases" | grep -o '"tag_name"' | wc -l) -gt 20 ]]; then
-        info "Showing latest 20 releases. Visit GitHub for full list."
+    # Arrays to store orphan IDs
+    local -a extent_orphans=()
+    local -a te_orphans=()
+    local -a zvol_orphans=()
+    local orphan_count=0
+
+    # Check extents without zvols
+    local extent_data
+    extent_data=$(echo "$extents" | grep -o '"id": *[0-9]*' | sed 's/"id": *//' || true)
+
+    for extent_id in $extent_data; do
+        local extent_disk
+        extent_disk=$(echo "$extents" | sed -n "/{/,/}/{ /\"id\": *${extent_id}/,/}/p }" | \
+                     grep -o '"disk": *"zvol/[^"]*"' | sed 's/"disk": *"zvol\///' | sed 's/"$//' | head -1 || true)
+
+        [[ -z "$extent_disk" ]] && continue
+
+        # Check if zvol is under our dataset and exists
+        if [[ "$extent_disk" == "$dataset/"* ]]; then
+            if ! echo "$zvols" | grep -q "\"id\": *\"${extent_disk}\""; then
+                extent_orphans+=("$extent_id")
+                orphan_count=$((orphan_count + 1))
+            fi
+        fi
+    done
+
+    # Check targetextents without extents
+    local te_data
+    te_data=$(echo "$targetextents" | grep -o '"id": *[0-9]*' | sed 's/"id": *//' || true)
+
+    for te_id in $te_data; do
+        local extent_ref
+        extent_ref=$(echo "$targetextents" | sed -n "/{/,/}/{ /\"id\": *${te_id}/,/}/p }" | \
+                    grep -o '"extent": *[0-9]*' | sed 's/"extent": *//' | head -1 || true)
+
+        [[ -z "$extent_ref" ]] && continue
+
+        if ! echo "$extents" | grep -q "\"id\": *${extent_ref}"; then
+            te_orphans+=("$te_id")
+            orphan_count=$((orphan_count + 1))
+        fi
+    done
+
+    # Check zvols without extents
+    local zvol_ids
+    zvol_ids=$(echo "$zvols" | { grep -B2 -A2 "\"type\": *\"VOLUME\"" || true; } | \
+              { grep "\"id\": *\"${dataset}/" || true; } | sed 's/.*"id": *"\([^"]*\)".*/\1/' || true)
+
+    for zvol_id in $zvol_ids; do
+        local zvol_disk="zvol/${zvol_id}"
+        if ! echo "$extents" | grep -q "\"disk\": *\"${zvol_disk}\""; then
+            zvol_orphans+=("$zvol_id")
+            orphan_count=$((orphan_count + 1))
+        fi
+    done
+
+    # Report findings
+    if [[ $orphan_count -eq 0 ]]; then
+        success "No orphaned resources found"
+        return 0
     fi
 
-    read -rp "Press Enter to continue..."
+    error "Found $orphan_count orphaned resource(s):"
+    echo
+
+    # Display orphans
+    for extent_id in "${extent_orphans[@]}"; do
+        echo "  • [EXTENT] ID: $extent_id (zvol missing)"
+    done
+
+    for te_id in "${te_orphans[@]}"; do
+        echo "  • [TARGET-EXTENT] ID: $te_id (extent missing)"
+    done
+
+    for zvol_id in "${zvol_orphans[@]}"; do
+        echo "  • [ZVOL] $zvol_id (no extent pointing to this zvol)"
+    done
+
+    echo
+    warning "WARNING: This will permanently delete these orphaned resources!"
+    echo
+
+    # Typed confirmation
+    local confirm
+    read -rp "Type 'DELETE' (all caps) to confirm deletion: " confirm
+    if [[ "$confirm" != "DELETE" ]]; then
+        warning "Confirmation failed. Cleanup cancelled."
+        return 1
+    fi
+
+    echo
+    info "Cleaning up orphaned resources..."
+    echo
+
+    # Delete targetextents first (they reference extents)
+    if [[ ${#te_orphans[@]} -gt 0 ]]; then
+        for te_id in "${te_orphans[@]}"; do
+            info "Deleting target-extent mapping ID: $te_id..."
+            if curl $curl_opts -H "Authorization: Bearer $api_key" -X DELETE "https://$api_host/api/v2.0/iscsi/targetextent/id/$te_id" > /dev/null 2>&1; then
+                success "  Deleted target-extent $te_id"
+            else
+                error "  Failed to delete target-extent $te_id"
+            fi
+        done
+    fi
+
+    # Delete extents
+    if [[ ${#extent_orphans[@]} -gt 0 ]]; then
+        for extent_id in "${extent_orphans[@]}"; do
+            info "Deleting extent ID: $extent_id..."
+            if curl $curl_opts -H "Authorization: Bearer $api_key" -X DELETE "https://$api_host/api/v2.0/iscsi/extent/id/$extent_id" > /dev/null 2>&1; then
+                success "  Deleted extent $extent_id"
+            else
+                error "  Failed to delete extent $extent_id"
+            fi
+        done
+    fi
+
+    # Delete zvols
+    if [[ ${#zvol_orphans[@]} -gt 0 ]]; then
+        for zvol_id in "${zvol_orphans[@]}"; do
+            info "Deleting zvol: $zvol_id..."
+            # URL encode the zvol path
+            local zvol_encoded
+            zvol_encoded=$(echo "$zvol_id" | sed 's|/|%2F|g')
+            if curl $curl_opts -H "Authorization: Bearer $api_key" -X DELETE "https://$api_host/api/v2.0/pool/dataset/id/$zvol_encoded" > /dev/null 2>&1; then
+                success "  Deleted zvol $zvol_id"
+            else
+                error "  Failed to delete zvol $zvol_id"
+            fi
+        done
+    fi
+
+    echo
+    success "Cleanup complete!"
+    return 0
 }
 
 # Menu: Run health check
 menu_health_check() {
-    print_header "TrueNAS Plugin Health Check"
+    clear_screen
+    print_banner
+    echo
 
     # List available TrueNAS storage
     info "Detecting TrueNAS storage configurations..."
@@ -2075,9 +2340,6 @@ menu_health_check() {
     # Run health check and capture exit code
     # Don't let non-zero returns trigger error trap
     run_health_check "$storage_name" || true
-
-    echo
-    read -rp "Press Enter to continue..."
 }
 
 # Extract storage configuration block safely
@@ -2535,7 +2797,9 @@ run_health_check() {
 
 # Menu: Install specific version
 menu_install_specific_version() {
-    print_header "Install Specific Version"
+    clear_screen
+    print_banner
+    echo
 
     info "Fetching releases from GitHub..."
     local releases
@@ -2545,19 +2809,38 @@ menu_install_specific_version() {
         return 1
     }
 
-    echo
-    echo "Available versions:"
-    echo "$releases" | grep -Po '"tag_name":\s*"\K[^"]+' | sed 's/^v//' | head -20 | sed 's/^/  • v/'
-    echo
+    # Parse versions into array
+    local -a version_array=()
+    while IFS= read -r version; do
+        version_array+=("$version")
+    done < <(echo "$releases" | grep -Po '"tag_name":\s*"\K[^"]+' | sed 's/^v//' | head -20)
 
-    read -rp "Enter version number (e.g., 1.0.7): " version
-
-    if [[ -z "$version" ]]; then
-        warning "Installation cancelled"
+    if [[ ${#version_array[@]} -eq 0 ]]; then
+        error "No versions found"
+        read -rp "Press Enter to continue..."
         return 1
     fi
 
-    if perform_installation "$version"; then
+    # Build menu items with version info
+    local -a menu_items=()
+    for version in "${version_array[@]}"; do
+        # Try to get release name and date (simplified version without parsing full JSON)
+        menu_items+=("v${version}")
+    done
+
+    show_menu "Select version to install" "${menu_items[@]}"
+
+    local choice
+    choice=$(read_choice "${#version_array[@]}")
+
+    if [[ "$choice" -eq 0 ]]; then
+        return 0
+    fi
+
+    # Get selected version (adjust for 1-indexed menu)
+    local selected_version="${version_array[$((choice-1))]}"
+
+    if perform_installation "$selected_version"; then
         # Prompt to configure storage after successful installation
         if [[ "$NON_INTERACTIVE" != "true" ]]; then
             echo
@@ -3234,16 +3517,17 @@ menu_configure_storage() {
         info "What would you like to do?"
         echo "  1) Edit an existing storage"
         echo "  2) Add a new storage"
+        echo "  3) Delete a storage"
         echo "  0) Cancel"
         echo
 
         local menu_choice
         while true; do
-            read -rp "Select option [0-2]: " menu_choice
-            if [[ "$menu_choice" =~ ^[0-2]$ ]]; then
+            read -rp "Select option [0-3]: " menu_choice
+            if [[ "$menu_choice" =~ ^[0-3]$ ]]; then
                 break
             else
-                error "Invalid choice. Please enter 0, 1, or 2"
+                error "Invalid choice. Please enter 0, 1, 2, or 3"
             fi
         done
 
@@ -3283,6 +3567,70 @@ menu_configure_storage() {
                 ;;
             2)
                 # Add new storage mode - continue with existing workflow below
+                ;;
+            3)
+                # Delete mode - show storage list and confirm deletion
+                echo
+                info "Available storage configurations:"
+                local idx=1
+                local -a storage_array=()
+                while IFS= read -r storage; do
+                    echo "  $idx) $storage"
+                    storage_array+=("$storage")
+                    ((idx++))
+                done <<< "$existing_storages"
+                echo
+
+                local storage_idx
+                while true; do
+                    read -rp "Select storage to delete [1-${#storage_array[@]}] or 0 to cancel: " storage_idx
+                    if [[ "$storage_idx" == "0" ]]; then
+                        info "Deletion cancelled"
+                        return 0
+                    elif [[ "$storage_idx" =~ ^[0-9]+$ ]] && [[ "$storage_idx" -ge 1 ]] && [[ "$storage_idx" -le "${#storage_array[@]}" ]]; then
+                        storage_name="${storage_array[$((storage_idx-1))]}"
+                        break
+                    else
+                        error "Invalid selection. Please enter a number between 1 and ${#storage_array[@]}"
+                    fi
+                done
+
+                # Warning and confirmation
+                echo
+                warning "WARNING: Deleting storage configuration '$storage_name'"
+                warning "This will remove the storage from Proxmox configuration."
+                warning "VMs using disks on this storage will lose access until reconfigured."
+                echo
+
+                local confirm
+                read -rp "Type storage name '$storage_name' to confirm deletion: " confirm
+                if [[ "$confirm" != "$storage_name" ]]; then
+                    warning "Confirmation failed. Deletion cancelled."
+                    return 1
+                fi
+
+                # Read transport_mode BEFORE deletion (config will be gone after)
+                local transport_mode
+                transport_mode=$(get_storage_config_value "$storage_name" "transport_mode" 2>/dev/null || echo "iscsi")
+
+                # Perform deletion
+                if remove_storage_config "$storage_name"; then
+                    success "Storage '$storage_name' has been deleted"
+
+                    # Check if this was an iSCSI storage and offer orphan cleanup
+                    if [[ "$transport_mode" != "nvme-tcp" ]]; then
+                        echo
+                        read -rp "Would you like to cleanup orphaned resources on TrueNAS? (y/N): " cleanup_response
+                        if [[ "$cleanup_response" =~ ^[Yy] ]]; then
+                            info "Note: Storage no longer exists in config. Manual cleanup may be needed."
+                        fi
+                    fi
+                else
+                    error "Failed to delete storage configuration"
+                    return 1
+                fi
+
+                return 0
                 ;;
         esac
     fi
@@ -4112,8 +4460,8 @@ remove_storage_config() {
     # Create temporary file
     local temp_file="${STORAGE_CFG}.tmp"
 
-    # Remove the storage block (truenas: line and all indented lines after it)
-    awk -v storage="truenas: ${storage_name}" '
+    # Remove the storage block (truenasplugin: line and all indented lines after it)
+    awk -v storage="truenasplugin: ${storage_name}" '
         $0 ~ "^" storage "$" { skip=1; next }
         /^[^ \t]/ { skip=0 }
         !skip { print }

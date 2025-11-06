@@ -9,8 +9,8 @@ The plugin includes several tools to simplify installation, testing, cluster man
 - **[Development Test Suite](#development-test-suite)** - **Development/testing only** - Comprehensive plugin testing
 - **[Debug Logging System](#debug-logging-system)** - Diagnostic logging for troubleshooting
 - **[Production Test Suite](#production-test-suite)** - Automated testing and validation for production
-- **[Health Check Tool](#health-check-tool)** - Quick health validation for monitoring
-- **[Orphan Cleanup Tool](#orphan-cleanup-tool)** - Find and remove orphaned iSCSI resources
+- **[Health Check Tool](#health-check-tool)** - Quick health validation for monitoring (integrated in installer)
+- **[Orphan Cleanup](#orphan-cleanup)** - Find and remove orphaned iSCSI resources (integrated in installer)
 - **[Version Check Script](#version-check-script)** - Check plugin version across cluster
 - **[Cluster Update Script](#cluster-update-script)** - Deploy plugin to all cluster nodes
 - **[Tools Directory](#tools-directory-structure)** - Location and organization
@@ -20,13 +20,14 @@ The plugin includes several tools to simplify installation, testing, cluster man
 ```
 tools/
 ├── truenas-plugin-test-suite.sh              # Production test suite
-├── cleanup-orphans.sh                         # Orphan resource cleanup
 ├── update-cluster.sh                          # Cluster deployment script
 ├── check-version.sh                           # Version checker for cluster
 └── dev-truenas-plugin-full-function-test.sh  # Development test suite (⚠️ DEV ONLY)
 ```
 
 All tools are located in the `tools/` directory of the plugin repository.
+
+Note: Health check and orphan cleanup functionality are now integrated directly into the `install.sh` installer script via the Diagnostics menu.
 
 ---
 
@@ -550,7 +551,7 @@ Complete test suite documentation: [Testing Guide](Testing.md)
 
 The health check functionality is now integrated into the interactive installer (`install.sh`). It performs comprehensive validation of the plugin installation and storage health, supporting both iSCSI and NVMe/TCP transport modes.
 
-**Access Method**: Run `bash install.sh` and select "Run health check" from the menu
+**Access Method**: Run `bash install.sh`, select "Diagnostics" from the main menu, then choose "Run health check"
 
 ### Features
 
@@ -566,7 +567,8 @@ The health check functionality is now integrated into the interactive installer 
 
 ```bash
 bash install.sh
-# Select: "Run health check" from the menu
+# Select: "Diagnostics" from the main menu
+# Select: "Run health check" from the diagnostics menu
 # Choose storage to check from the list
 ```
 
@@ -1206,13 +1208,15 @@ done
 
 ---
 
-## Orphan Cleanup Tool
+## Orphan Cleanup
 
 ### Overview
 
-The orphan cleanup tool (`cleanup-orphans.sh`) detects and removes orphaned iSCSI resources on TrueNAS that result from failed operations or interrupted workflows.
+The orphan cleanup functionality is now integrated into the interactive installer (`install.sh`). It detects and removes orphaned iSCSI resources on TrueNAS that result from failed operations or interrupted workflows.
 
-**Location**: `tools/cleanup-orphans.sh`
+**Access Method**: Run `bash install.sh`, select "Diagnostics" from the main menu, then choose "Cleanup orphaned resources"
+
+**Note**: A standalone script (`tools/cleanup-orphans.sh`) is still available for automation or scripting purposes, but the integrated version in the installer is recommended for interactive use.
 
 ### What Are Orphaned Resources?
 
@@ -1230,8 +1234,46 @@ Orphaned resources occur when storage operations fail partway through:
 
 ### Usage
 
-#### Basic Syntax
+#### Interactive Method (Recommended)
+
 ```bash
+bash install.sh
+# Select: "Diagnostics" from the main menu
+# Select: "Cleanup orphaned resources" from the diagnostics menu
+# Choose storage from the list
+# Review detected orphans
+# Type "DELETE" (in caps) to confirm cleanup
+```
+
+The integrated cleanup will:
+1. Scan for orphaned iSCSI resources (extents, zvols, target-extent mappings)
+2. Display detailed list with reasons for each orphan
+3. Require typed "DELETE" confirmation for safety
+4. Delete orphans in safe order (mappings → extents → zvols)
+5. Report success/failure for each deletion
+
+**Example Output**:
+```
+Found 3 orphaned resource(s):
+
+  [EXTENT] vm-999-disk-0 (ID: 42)
+           Reason: zvol missing: tank/proxmox/vm-999-disk-0
+  [TARGET-EXTENT] mapping-15 (ID: 15)
+                  Reason: extent missing: 40 (target: 2)
+  [ZVOL] vm-998-disk-1
+         Reason: no extent pointing to this zvol
+
+WARNING: This will permanently delete these orphaned resources!
+
+Type "DELETE" to confirm cleanup:
+```
+
+#### Standalone Script (For Automation)
+
+For automation or scripting, the standalone script is still available:
+
+```bash
+cd tools/
 ./cleanup-orphans.sh [storage-name] [--force] [--dry-run]
 ```
 
@@ -1240,66 +1282,16 @@ Orphaned resources occur when storage operations fail partway through:
 - `--force`: Skip confirmation prompt
 - `--dry-run`: Show what would be deleted without deleting
 
-#### Examples
-
-**List Available Storages**:
+**Examples**:
 ```bash
-cd tools/
-./cleanup-orphans.sh
-
-# Output:
-# === Available TrueNAS Storage ====
-# truenas-storage
-# truenas-backup
-```
-
-**Detect Orphans (Interactive)**:
-```bash
-cd tools/
+# Interactive cleanup
 ./cleanup-orphans.sh truenas-storage
 
-# Output:
-# === TrueNAS Orphan Resource Detection ===
-# Storage: truenas-storage
-#
-# Fetching iSCSI extents...
-# Fetching zvols...
-# Fetching target-extent mappings...
-#
-# === Analyzing Resources ===
-# Checking for extents without zvols...
-# Checking for target-extent mappings without extents...
-# Checking for zvols without extents...
-#
-# Found 3 orphaned resource(s):
-#
-#   [EXTENT] vm-999-disk-0 (ID: 42)
-#            Reason: zvol missing: tank/proxmox/vm-999-disk-0
-#   [TARGET-EXTENT] mapping-15 (ID: 15)
-#                   Reason: extent missing: 40 (target: 2)
-#   [ZVOL] vm-998-disk-1
-#          Reason: no extent pointing to this zvol
-#
-# WARNING: This will permanently delete these orphaned resources!
-#
-# Delete these orphaned resources? (yes/N):
-```
-
-**Dry Run (Preview Only)**:
-```bash
-cd tools/
+# Dry run (preview only)
 ./cleanup-orphans.sh truenas-storage --dry-run
 
-# Shows what would be deleted without making changes
-# Dry run complete. No resources were deleted.
-```
-
-**Automated Cleanup (No Prompt)**:
-```bash
-cd tools/
+# Automated (no prompt)
 ./cleanup-orphans.sh truenas-storage --force
-
-# Deletes all orphaned resources without confirmation
 ```
 
 ### Output Interpretation
@@ -1315,30 +1307,33 @@ cd tools/
 
 ### Safety Features
 
-1. **Interactive Confirmation** - Prompts before deletion (unless `--force`)
-2. **Dry Run Mode** - Preview changes without modifying anything
-3. **Dataset Isolation** - Only scans resources under configured dataset
-4. **Ordered Deletion** - Removes dependencies first (mappings → extents → zvols)
-5. **Error Logging** - Failed deletions are reported but don't stop cleanup
+1. **Typed Confirmation** - Requires typing "DELETE" (in caps) to proceed
+2. **Dataset Isolation** - Only scans resources under configured dataset
+3. **Ordered Deletion** - Removes dependencies first (mappings → extents → zvols)
+4. **Transport Limitation** - iSCSI only (NVMe/TCP shows unsupported message)
+5. **Error Reporting** - Failed deletions are reported but don't stop cleanup
+6. **Dry Run Mode** - Available in standalone script for preview without deletion
 
 ### When to Run
-
-**Regular Maintenance**:
-```bash
-# Monthly check for orphans
-0 0 1 * * /path/to/tools/cleanup-orphans.sh truenas-storage --force
-```
 
 **After Issues**:
 - After failed VM deletions
 - After network interruptions during storage operations
 - After manual cleanup on TrueNAS
 - When storage space doesn't match expectations
+- When health check reports orphaned resources
 
 **Before Major Operations**:
 - Before storage migrations
 - Before cluster maintenance
 - Before TrueNAS upgrades
+
+**Regular Maintenance**:
+For automated monthly cleanup, use the standalone script:
+```bash
+# Monthly check for orphans (cron example)
+0 0 1 * * /path/to/tools/cleanup-orphans.sh truenas-storage --force
+```
 
 ### Troubleshooting
 
@@ -1364,13 +1359,13 @@ cd tools/
 
 ### Best Practices
 
-1. **Run with --dry-run first** - Always preview before deleting
-2. **Schedule regular scans** - Monthly maintenance prevents accumulation
-3. **Run after incidents** - Clean up after failed operations
-4. **Backup before cleanup** - Snapshot TrueNAS pool before major cleanup
-5. **Check logs** - Review syslog for cleanup results
+1. **Run health check first** - Health check will detect orphans and their count
+2. **Use interactive cleanup** - The integrated installer version provides clear prompts and safety
+3. **Review before confirming** - Carefully check the orphan list before typing "DELETE"
+4. **Run after incidents** - Clean up after failed operations or storage issues
+5. **Backup before cleanup** - Snapshot TrueNAS pool before major cleanup operations
 
-**Example Maintenance Script**:
+**Example Automated Maintenance Script** (using standalone script):
 ```bash
 #!/bin/bash
 # Monthly orphan cleanup with notification
@@ -1384,7 +1379,7 @@ if [ "$ORPHANS" -gt 0 ]; then
     echo "Found $ORPHANS orphaned resources on $STORAGE" | \
       mail -s "TrueNAS Orphan Alert" admin@example.com
 
-    # Cleanup
+    # Cleanup (automated)
     ./cleanup-orphans.sh "$STORAGE" --force
 fi
 ```

@@ -51,15 +51,14 @@ Plugin Status: Installed (v1.0.6)
 Update Available: v1.0.7
 
 Main Menu:
-  1) Update to latest version
-  2) Update all cluster nodes (cluster detected)
-  3) Install specific version
-  4) Configure storage
-  5) Run health check
-  6) Manage backups
-  7) Rollback to previous version
-  8) Uninstall plugin
-  9) Exit
+  1) Update plugin
+  2) Install specific version
+  3) Configure storage
+  4) Diagnostics
+  5) Manage backups
+  6) Rollback to previous version
+  7) Uninstall plugin
+  8) Exit
 
 Choose an option:
 ```
@@ -68,12 +67,14 @@ Choose an option:
 
 **Installation & Updates**
 - Install latest version from GitHub
-- Install specific version (version selection menu)
-- Update to latest version (with backup)
+- Install specific version (numbered version selection, no typing required)
+- Update plugin with sub-menu for local or cluster-wide update
 - Automatic update detection and notification
 
 **Configuration Management**
 - Interactive configuration wizard
+- Add, edit, or delete storage configurations
+- Delete storage with typed confirmation (storage name must be entered exactly)
 - Transport mode selection (iSCSI or NVMe/TCP)
 - Guided setup for all storage parameters
 - Input validation (IP addresses, API keys, dataset names, NQNs)
@@ -83,15 +84,22 @@ Choose an option:
 - Transport-specific checks (nvme-cli for NVMe/TCP, multipath-tools for iSCSI)
 - Automatic backup of storage.cfg
 
-**Health Checking**
+**Diagnostics Menu**
+- Unified diagnostics menu for troubleshooting and maintenance
 - 12-point comprehensive health validation
-- Transport-aware validation (iSCSI and NVMe/TCP)
-- Plugin file verification and syntax check
-- Storage configuration validation
-- TrueNAS API connectivity test
-- iSCSI session monitoring or NVMe connection verification
-- Multipath status check (dm-multipath for iSCSI, native for NVMe)
-- Service verification (pvedaemon, pveproxy)
+  - Transport-aware validation (iSCSI and NVMe/TCP)
+  - Plugin file verification and syntax check
+  - Storage configuration validation
+  - TrueNAS API connectivity test
+  - iSCSI session monitoring or NVMe connection verification
+  - Multipath status check (dm-multipath for iSCSI, native for NVMe)
+  - Orphaned resource detection (iSCSI only)
+  - Service verification (pvedaemon, pveproxy)
+- Integrated orphan cleanup functionality
+  - Detects orphaned iSCSI extents, zvols, and target-extent mappings
+  - Displays detailed orphan list with reasons
+  - Typed "DELETE" confirmation required for safety
+  - Ordered deletion (mappings, then extents, then zvols)
 - Color-coded status indicators
 - Animated spinners during checks
 
@@ -175,8 +183,13 @@ wget -qO- https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/insta
 # "Plugin Status: Installed (v1.0.6)"
 # "Update Available: v1.0.7"
 
-# Choose option 1: "Update to latest version"
-# Installer will:
+# Choose option 1: "Update plugin"
+# Sub-menu will present:
+#   1) Update this node only
+#   2) Update all cluster nodes (if cluster detected)
+#   0) Cancel
+
+# After selecting update target, installer will:
 # 1. Create backup of v1.0.6
 # 2. Download and install v1.0.7
 # 3. Validate syntax
@@ -188,13 +201,20 @@ wget -qO- https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/insta
 ```bash
 # From main menu, choose "Configure storage"
 
+# If existing storages found, sub-menu appears:
+#   1) Edit an existing storage
+#   2) Add a new storage
+#   3) Delete a storage
+#   0) Cancel
+
+# === Adding New Storage ===
 # Wizard will prompt for:
 Storage name (e.g., 'truenas-storage'): truenas-prod
 TrueNAS IP address: 192.168.1.100
 TrueNAS API key: 1-abc123def456...
 ZFS dataset path: tank/proxmox
 
-# Transport mode selection (NEW in v1.1.0):
+# Transport mode selection:
 Select transport protocol:
   1) iSCSI (traditional, widely compatible)
   2) NVMe/TCP (modern, lower latency)
@@ -249,12 +269,26 @@ Portal numbers (or press Enter to skip): 1 2
 # ✓ Appends new configuration
 # ✓ Confirms success
 # ✓ Provides transport-specific verification commands
+
+# === Deleting Storage ===
+# Select "Delete a storage" from configuration menu
+# Choose storage from numbered list
+# Warning displayed about implications (VMs will lose disk access)
+# Type exact storage name to confirm deletion
+# Storage block removed from /etc/pve/storage.cfg
+# Optionally run orphan cleanup if iSCSI storage
 ```
 
-#### Health Check
+#### Diagnostics Menu
 ```bash
-# From main menu, choose "Run health check"
+# From main menu, choose "Diagnostics"
 
+# Diagnostics sub-menu:
+#   1) Run health check
+#   2) Cleanup orphaned resources
+#   0) Back to main menu
+
+# === Option 1: Health Check ===
 # Health check validates (with spinners):
 # ✓ Plugin file exists
 # ✓ Plugin syntax valid
@@ -265,6 +299,7 @@ Portal numbers (or press Enter to skip): 1 2
 # ✓ Target IQN/Subsystem NQN configured (transport-specific)
 # ✓ Discovery portal configured
 # ✓ iSCSI sessions established or NVMe connections active (transport-specific)
+# ✓ Orphaned resources check (iSCSI only)
 # ✓ Service pvedaemon running
 # ✓ Service pveproxy running
 # ✓ Multipath configuration (dm-multipath or native NVMe, if enabled)
@@ -273,6 +308,17 @@ Portal numbers (or press Enter to skip): 1 2
 
 # Note: Health checks automatically detect transport mode and perform
 # transport-specific validation (iSCSI vs NVMe/TCP)
+
+# === Option 2: Cleanup Orphaned Resources ===
+# Select storage from list
+# Scans for orphaned iSCSI resources:
+#   - Extents pointing to deleted zvols
+#   - Zvols without corresponding extents
+#   - Target-extent mappings without extents
+# Displays detailed orphan list with reasons
+# Type "DELETE" (in caps) to confirm cleanup
+# Deletes orphans in safe order (mappings → extents → zvols)
+# Note: iSCSI only - NVMe/TCP shows unsupported message
 ```
 
 #### Rollback to Previous Version
