@@ -3834,6 +3834,10 @@ fio_run_benchmark_suite() {
     local total_tests=30
 
     # Arrays to store results for summary (global scope for access in fio_run_test)
+    # Clear arrays from any previous runs
+    test_names=()
+    test_results=()
+    test_values=()
     declare -ga test_names
     declare -ga test_results
     declare -ga test_values
@@ -3984,10 +3988,11 @@ fio_run_benchmark_suite() {
     # Find best sequential read bandwidth (test indices 0-4)
     local best_seq_read_idx=0
     local best_seq_read_value=0
+    local value unit
     for i in 0 1 2 3 4; do
         if [[ "${test_values[$i]:-}" == "pass" ]]; then
-            local value=$(echo "${test_results[$i]}" | grep -oP '^[0-9.]+')
-            local unit=$(echo "${test_results[$i]}" | grep -oP '(MB|GB)/s')
+            value=$(echo "${test_results[$i]}" | grep -oP '^[0-9.]+')
+            unit=$(echo "${test_results[$i]}" | grep -oP '(MB|GB)/s')
             # Normalize to MB/s for comparison
             if [[ "$unit" == "GB/s" ]]; then
                 value=$(awk "BEGIN {printf \"%.2f\", $value * 1024}")
@@ -4006,8 +4011,8 @@ fio_run_benchmark_suite() {
     local best_seq_write_value=0
     for i in 5 6 7 8 9; do
         if [[ "${test_values[$i]:-}" == "pass" ]]; then
-            local value=$(echo "${test_results[$i]}" | grep -oP '^[0-9.]+')
-            local unit=$(echo "${test_results[$i]}" | grep -oP '(MB|GB)/s')
+            value=$(echo "${test_results[$i]}" | grep -oP '^[0-9.]+')
+            unit=$(echo "${test_results[$i]}" | grep -oP '(MB|GB)/s')
             # Normalize to MB/s for comparison
             if [[ "$unit" == "GB/s" ]]; then
                 value=$(awk "BEGIN {printf \"%.2f\", $value * 1024}")
@@ -4056,8 +4061,8 @@ fio_run_benchmark_suite() {
     local best_latency_value=999999999
     for i in 20 21 22 23 24; do
         if [[ "${test_values[$i]:-}" == "pass" ]]; then
-            local value=$(echo "${test_results[$i]}" | grep -oP '^[0-9.]+')
-            local unit=$(echo "${test_results[$i]}" | grep -oP '(µs|ms)')
+            value=$(echo "${test_results[$i]}" | grep -oP '^[0-9.]+')
+            unit=$(echo "${test_results[$i]}" | grep -oP '(µs|ms)')
             # Normalize to µs for comparison (lower is better)
             if [[ "$unit" == "ms" ]]; then
                 value=$(awk "BEGIN {printf \"%.2f\", $value * 1000}")
