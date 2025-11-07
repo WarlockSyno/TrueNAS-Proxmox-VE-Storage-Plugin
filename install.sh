@@ -258,12 +258,10 @@ stop_spinner() {
         # Clean up temporary spinner script
         rm -f "/tmp/.installer-spinner-$$.sh" 2>/dev/null || true
 
-        # Clear spinner character by printing space
-        printf "\033[s \033[u" >&2
         SPINNER_PID=""
     fi
 
-    # Show cursor
+    # Show cursor - calling code will overwrite spinner with \r
     printf "\033[?25h" >&2
 }
 
@@ -2034,10 +2032,11 @@ menu_diagnostics() {
         show_menu "Select diagnostic action" \
             "Run health check" \
             "Cleanup orphaned resources" \
-            "Run plugin function test"
+            "Run plugin function test" \
+            "Run FIO storage benchmark"
 
         local choice
-        choice=$(read_choice 3)
+        choice=$(read_choice 4)
 
         case $choice in
             0)
@@ -2056,6 +2055,11 @@ menu_diagnostics() {
             3)
                 # Run plugin function test
                 menu_plugin_test
+                read -rp "Press Enter to return to diagnostics menu..."
+                ;;
+            4)
+                # Run FIO benchmark
+                menu_fio_benchmark
                 read -rp "Press Enter to return to diagnostics menu..."
                 ;;
         esac
@@ -2161,6 +2165,134 @@ menu_plugin_test() {
 
     # Run the test suite
     run_plugin_test "$storage_name" || true
+
+    return 0
+}
+
+# Menu: FIO storage benchmark
+menu_fio_benchmark() {
+    clear_screen
+    print_banner
+    echo
+
+    # Show description and warnings
+    info "FIO Storage Benchmark Suite"
+    echo
+    warning "This benchmark will perform the following operations:"
+    echo "  • Allocate a 10GB test volume directly on storage"
+    echo "  • Run 30 comprehensive I/O tests at multiple queue depths"
+    echo "  • Test sequential/random read/write bandwidth and IOPS"
+    echo "  • Test latency and mixed workload performance"
+    echo "  • Automatically cleanup test volume after completion"
+    echo
+
+    warning "Important considerations:"
+    echo "  • Storage must have at least 10GB free space"
+    echo "  • Benchmarks will run for 25-30 minutes total (30 tests)"
+    echo "  • Each test type runs at 5 queue depths (QD=1, 16, 32, 64, 128)"
+    echo "  • Tests will generate heavy I/O load on the storage system"
+    echo "  • FIO must be installed on this system (will prompt if missing)"
+    echo "  • All test data will be cleaned up after completion"
+    echo "  • Benchmarks are non-destructive to production data"
+    echo
+
+    # Require typed confirmation
+    info "Type ${c8}ACCEPT${c0} to continue or any other input to return to menu"
+    local confirmation
+    read -rp "Confirmation: " confirmation
+
+    if [[ "$confirmation" != "ACCEPT" ]]; then
+        warning "Benchmark cancelled by user"
+        return 0
+    fi
+
+    # Clear screen and show banner again for storage selection
+    clear_screen
+    print_banner
+    echo
+
+    # Show header
+    info "FIO Storage Benchmark"
+    echo
+
+    # List available TrueNAS storage
+    info "Detecting TrueNAS storage configurations..."
+    echo
+
+    if [[ ! -f "$STORAGE_CFG" ]]; then
+        error "Storage configuration file not found: $STORAGE_CFG"
+        return 1
+    fi
+
+    local storages
+    storages=$(grep "^truenasplugin:" "$STORAGE_CFG" 2>/dev/null | awk '{print $2}')
+
+    if [[ -z "$storages" ]]; then
+        warning "No TrueNAS storage configured"
+        info "Please configure storage first from the main menu"
+        return 1
+    fi
+
+    # Prompt for storage selection with retry loop
+    local storage_name=""
+    local storage_error=""
+    local first_try=true
+
+    while true; do
+        # On retry, clear screen and reshow banner
+        if [[ "$first_try" == "false" ]]; then
+            clear_screen
+            print_banner
+            echo
+            info "FIO Storage Benchmark"
+            echo
+            info "Detecting TrueNAS storage configurations..."
+            echo
+        fi
+        first_try=false
+
+        # Show error if validation failed
+        if [[ -n "$storage_error" ]]; then
+            error "$storage_error"
+            echo
+            storage_error=""
+        fi
+
+        info "Available TrueNAS storage:"
+        while IFS= read -r storage; do
+            echo "  • $storage"
+        done <<< "$storages"
+        echo
+
+        read -rp "Enter storage name to benchmark (or press Enter for first): " storage_name
+
+        if [[ -z "$storage_name" ]]; then
+            storage_name=$(echo "$storages" | head -1)
+            info "Using: $storage_name"
+            break
+        fi
+
+        # Validate storage exists
+        if echo "$storages" | grep -q "^${storage_name}$"; then
+            break
+        else
+            storage_error="Storage '$storage_name' not found in configuration"
+        fi
+    done
+
+    # Clear screen and show header for benchmark execution
+    clear_screen
+    print_banner
+    echo
+
+    info "FIO Storage Benchmark"
+    echo
+
+    info "Running benchmark on storage: $storage_name"
+    echo
+
+    # Run the benchmark suite
+    run_fio_benchmark "$storage_name" || true
 
     return 0
 }
@@ -3302,6 +3434,879 @@ detect_orphaned_resources() {
     fi
 
     echo "$orphan_count"
+}
+
+# ============================================================================
+# FIO Benchmark Functions
+# ============================================================================
+
+# FIO benchmark orchestration function
+run_fio_benchmark() {
+    local storage_name="$1"
+    local allocated_volume=""
+    local test_device=""
+    local cleanup_done=false
+    local current_fio_pid=""
+
+    # Global flag so fio_run_test can check it
+    declare -g benchmark_interrupted=false
+
+    # Cleanup function for benchmark
+    cleanup_benchmark() {
+        local sig="${1:-EXIT}"
+
+        # Check if cleanup already done (variable may not exist if interrupted early)
+        if [[ "${cleanup_done:-false}" == "true" ]]; then
+            return 0
+        fi
+        cleanup_done=true
+
+        # Set interrupt flag to break out of any running polling loops
+        benchmark_interrupted=true
+
+        # Disable further interrupts during cleanup to prevent corruption
+        trap '' INT TERM
+
+        # Stop spinner if running
+        stop_spinner 2>/dev/null || true
+
+        # Kill specific FIO process if running
+        if [[ -n "${current_fio_pid:-}" ]] && kill -0 "${current_fio_pid:-}" 2>/dev/null; then
+            log "INFO" "Terminating FIO process with PID ${current_fio_pid:-}"
+            kill "${current_fio_pid:-}" 2>/dev/null || true
+            sleep 1
+            # If still running, force kill
+            if kill -0 "${current_fio_pid:-}" 2>/dev/null; then
+                log "WARNING" "FIO process ${current_fio_pid:-} not responding, using SIGKILL"
+                kill -9 "${current_fio_pid:-}" 2>/dev/null || true
+            fi
+        fi
+
+        if [[ -n "${allocated_volume:-}" ]]; then
+            echo
+            info "Cleaning up test volume..."
+
+            # Free the allocated volume
+            pvesm free "$allocated_volume" &>/dev/null || true
+            sleep 2
+
+            success "Cleanup complete"
+        fi
+
+        # Re-enable interrupts and unset traps before returning
+        trap - EXIT INT TERM
+
+        # If interrupted, show message and return to menu
+        if [[ "$sig" == "INT" ]]; then
+            echo
+            warning "Benchmark interrupted by user (CTRL+C)"
+            return 130
+        elif [[ "$sig" == "TERM" ]]; then
+            echo
+            warning "Benchmark terminated"
+            return 143
+        fi
+    }
+
+    # Set trap for cleanup on exit/interrupt
+    trap 'cleanup_benchmark INT' INT
+    trap 'cleanup_benchmark TERM' TERM
+    trap 'cleanup_benchmark EXIT' EXIT
+
+    # Check 1: FIO installation and version validation
+    printf "%-30s " "FIO installation:"
+    if command -v fio &>/dev/null; then
+        local fio_version fio_major fio_minor
+        fio_version=$(fio --version 2>/dev/null | head -1 || echo "unknown")
+
+        # Extract version number (format: fio-3.16 or fio-3.x)
+        if [[ "$fio_version" =~ fio-([0-9]+)\.([0-9]+) ]]; then
+            fio_major="${BASH_REMATCH[1]}"
+            fio_minor="${BASH_REMATCH[2]}"
+
+            # Minimum version requirement: 3.0 (for reliable JSON output)
+            if [[ $fio_major -lt 3 ]]; then
+                echo -e "${COLOR_RED}✗${COLOR_RESET} $fio_version (too old)"
+                echo
+                error "FIO version 3.0 or higher is required for JSON output support"
+                info "Current version: $fio_version"
+                info "Please upgrade FIO using: apt install fio"
+                return 1
+            fi
+        fi
+
+        echo -e "${COLOR_GREEN}✓${COLOR_RESET} $fio_version"
+
+        # Validate JSON output support
+        local json_test
+        json_test=$(fio --output-format=json --version 2>&1)
+        if [[ $? -ne 0 ]] || echo "$json_test" | grep -qi "unknown.*format"; then
+            echo
+            warning "FIO JSON output format may not be supported"
+            info "Benchmark results parsing may fail"
+            echo
+            read -rp "Continue anyway? (y/N): " continue_choice
+            if [[ ! "$continue_choice" =~ ^[Yy] ]]; then
+                return 1
+            fi
+        fi
+    else
+        echo -e "${COLOR_RED}✗${COLOR_RESET} Not installed"
+        echo
+        error "FIO is not installed on this system"
+        info "Please install FIO using: apt install fio"
+        return 1
+    fi
+
+    # Check 2: Storage configuration
+    printf "%-30s " "Storage configuration:"
+    start_spinner
+
+    local api_host api_key dataset transport_mode
+    api_host=$(get_storage_config_value "$storage_name" "api_host")
+    api_key=$(get_storage_config_value "$storage_name" "api_key")
+    dataset=$(get_storage_config_value "$storage_name" "dataset")
+    transport_mode=$(get_storage_config_value "$storage_name" "transport_mode")
+
+    # Default to iSCSI if transport_mode not specified
+    if [[ -z "$transport_mode" ]]; then
+        transport_mode="iscsi"
+    fi
+
+    stop_spinner
+
+    if [[ -z "$api_host" || -z "$api_key" || -z "$dataset" ]]; then
+        echo -e "\r$(printf "%-30s " "Storage configuration:")${COLOR_RED}✗${COLOR_RESET} Incomplete configuration"
+        return 1
+    fi
+
+    echo -e "\r$(printf "%-30s " "Storage configuration:")${COLOR_GREEN}✓${COLOR_RESET} Valid ($transport_mode mode)"
+
+    # Check 3: Find available VM ID for volume allocation
+    printf "%-30s " "Finding available VM ID:"
+    start_spinner
+
+    # Find two consecutive available VM IDs starting from 990
+    if ! test_find_available_vm_ids 990; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Finding available VM ID:")${COLOR_RED}✗${COLOR_RESET} No available VM IDs"
+        error "Cannot find available VM ID in range 990-1090"
+        return 1
+    fi
+
+    # Use the first available ID for the FIO benchmark volume
+    local benchmark_vm_id=$TEST_VM_BASE
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Finding available VM ID:")${COLOR_GREEN}✓${COLOR_RESET} Using VM ID $benchmark_vm_id"
+
+    # Check 4: Allocate test volume directly on storage
+    printf "%-30s " "Allocating 10GB test volume:"
+    start_spinner
+
+    # Generate unique volume name with timestamp to avoid conflicts
+    local timestamp
+    timestamp=$(date +%s)
+    local unique_name="fio-bench-${timestamp}"
+
+    local alloc_result volume_name
+    alloc_result=$(pvesm alloc "$storage_name" "$benchmark_vm_id" "$unique_name" 10G 2>&1)
+    local alloc_exit=$?
+
+    stop_spinner
+
+    if [[ $alloc_exit -ne 0 ]]; then
+        echo -e "\r$(printf "%-30s " "Allocating 10GB test volume:")${COLOR_RED}✗${COLOR_RESET} Allocation failed"
+        error "Failed to allocate volume: $alloc_result"
+        return 1
+    fi
+
+    # Extract volume name from result (format: storage:volumename)
+    volume_name=$(echo "$alloc_result" | grep -oP "successfully created '\K[^']+")
+    if [[ -z "$volume_name" ]]; then
+        # Parsing failed - try to get volume list from storage
+        volume_name=$(pvesm list "$storage_name" 2>/dev/null | grep "$unique_name" | awk '{print $1}' | head -1)
+    fi
+
+    if [[ -z "$volume_name" ]]; then
+        echo -e "\r$(printf "%-30s " "Allocating 10GB test volume:")${COLOR_RED}✗${COLOR_RESET} Cannot determine volume name"
+        error "Volume was created but name could not be determined"
+        error "Output was: $alloc_result"
+        return 1
+    fi
+
+    allocated_volume="$volume_name"
+
+    # Verify the volume actually exists
+    if ! pvesm list "$storage_name" 2>/dev/null | grep -q "$volume_name"; then
+        echo -e "\r$(printf "%-30s " "Allocating 10GB test volume:")${COLOR_RED}✗${COLOR_RESET} Volume verification failed"
+        error "Volume $volume_name was not found in storage"
+        return 1
+    fi
+
+    echo -e "\r$(printf "%-30s " "Allocating 10GB test volume:")${COLOR_GREEN}✓${COLOR_RESET} $volume_name"
+
+    # Wait for device to appear (sufficient for both iSCSI and NVMe/TCP)
+    printf "%-30s " "Waiting for device (5s):"
+    start_spinner
+    sleep 5
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Waiting for device (5s):")${COLOR_GREEN}✓${COLOR_RESET} Ready"
+
+    # Check 5: Detect device path
+    printf "%-30s " "Detecting device path:"
+    start_spinner
+
+    # Try pvesm path first (authoritative source)
+    test_device=$(pvesm path "$volume_name" 2>/dev/null)
+
+    # If pvesm path didn't work, fall back to detection logic
+    if [[ -z "$test_device" || ! -b "$test_device" ]]; then
+        test_device=$(fio_detect_device_path "$storage_name" "$volume_name")
+    fi
+
+    stop_spinner
+
+    if [[ -z "$test_device" || ! -b "$test_device" ]]; then
+        echo -e "\r$(printf "%-30s " "Detecting device path:")${COLOR_RED}✗${COLOR_RESET} Device not found"
+        error "Could not detect block device for test volume"
+        info "Volume name: $volume_name"
+        info "Available devices: $(ls -1 /dev/sd* /dev/nvme* /dev/mapper/mpath* 2>/dev/null | head -5 | tr '\n' ' ')"
+        cleanup_benchmark
+        return 1
+    fi
+
+    echo -e "\r$(printf "%-30s " "Detecting device path:")${COLOR_GREEN}✓${COLOR_RESET} $test_device"
+
+    # Check 6: Validate device is not in use
+    printf "%-30s " "Validating device is unused:"
+    start_spinner
+
+    # Check if device has filesystem
+    local has_fs
+    has_fs=$(blkid "$test_device" 2>/dev/null)
+
+    # Check if device is mounted
+    local is_mounted
+    is_mounted=$(mount | grep -q "$test_device" && echo "yes" || echo "no")
+
+    stop_spinner
+
+    if [[ -n "$has_fs" ]]; then
+        echo -e "\r$(printf "%-30s " "Validating device is unused:")${COLOR_RED}✗${COLOR_RESET} Device has filesystem"
+        error "Device $test_device has a filesystem: $has_fs"
+        cleanup_benchmark
+        return 1
+    fi
+
+    if [[ "$is_mounted" == "yes" ]]; then
+        echo -e "\r$(printf "%-30s " "Validating device is unused:")${COLOR_RED}✗${COLOR_RESET} Device is mounted"
+        error "Device $test_device is currently mounted"
+        cleanup_benchmark
+        return 1
+    fi
+
+    # Note: VM ID check removed - volumes created with pvesm alloc are not attached to VMs
+    # The filesystem and mount checks above, plus lsof checks in fio_run_test, are sufficient
+
+    echo -e "\r$(printf "%-30s " "Validating device is unused:")${COLOR_GREEN}✓${COLOR_RESET} Device is safe to test"
+
+    echo
+    info "Starting FIO benchmarks (30 tests, 25-30 minutes total)..."
+    echo
+
+    # Run benchmark tests
+    fio_run_benchmark_suite "$test_device" "$transport_mode"
+
+    # EXIT trap will handle cleanup automatically
+    return 0
+}
+
+# Detect device path for benchmark test disk
+fio_detect_device_path() {
+    local storage_name="$1"
+    local volume_name="$2"
+    local device_path=""
+
+    # Extract just the volume part (after storage name)
+    local vol_id
+    vol_id=$(echo "$volume_name" | sed "s/${storage_name}://")
+
+    # Detect transport mode
+    local transport_mode use_multipath
+    transport_mode=$(get_storage_config_value "$storage_name" "transport_mode")
+    use_multipath=$(get_storage_config_value "$storage_name" "use_multipath")
+
+    # Default to iSCSI if not specified
+    if [[ -z "$transport_mode" ]]; then
+        transport_mode="iscsi"
+    fi
+
+    # Wait for device to appear and retry up to 40 times (40 seconds after initial 10 second wait = 50 total)
+    local max_retries=40
+    local retry_count=0
+
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        # NVMe-TCP: Look for device in nvme list
+        # The volume ID should match the NVMe namespace
+        while [[ $retry_count -lt $max_retries ]]; do
+            # Get list of all NVMe devices with their details
+            local nvme_devices
+            nvme_devices=$(nvme list 2>/dev/null | tail -n +3)
+
+            # Look for the most recently added device
+            # For NVMe-TCP, we'll find the newest device by checking timestamps
+            local newest_nvme
+            newest_nvme=$(ls -t /dev/nvme*n1 2>/dev/null | head -1)
+
+            if [[ -n "$newest_nvme" && -b "$newest_nvme" ]]; then
+                device_path="$newest_nvme"
+                break
+            fi
+
+            sleep 1
+            ((retry_count++))
+        done
+
+    else
+        # iSCSI: Check for multipath or standard device
+        if [[ "$use_multipath" == "1" ]]; then
+            # Multipath enabled: Look for /dev/mapper/mpathX
+            while [[ $retry_count -lt $max_retries ]]; do
+                # Rescan multipath to pick up new devices
+                multipath -r &>/dev/null || true
+
+                # Get the most recently added multipath device
+                local newest_mpath
+                newest_mpath=$(ls -t /dev/mapper/mpath* 2>/dev/null | head -1)
+
+                if [[ -n "$newest_mpath" && -b "$newest_mpath" ]]; then
+                    device_path="$newest_mpath"
+                    break
+                fi
+
+                sleep 1
+                ((retry_count++))
+            done
+
+        else
+            # Standard iSCSI: Look for /dev/sdX
+            # Get baseline of existing SCSI devices before allocation
+            while [[ $retry_count -lt $max_retries ]]; do
+                # Rescan SCSI bus to pick up new devices
+                echo "- - -" > /proc/scsi/scsi 2>/dev/null || true
+
+                # Find the most recently added SCSI device
+                local newest_sd
+                newest_sd=$(ls -t /dev/sd* 2>/dev/null | grep -E "sd[a-z]+$" | head -1)
+
+                if [[ -n "$newest_sd" && -b "$newest_sd" ]]; then
+                    # Verify it's roughly the right size (around 10GB)
+                    local size_gb
+                    size_gb=$(lsblk -b -dn -o SIZE "$newest_sd" 2>/dev/null | awk '{printf "%.0f", $1/1024/1024/1024}')
+
+                    if [[ -n "$size_gb" && $size_gb -ge 9 && $size_gb -le 11 ]]; then
+                        device_path="$newest_sd"
+                        break
+                    fi
+                fi
+
+                sleep 1
+                ((retry_count++))
+            done
+        fi
+    fi
+
+    echo "$device_path"
+}
+
+# Progress is now shown in section headers instead of bottom progress bar
+
+# Run FIO benchmark suite on a device
+fio_run_benchmark_suite() {
+    local device="$1"
+    local transport_mode="$2"
+
+    # Define queue depths to test - same for both transport modes
+    info "Transport mode: ${transport_mode} (testing QD=1, 16, 32, 64, 128)"
+    echo
+
+    local test_num=1
+    local total_tests=30
+
+    # Arrays to store results for summary (global scope for access in fio_run_test)
+    declare -ga test_names
+    declare -ga test_results
+    declare -ga test_values
+
+    # Sequential Read Bandwidth - 5 queue depths
+    info "Sequential Read Bandwidth Tests: [1-5/30]"
+    fio_run_test "Queue Depth = 1:" "$device" \
+        "seq-read-qd1" "read" "1M" "1" "20" "bandwidth" "$test_num" "$total_tests"
+    ((test_num++))
+    fio_run_test "Queue Depth = 16:" "$device" \
+        "seq-read-qd16" "read" "1M" "16" "20" "bandwidth" "$test_num" "$total_tests"
+    ((test_num++))
+    fio_run_test "Queue Depth = 32:" "$device" \
+        "seq-read-qd32" "read" "1M" "32" "20" "bandwidth" "$test_num" "$total_tests"
+    ((test_num++))
+    fio_run_test "Queue Depth = 64:" "$device" \
+        "seq-read-qd64" "read" "1M" "64" "20" "bandwidth" "$test_num" "$total_tests"
+    ((test_num++))
+    fio_run_test "Queue Depth = 128:" "$device" \
+        "seq-read-qd128" "read" "1M" "128" "20" "bandwidth" "$test_num" "$total_tests"
+    ((test_num++))
+    echo
+
+    # Sequential Write Bandwidth - 5 queue depths
+    info "Sequential Write Bandwidth Tests: [6-10/30]"
+    fio_run_test "Queue Depth = 1:" "$device" \
+        "seq-write-qd1" "write" "1M" "1" "20" "bandwidth" "$test_num" "$total_tests"
+    ((test_num++))
+    fio_run_test "Queue Depth = 16:" "$device" \
+        "seq-write-qd16" "write" "1M" "16" "20" "bandwidth" "$test_num" "$total_tests"
+    ((test_num++))
+    fio_run_test "Queue Depth = 32:" "$device" \
+        "seq-write-qd32" "write" "1M" "32" "20" "bandwidth" "$test_num" "$total_tests"
+    ((test_num++))
+    fio_run_test "Queue Depth = 64:" "$device" \
+        "seq-write-qd64" "write" "1M" "64" "20" "bandwidth" "$test_num" "$total_tests"
+    ((test_num++))
+    fio_run_test "Queue Depth = 128:" "$device" \
+        "seq-write-qd128" "write" "1M" "128" "20" "bandwidth" "$test_num" "$total_tests"
+    ((test_num++))
+    echo
+
+    # Random Read IOPS - 5 queue depths
+    info "Random Read IOPS Tests: [11-15/30]"
+    fio_run_test "Queue Depth = 1:" "$device" \
+        "rand-read-qd1" "randread" "4K" "1" "30" "iops" "$test_num" "$total_tests"
+    ((test_num++))
+    fio_run_test "Queue Depth = 16:" "$device" \
+        "rand-read-qd16" "randread" "4K" "16" "30" "iops" "$test_num" "$total_tests"
+    ((test_num++))
+    fio_run_test "Queue Depth = 32:" "$device" \
+        "rand-read-qd32" "randread" "4K" "32" "30" "iops" "$test_num" "$total_tests"
+    ((test_num++))
+    fio_run_test "Queue Depth = 64:" "$device" \
+        "rand-read-qd64" "randread" "4K" "64" "30" "iops" "$test_num" "$total_tests"
+    ((test_num++))
+    fio_run_test "Queue Depth = 128:" "$device" \
+        "rand-read-qd128" "randread" "4K" "128" "30" "iops" "$test_num" "$total_tests"
+    ((test_num++))
+    echo
+
+    # Random Write IOPS - 5 queue depths
+    info "Random Write IOPS Tests: [16-20/30]"
+    fio_run_test "Queue Depth = 1:" "$device" \
+        "rand-write-qd1" "randwrite" "4K" "1" "30" "iops" "$test_num" "$total_tests"
+    ((test_num++))
+    fio_run_test "Queue Depth = 16:" "$device" \
+        "rand-write-qd16" "randwrite" "4K" "16" "30" "iops" "$test_num" "$total_tests"
+    ((test_num++))
+    fio_run_test "Queue Depth = 32:" "$device" \
+        "rand-write-qd32" "randwrite" "4K" "32" "30" "iops" "$test_num" "$total_tests"
+    ((test_num++))
+    fio_run_test "Queue Depth = 64:" "$device" \
+        "rand-write-qd64" "randwrite" "4K" "64" "30" "iops" "$test_num" "$total_tests"
+    ((test_num++))
+    fio_run_test "Queue Depth = 128:" "$device" \
+        "rand-write-qd128" "randwrite" "4K" "128" "30" "iops" "$test_num" "$total_tests"
+    ((test_num++))
+    echo
+
+    # Random Read Latency - 5 queue depths
+    info "Random Read Latency Tests: [21-25/30]"
+    fio_run_test "Queue Depth = 1:" "$device" \
+        "rand-read-lat-qd1" "randread" "4K" "1" "20" "latency" "$test_num" "$total_tests"
+    ((test_num++))
+    fio_run_test "Queue Depth = 16:" "$device" \
+        "rand-read-lat-qd16" "randread" "4K" "16" "20" "latency" "$test_num" "$total_tests"
+    ((test_num++))
+    fio_run_test "Queue Depth = 32:" "$device" \
+        "rand-read-lat-qd32" "randread" "4K" "32" "20" "latency" "$test_num" "$total_tests"
+    ((test_num++))
+    fio_run_test "Queue Depth = 64:" "$device" \
+        "rand-read-lat-qd64" "randread" "4K" "64" "20" "latency" "$test_num" "$total_tests"
+    ((test_num++))
+    fio_run_test "Queue Depth = 128:" "$device" \
+        "rand-read-lat-qd128" "randread" "4K" "128" "20" "latency" "$test_num" "$total_tests"
+    ((test_num++))
+    echo
+
+    # Mixed 70/30 Workload - 5 queue depths
+    info "Mixed 70/30 Workload Tests: [26-30/30]"
+    fio_run_test "Queue Depth = 1:" "$device" \
+        "mixed-7030-qd1" "randrw" "4K" "1" "30" "mixed" "$test_num" "$total_tests"
+    ((test_num++))
+    fio_run_test "Queue Depth = 16:" "$device" \
+        "mixed-7030-qd16" "randrw" "4K" "16" "30" "mixed" "$test_num" "$total_tests"
+    ((test_num++))
+    fio_run_test "Queue Depth = 32:" "$device" \
+        "mixed-7030-qd32" "randrw" "4K" "32" "30" "mixed" "$test_num" "$total_tests"
+    ((test_num++))
+    fio_run_test "Queue Depth = 64:" "$device" \
+        "mixed-7030-qd64" "randrw" "4K" "64" "30" "mixed" "$test_num" "$total_tests"
+    ((test_num++))
+    fio_run_test "Queue Depth = 128:" "$device" \
+        "mixed-7030-qd128" "randrw" "4K" "128" "30" "mixed" "$test_num" "$total_tests"
+
+    # Display benchmark summary
+    echo
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    info "Benchmark Summary"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo
+
+    local completed=0
+    local failed=0
+    for status in "${test_values[@]}"; do
+        if [[ "$status" == "pass" ]]; then
+            ((completed++))
+        else
+            ((failed++))
+        fi
+    done
+
+    info "Total tests run: $total_tests"
+    info "Completed: $completed"
+    if [[ $failed -gt 0 ]]; then
+        error "Failed: $failed"
+    fi
+    echo
+
+    # Show top performers in each category
+    info "Top Performers:"
+    echo
+
+    # Map test index to queue depth (0=QD1, 1=QD16, 2=QD32, 3=QD64, 4=QD128)
+    local qd_map=(1 16 32 64 128)
+
+    # Find best sequential read bandwidth (test indices 0-4)
+    local best_seq_read_idx=0
+    local best_seq_read_value=0
+    for i in 0 1 2 3 4; do
+        if [[ "${test_values[$i]:-}" == "pass" ]]; then
+            local value=$(echo "${test_results[$i]}" | grep -oP '^[0-9.]+')
+            if (( $(echo "$value > $best_seq_read_value" | bc -l 2>/dev/null || echo 0) )); then
+                best_seq_read_value=$value
+                best_seq_read_idx=$i
+            fi
+        fi
+    done
+    local seq_read_qd=${qd_map[$((best_seq_read_idx % 5))]}
+    printf "  %-22s %20s   (QD=%-3s)\n" "Sequential Read:" "${test_results[$best_seq_read_idx]}" "$seq_read_qd"
+
+    # Find best sequential write bandwidth (test indices 5-9)
+    local best_seq_write_idx=5
+    local best_seq_write_value=0
+    for i in 5 6 7 8 9; do
+        if [[ "${test_values[$i]:-}" == "pass" ]]; then
+            local value=$(echo "${test_results[$i]}" | grep -oP '^[0-9.]+')
+            if (( $(echo "$value > $best_seq_write_value" | bc -l 2>/dev/null || echo 0) )); then
+                best_seq_write_value=$value
+                best_seq_write_idx=$i
+            fi
+        fi
+    done
+    local seq_write_qd=${qd_map[$((best_seq_write_idx % 5))]}
+    printf "  %-22s %20s   (QD=%-3s)\n" "Sequential Write:" "${test_results[$best_seq_write_idx]}" "$seq_write_qd"
+
+    # Find best random read IOPS (test indices 10-14)
+    local best_rand_read_idx=10
+    local best_rand_read_value=0
+    for i in 10 11 12 13 14; do
+        if [[ "${test_values[$i]:-}" == "pass" ]]; then
+            local value=$(echo "${test_results[$i]}" | tr -d ',' | grep -oP '^[0-9.]+')
+            if [[ -n "$value" ]] && (( $(echo "$value > $best_rand_read_value" | bc -l 2>/dev/null || echo 0) )); then
+                best_rand_read_value=$value
+                best_rand_read_idx=$i
+            fi
+        fi
+    done
+    local rand_read_qd=${qd_map[$((best_rand_read_idx % 5))]}
+    printf "  %-22s %20s   (QD=%-3s)\n" "Random Read IOPS:" "${test_results[$best_rand_read_idx]}" "$rand_read_qd"
+
+    # Find best random write IOPS (test indices 15-19)
+    local best_rand_write_idx=15
+    local best_rand_write_value=0
+    for i in 15 16 17 18 19; do
+        if [[ "${test_values[$i]:-}" == "pass" ]]; then
+            local value=$(echo "${test_results[$i]}" | tr -d ',' | grep -oP '^[0-9.]+')
+            if [[ -n "$value" ]] && (( $(echo "$value > $best_rand_write_value" | bc -l 2>/dev/null || echo 0) )); then
+                best_rand_write_value=$value
+                best_rand_write_idx=$i
+            fi
+        fi
+    done
+    local rand_write_qd=${qd_map[$((best_rand_write_idx % 5))]}
+    printf "  %-22s %20s   (QD=%-3s)\n" "Random Write IOPS:" "${test_results[$best_rand_write_idx]}" "$rand_write_qd"
+
+    # Find best (lowest) latency (test indices 20-24)
+    local best_latency_idx=20
+    local best_latency_value=999999999
+    for i in 20 21 22 23 24; do
+        if [[ "${test_values[$i]:-}" == "pass" ]]; then
+            local value=$(echo "${test_results[$i]}" | grep -oP '^[0-9.]+')
+            if [[ -n "$value" ]] && (( $(echo "$value < $best_latency_value" | bc -l 2>/dev/null || echo 0) )); then
+                best_latency_value=$value
+                best_latency_idx=$i
+            fi
+        fi
+    done
+    local latency_qd=${qd_map[$((best_latency_idx % 5))]}
+    printf "  %-22s %20s   (QD=%-3s)\n" "Lowest Latency:" "${test_results[$best_latency_idx]}" "$latency_qd"
+
+    echo
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+# Run a single FIO test with spinner and result display
+fio_run_test() {
+    local label="$1"
+    local device="$2"
+    local test_name="$3"
+    local rw_mode="$4"
+    local block_size="$5"
+    local iodepth="$6"
+    local runtime="$7"
+    local metric_type="$8"
+    local test_num="${9:-0}"
+    local total_tests="${10:-0}"
+
+    # Validate device is not in use before starting test
+    if command -v lsof &>/dev/null; then
+        if lsof "$device" &>/dev/null; then
+            printf "%-30s " "${label}"
+            echo -e "${COLOR_RED}✗${COLOR_RESET} Device in use"
+            log "ERROR" "Device $device is in use, cannot run test $test_name"
+            return 1
+        fi
+    fi
+
+    # Note: Progress indicator removed from label to maintain alignment
+    # Progress is now shown in a separate progress bar at bottom of screen
+
+    printf "%-30s " "${label}"
+    start_spinner
+
+    # Create temporary file for JSON output
+    local json_output
+    json_output=$(mktemp)
+
+    # Build FIO command with appropriate parameters
+    local fio_cmd="fio --name=${test_name} --ioengine=libaio --direct=1 --rw=${rw_mode} --bs=${block_size} --iodepth=${iodepth} --runtime=${runtime} --time_based --group_reporting --filename=${device} --output-format=json"
+
+    # Add mixed workload specific parameters
+    if [[ "$metric_type" == "mixed" ]]; then
+        fio_cmd+=" --rwmixread=70"
+    fi
+
+    # Run FIO and capture output
+    # Run in background to allow signal handling
+    $fio_cmd > "$json_output" 2>&1 &
+    local fio_pid=$!
+
+    # Store PID in parent scope for cleanup
+    current_fio_pid=$fio_pid
+
+    # Wait for FIO to complete with interruptible polling
+    # Check interrupt flag every 0.1s - trap will set flag when CTRL+C pressed
+    local fio_exit=0
+    while kill -0 $fio_pid 2>/dev/null && [[ "${benchmark_interrupted:-false}" == "false" ]]; do
+        sleep 0.1
+    done
+    wait $fio_pid 2>/dev/null || fio_exit=$?
+
+    # Clear PID after completion
+    current_fio_pid=""
+
+    stop_spinner
+
+    if [[ $fio_exit -ne 0 ]]; then
+        echo -e "\r$(printf "%-30s " "${label}")${COLOR_RED}✗${COLOR_RESET} Failed"
+
+        # Store failure for summary (arrays are global)
+        test_names+=("${test_name}")
+        test_results+=("Failed")
+        test_values+=("fail")
+
+        rm -f "$json_output"
+        return 1
+    fi
+
+    # Parse results based on metric type
+    local result_text
+    case "$metric_type" in
+        bandwidth)
+            result_text=$(fio_parse_bandwidth "$json_output" "$rw_mode")
+            ;;
+        iops)
+            result_text=$(fio_parse_iops "$json_output" "$rw_mode")
+            ;;
+        latency)
+            result_text=$(fio_parse_latency "$json_output" "$rw_mode")
+            ;;
+        mixed)
+            result_text=$(fio_parse_mixed "$json_output")
+            ;;
+    esac
+
+    # Display result
+    echo -e "\r$(printf "%-30s " "${label}")${COLOR_GREEN}✓${COLOR_RESET} ${result_text}"
+
+    # Store result for summary (arrays are global)
+    test_names+=("${test_name}")
+    test_results+=("${result_text}")
+    test_values+=("pass")
+
+    # Cleanup
+    rm -f "$json_output"
+}
+
+# Parse bandwidth from FIO JSON output
+fio_parse_bandwidth() {
+    local json_file="$1"
+    local rw_mode="$2"
+
+    # Validate JSON structure
+    if ! grep -q '"jobs"' "$json_file" 2>/dev/null; then
+        log "ERROR" "Invalid JSON output from FIO - missing 'jobs' section"
+        echo "N/A (Invalid JSON)"
+        return 1
+    fi
+
+    # Extract the read or write section, then find bw_bytes
+    local bw_bytes
+    if [[ "$rw_mode" == "read" ]]; then
+        bw_bytes=$(grep -A 50 '"read" : {' "$json_file" | grep '"bw_bytes"' | head -1 | grep -oP ':\s*\K[0-9]+')
+    else
+        bw_bytes=$(grep -A 50 '"write" : {' "$json_file" | grep '"bw_bytes"' | head -1 | grep -oP ':\s*\K[0-9]+')
+    fi
+
+    if [[ -z "$bw_bytes" ]]; then
+        log "WARNING" "Could not parse bandwidth from JSON output"
+        echo "N/A"
+        return
+    fi
+
+    # Convert bytes/sec to MB/s
+    local bw_mbps
+    bw_mbps=$(awk "BEGIN {printf \"%.2f\", $bw_bytes/1024/1024}")
+
+    # If > 1000 MB/s, show in GB/s
+    if (( $(echo "$bw_mbps > 1000" | bc -l) )); then
+        local bw_gbps
+        bw_gbps=$(awk "BEGIN {printf \"%.2f\", $bw_mbps/1024}")
+        echo "${bw_gbps} GB/s"
+    else
+        echo "${bw_mbps} MB/s"
+    fi
+}
+
+# Parse IOPS from FIO JSON output
+fio_parse_iops() {
+    local json_file="$1"
+    local rw_mode="$2"
+
+    # Validate JSON structure
+    if ! grep -q '"jobs"' "$json_file" 2>/dev/null; then
+        log "ERROR" "Invalid JSON output from FIO - missing 'jobs' section"
+        echo "N/A (Invalid JSON)"
+        return 1
+    fi
+
+    # Extract the read or write section, then find iops (not iops_min/max/mean)
+    local iops
+    if [[ "$rw_mode" == "randread" ]]; then
+        iops=$(grep -A 50 '"read" : {' "$json_file" | grep '"iops"' | head -1 | grep -oP ':\s*\K[0-9.]+')
+    else
+        iops=$(grep -A 50 '"write" : {' "$json_file" | grep '"iops"' | head -1 | grep -oP ':\s*\K[0-9.]+')
+    fi
+
+    if [[ -z "$iops" ]]; then
+        log "WARNING" "Could not parse IOPS from JSON output"
+        echo "N/A"
+        return
+    fi
+
+    # Format with comma separator for thousands
+    local iops_int
+    iops_int=$(printf "%.0f" "$iops")
+    local formatted_iops
+    formatted_iops=$(echo "$iops_int" | sed ':a;s/\B[0-9]\{3\}\>/,&/;ta')
+    echo "${formatted_iops} IOPS"
+}
+
+# Parse latency from FIO JSON output
+fio_parse_latency() {
+    local json_file="$1"
+    local rw_mode="$2"
+
+    # Validate JSON structure
+    if ! grep -q '"jobs"' "$json_file" 2>/dev/null; then
+        log "ERROR" "Invalid JSON output from FIO - missing 'jobs' section"
+        echo "N/A (Invalid JSON)"
+        return 1
+    fi
+
+    # Extract the read or write section, find lat_ns section, then get mean
+    local lat_ns
+    if [[ "$rw_mode" == "randread" ]]; then
+        lat_ns=$(grep -A 100 '"read" : {' "$json_file" | grep -A 10 '"lat_ns"' | grep '"mean"' | head -1 | grep -oP ':\s*\K[0-9.]+')
+    else
+        lat_ns=$(grep -A 100 '"write" : {' "$json_file" | grep -A 10 '"lat_ns"' | grep '"mean"' | head -1 | grep -oP ':\s*\K[0-9.]+')
+    fi
+
+    if [[ -z "$lat_ns" ]]; then
+        log "WARNING" "Could not parse latency from JSON output"
+        echo "N/A"
+        return
+    fi
+
+    # Convert nanoseconds to microseconds or milliseconds
+    local lat_us
+    lat_us=$(awk "BEGIN {printf \"%.2f\", $lat_ns/1000}")
+
+    if (( $(echo "$lat_us > 1000" | bc -l) )); then
+        local lat_ms
+        lat_ms=$(awk "BEGIN {printf \"%.2f\", $lat_us/1000}")
+        echo "${lat_ms} ms"
+    else
+        echo "${lat_us} µs"
+    fi
+}
+
+# Parse mixed workload results from FIO JSON output
+fio_parse_mixed() {
+    local json_file="$1"
+
+    # Validate JSON structure
+    if ! grep -q '"jobs"' "$json_file" 2>/dev/null; then
+        log "ERROR" "Invalid JSON output from FIO - missing 'jobs' section"
+        echo "N/A (Invalid JSON)"
+        return 1
+    fi
+
+    # Extract read and write sections separately
+    local read_iops write_iops
+    read_iops=$(grep -A 50 '"read" : {' "$json_file" | grep '"iops"' | head -1 | grep -oP ':\s*\K[0-9.]+')
+    write_iops=$(grep -A 50 '"write" : {' "$json_file" | grep '"iops"' | head -1 | grep -oP ':\s*\K[0-9.]+')
+
+    if [[ -z "$read_iops" || -z "$write_iops" ]]; then
+        log "WARNING" "Could not parse mixed workload from JSON output"
+        echo "N/A"
+        return
+    fi
+
+    local read_iops_int write_iops_int
+    read_iops_int=$(printf "%.0f" "$read_iops")
+    write_iops_int=$(printf "%.0f" "$write_iops")
+
+    # Format with commas
+    read_iops_int=$(echo "$read_iops_int" | sed ':a;s/\B[0-9]\{3\}\>/,&/;ta')
+    write_iops_int=$(echo "$write_iops_int" | sed ':a;s/\B[0-9]\{3\}\>/,&/;ta')
+
+    echo "R: ${read_iops_int} / W: ${write_iops_int} IOPS"
 }
 
 # Perform health check on a storage

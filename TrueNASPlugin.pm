@@ -2651,6 +2651,7 @@ sub _nvme_create_namespace {
     my $subsys_id = _nvme_ensure_subsystem($scfg);
 
     # Create namespace
+    # Note: zvol creation job is now waited on in alloc_image() before calling this function
     my $ns = _api_call($scfg, 'nvmet.namespace.create', [{
         device_type => 'ZVOL',
         device_path => $zvol_path,  # Already has 'zvol/' prefix
@@ -2868,12 +2869,23 @@ sub alloc_image {
     # Normalize blocksize to uppercase for TrueNAS 25.10+ compatibility
     $create_payload->{volblocksize} = _normalize_blocksize($blocksize) if $blocksize;
 
-    _api_call(
+    my $create_result = _api_call(
         $scfg,
         'pool.dataset.create',
         [ $create_payload ],
         sub { _rest_call($scfg, 'POST', '/pool/dataset', $create_payload) },
     );
+
+    # If pool.dataset.create returns a job ID, wait for it to complete
+    # This ensures the zvol is fully created before we try to use it
+    if (defined $create_result && !ref($create_result) && $create_result =~ /^\d+$/) {
+        _log($scfg, 1, 'info', "alloc_image: waiting for zvol creation job $create_result to complete");
+        my $job_result = _wait_for_job_completion($scfg, $create_result, 30);
+        unless ($job_result->{success}) {
+            die "Failed to create zvol $full_ds: " . ($job_result->{error} // 'Unknown error') . "\n";
+        }
+        _log($scfg, 1, 'info', "alloc_image: zvol $full_ds created successfully");
+    }
 
     # 2) Transport-specific volume exposure
     my $zvol_path = 'zvol/' . $full_ds;
