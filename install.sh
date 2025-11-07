@@ -3987,6 +3987,11 @@ fio_run_benchmark_suite() {
     for i in 0 1 2 3 4; do
         if [[ "${test_values[$i]:-}" == "pass" ]]; then
             local value=$(echo "${test_results[$i]}" | grep -oP '^[0-9.]+')
+            local unit=$(echo "${test_results[$i]}" | grep -oP '(MB|GB)/s')
+            # Normalize to MB/s for comparison
+            if [[ "$unit" == "GB/s" ]]; then
+                value=$(awk "BEGIN {printf \"%.2f\", $value * 1024}")
+            fi
             if (( $(echo "$value > $best_seq_read_value" | bc -l 2>/dev/null || echo 0) )); then
                 best_seq_read_value=$value
                 best_seq_read_idx=$i
@@ -4002,6 +4007,11 @@ fio_run_benchmark_suite() {
     for i in 5 6 7 8 9; do
         if [[ "${test_values[$i]:-}" == "pass" ]]; then
             local value=$(echo "${test_results[$i]}" | grep -oP '^[0-9.]+')
+            local unit=$(echo "${test_results[$i]}" | grep -oP '(MB|GB)/s')
+            # Normalize to MB/s for comparison
+            if [[ "$unit" == "GB/s" ]]; then
+                value=$(awk "BEGIN {printf \"%.2f\", $value * 1024}")
+            fi
             if (( $(echo "$value > $best_seq_write_value" | bc -l 2>/dev/null || echo 0) )); then
                 best_seq_write_value=$value
                 best_seq_write_idx=$i
@@ -4047,6 +4057,11 @@ fio_run_benchmark_suite() {
     for i in 20 21 22 23 24; do
         if [[ "${test_values[$i]:-}" == "pass" ]]; then
             local value=$(echo "${test_results[$i]}" | grep -oP '^[0-9.]+')
+            local unit=$(echo "${test_results[$i]}" | grep -oP '(µs|ms)')
+            # Normalize to µs for comparison (lower is better)
+            if [[ "$unit" == "ms" ]]; then
+                value=$(awk "BEGIN {printf \"%.2f\", $value * 1000}")
+            fi
             if [[ -n "$value" ]] && (( $(echo "$value < $best_latency_value" | bc -l 2>/dev/null || echo 0) )); then
                 best_latency_value=$value
                 best_latency_idx=$i
@@ -4094,7 +4109,8 @@ fio_run_test() {
     json_output=$(mktemp)
 
     # Build FIO command with appropriate parameters
-    local fio_cmd="fio --name=${test_name} --ioengine=libaio --direct=1 --rw=${rw_mode} --bs=${block_size} --iodepth=${iodepth} --runtime=${runtime} --time_based --group_reporting --filename=${device} --output-format=json"
+    # Note: --size parameter is required for device paths that FIO cannot auto-query (e.g., iSCSI symlinks)
+    local fio_cmd="fio --name=${test_name} --ioengine=libaio --direct=1 --rw=${rw_mode} --bs=${block_size} --iodepth=${iodepth} --runtime=${runtime} --time_based --size=10G --group_reporting --filename=${device} --output-format=json"
 
     # Add mixed workload specific parameters
     if [[ "$metric_type" == "mixed" ]]; then
