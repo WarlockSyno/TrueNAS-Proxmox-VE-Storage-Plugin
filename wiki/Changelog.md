@@ -1,5 +1,29 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.1.4 (November 8, 2025)
+
+### 🐛 **Bug Fixes**
+
+#### **WebSocket Message Fragmentation**
+- **Fixed truncated API responses with WebSocket transport** - Plugin now properly handles fragmented WebSocket messages
+  - **Error resolved**: Incomplete or truncated JSON responses causing API operation failures
+  - **Issue**: Large API responses (lengthy dataset lists, extensive configuration data) were truncated when split across multiple WebSocket frames
+  - **Root cause**: WebSocket receiver returned immediately after first frame without checking for continuation frames
+  - **Impact**: Operations with large responses failed with JSON parse errors or incomplete data
+  - **Solution**: Implemented proper WebSocket frame fragmentation handling
+    - Accumulates continuation frames (opcode 0x00) until FIN bit is set
+    - Supports both fragmented and unfragmented text frames
+    - Only returns complete messages after all fragments received
+    - Handles ping/pong and close frames during fragmented message reception
+
+### 🔧 **Technical Details**
+- Modified `_ws_recv_text()` function (lines 785-845)
+  - Added message accumulator for multi-frame messages
+  - Proper handling of continuation frames
+  - FIN bit checking to detect message completion
+
+---
+
 ## Version 1.1.3 (November 5, 2025)
 
 ### 🚀 **Major Performance Improvements**
