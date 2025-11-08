@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '1.1.3';
+our $VERSION = '1.1.4';
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -784,26 +784,64 @@ sub _ws_read_exact {
 }
 sub _ws_recv_text {
     my $sock = shift;
-    my $hdr;
-    _ws_read_exact($sock, \$hdr, 2) or die "WS read hdr failed";
-    my ($b1, $b2) = unpack('CC', $hdr);
-    my $opcode = $b1 & 0x0f;
-    die "WS: unexpected opcode $opcode" if $opcode != 1; # text only
-    my $masked = ($b2 & 0x80) ? 1 : 0; # server MUST NOT mask
-    my $len    = ($b2 & 0x7f);
-    if ($len == 126) {
-        my $ext; _ws_read_exact($sock, \$ext, 2) or die "WS len16 read fail";
-        $len = unpack('n', $ext);
-    } elsif ($len == 127) {
-        my $ext; _ws_read_exact($sock, \$ext, 8) or die "WS len64 read fail";
-        $len = unpack('Q>', $ext);
+    my $message = ''; # Accumulator for fragmented messages
+
+    while (1) {
+        my $hdr;
+        _ws_read_exact($sock, \$hdr, 2) or die "WS read hdr failed";
+        my ($b1, $b2) = unpack('CC', $hdr);
+        my $fin    = ($b1 & 0x80) ? 1 : 0; # FIN bit
+        my $opcode = $b1 & 0x0f;
+        my $masked = ($b2 & 0x80) ? 1 : 0; # server MUST NOT mask
+        my $len    = ($b2 & 0x7f);
+
+        if ($len == 126) {
+            my $ext; _ws_read_exact($sock, \$ext, 2) or die "WS len16 read fail";
+            $len = unpack('n', $ext);
+        } elsif ($len == 127) {
+            my $ext; _ws_read_exact($sock, \$ext, 8) or die "WS len64 read fail";
+            $len = unpack('Q>', $ext);
+        }
+
+        my $mask_key = '';
+        if ($masked) { _ws_read_exact($sock, \$mask_key, 4) or die "WS unexpected mask"; }
+
+        my $payload = '';
+        if ($len > 0) {
+            _ws_read_exact($sock, \$payload, $len) or die "WS payload read fail";
+            if ($masked) { $payload = _xor_mask($payload, $mask_key); }
+        }
+
+        # Handle different frame types
+        if ($opcode == 0x01) {
+            # Text frame (start of message or unfragmented message)
+            $message = $payload;
+            return $message if $fin; # Complete unfragmented message
+            # Otherwise, continue reading continuation frames
+        } elsif ($opcode == 0x00) {
+            # Continuation frame
+            $message .= $payload;
+            return $message if $fin; # Complete fragmented message
+        } elsif ($opcode == 0x08) {
+            # Close frame
+            my $code = $len >= 2 ? unpack('n', substr($payload, 0, 2)) : 0;
+            my $reason = $len > 2 ? substr($payload, 2) : '';
+            die "WS closed by server (code: $code, reason: $reason)";
+        } elsif ($opcode == 0x09) {
+            # Ping frame - respond with pong
+            my $pong_hdr = pack('C', 0x8A); # FIN=1, opcode=0xA
+            my $pong_len;
+            if ($len <= 125)       { $pong_len = pack('C', $len); }
+            elsif ($len <= 0xFFFF) { $pong_len = pack('C n', 126, $len); }
+            else                   { $pong_len = pack('C Q>', 127, $len); }
+            $sock->syswrite($pong_hdr . $pong_len . $payload);
+            # Continue reading next frame
+        } elsif ($opcode == 0x0A) {
+            # Pong frame - ignore and continue
+        } else {
+            die "WS: unexpected opcode $opcode";
+        }
     }
-    my $mask_key = '';
-    if ($masked) { _ws_read_exact($sock, \$mask_key, 4) or die "WS unexpected mask"; }
-    my $payload = '';
-    _ws_read_exact($sock, \$payload, $len) or die "WS payload read fail";
-    if ($masked) { $payload = _xor_mask($payload, $mask_key); }
-    return $payload;
 }
 sub _ws_rpc {
     my ($conn, $obj) = @_;

@@ -666,7 +666,7 @@ get_installed_prerelease_status() {
 
     if [[ -z "$version" ]]; then
         echo "false"
-        return 1
+        return 0
     fi
 
     # Fetch release data from GitHub for this version
@@ -674,7 +674,7 @@ get_installed_prerelease_status() {
     release_data=$(github_api_call "/releases/tags/v${version}" 2>/dev/null) || {
         # If API call fails, assume not a pre-release
         echo "false"
-        return 1
+        return 0
     }
 
     get_release_prerelease_status "$release_data"
