@@ -4,6 +4,14 @@ Common issues and solutions for the TrueNAS Proxmox VE Storage Plugin.
 
 ## Table of Contents
 
+- [Installer Issues](#installer-issues)
+  - [Installation Failed](#installation-failed)
+  - [Missing Dependencies](#missing-dependencies)
+  - [Permission Denied](#permission-denied)
+  - [GitHub API Rate Limiting](#github-api-rate-limiting)
+  - [Service Restart Failures](#service-restart-failures)
+  - [Configuration Wizard Issues](#configuration-wizard-issues)
+  - [Health Check Failures](#health-check-failures)
 - [About Plugin Error Messages](#about-plugin-error-messages)
 - [Storage Status Issues](#storage-status-issues)
   - [Storage Shows as Inactive](#storage-shows-as-inactive)
@@ -14,6 +22,15 @@ Common issues and solutions for the TrueNAS Proxmox VE Storage Plugin.
   - ["Could not discover iSCSI targets"](#could-not-discover-iscsi-targets)
   - ["Could not resolve iSCSI target ID for configured IQN"](#could-not-resolve-iscsi-target-id-for-configured-iqn)
   - [iSCSI Session Issues](#iscsi-session-issues)
+- [NVMe/TCP Connection Issues](#nvmetcp-connection-issues)
+  - ["nvme-cli is not installed"](#nvme-cli-is-not-installed)
+  - ["Could not determine host NQN"](#could-not-determine-host-nqn)
+  - ["Failed to connect to any NVMe/TCP portal"](#failed-to-connect-to-any-nvmetcp-portal)
+  - [DH-CHAP Authentication Failures](#dh-chap-authentication-failures)
+- [NVMe/TCP Namespace Issues](#nvmetcp-namespace-issues)
+  - ["Could not locate NVMe device for UUID"](#could-not-locate-nvme-device-for-uuid)
+  - [Namespace Creation Fails](#namespace-creation-fails)
+  - ["REST API not supported for NVMe-oF operations"](#rest-api-not-supported-for-nvme-of-operations)
 - [Volume Creation Issues](#volume-creation-issues)
   - ["Failed to create iSCSI extent for disk"](#failed-to-create-iscsi-extent-for-disk)
   - ["Insufficient space on dataset"](#insufficient-space-on-dataset)
@@ -38,6 +55,484 @@ Common issues and solutions for the TrueNAS Proxmox VE Storage Plugin.
   - [Storage Diagnostics](#storage-diagnostics)
   - [Enable Debug Logging](#enable-debug-logging)
 - [Getting Help](#getting-help)
+
+---
+
+## Installer Issues
+
+The automated installer ([install.sh](../install.sh)) handles most installation scenarios, but you may encounter issues. This section covers common installer problems and solutions.
+
+### Installation Failed
+
+**Symptom**: Installer exits with error during plugin installation
+
+**Common Errors**:
+
+**"Plugin syntax validation failed"**
+```bash
+ERROR: Plugin syntax validation failed
+Perl compilation check returned errors
+
+# This indicates the downloaded plugin file has syntax errors
+```
+
+**Solution**:
+```bash
+# Check if download was interrupted
+ls -lh /tmp/TrueNASPlugin.pm.download
+
+# Try downloading manually to verify file integrity
+wget https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/TrueNASPlugin.pm
+
+# Check syntax manually
+perl -c TrueNASPlugin.pm
+
+# If syntax is valid, try installer again
+./install.sh
+```
+
+**"Failed to restart Proxmox services"**
+```bash
+ERROR: Failed to restart pvedaemon
+Services could not be restarted properly
+
+# Plugin was installed but services didn't restart
+```
+
+**Solution**:
+```bash
+# Check service status
+systemctl status pvedaemon pveproxy
+
+# Check for conflicts or errors
+journalctl -u pvedaemon -n 50
+journalctl -u pveproxy -n 50
+
+# Try manual restart
+systemctl restart pvedaemon
+systemctl restart pveproxy
+
+# If services won't start, check plugin syntax
+perl -c /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
+
+# Rollback if needed
+./install.sh
+# Choose: "Rollback to previous version"
+```
+
+### Missing Dependencies
+
+**Symptom**: Installer exits with "Missing dependency" error
+
+**Common Messages**:
+```bash
+ERROR: Required dependency 'curl' or 'wget' not found
+Please install: apt-get install curl wget
+
+ERROR: Required dependency 'perl' not found
+Please install: apt-get install perl
+```
+
+**Solution**:
+```bash
+# Update package lists
+apt-get update
+
+# Install all common dependencies
+apt-get install curl wget perl
+
+# For minimal systems, install just what's needed
+# Either curl or wget (at least one required)
+apt-get install curl
+# OR
+apt-get install wget
+
+# Verify installations
+which curl wget perl
+
+# Run installer again
+./install.sh
+```
+
+### Permission Denied
+
+**Symptom**: "Permission denied" or "Must run as root"
+
+**Error Messages**:
+```bash
+ERROR: This script must be run as root
+Please run: sudo ./install.sh
+
+ERROR: Permission denied: /usr/share/perl5/PVE/Storage/Custom/
+Cannot write to plugin directory
+```
+
+**Solutions**:
+
+**Not running as root**:
+```bash
+# Check current user
+whoami
+
+# If not root, use sudo
+sudo ./install.sh
+
+# Or switch to root
+su -
+./install.sh
+```
+
+**Directory permissions issue**:
+```bash
+# Check plugin directory permissions
+ls -ld /usr/share/perl5/PVE/Storage/Custom/
+
+# Should be: drwxr-xr-x root root
+
+# Fix permissions if needed (as root)
+mkdir -p /usr/share/perl5/PVE/Storage/Custom/
+chown root:root /usr/share/perl5/PVE/Storage/Custom/
+chmod 755 /usr/share/perl5/PVE/Storage/Custom/
+```
+
+### GitHub API Rate Limiting
+
+**Symptom**: Cannot download plugin, GitHub API returns rate limit error
+
+**Error Message**:
+```bash
+ERROR: GitHub API rate limit exceeded
+API requests remaining: 0/60
+Rate limit resets at: 2025-10-25 15:30:00
+
+Please try again after the reset time, or use a GitHub token for higher limits
+```
+
+**Solutions**:
+
+**Option 1: Wait for rate limit reset**
+```bash
+# Wait until the reset time shown in error message
+# Default limit is 60 requests/hour for unauthenticated requests
+
+# Check current rate limit status
+curl -s https://api.github.com/rate_limit
+```
+
+**Option 2: Use GitHub token (higher limits)**
+```bash
+# Create GitHub personal access token:
+# 1. Go to https://github.com/settings/tokens
+# 2. Click "Generate new token (classic)"
+# 3. Give it a name: "Proxmox Installer"
+# 4. Select scopes: public_repo (read-only access)
+# 5. Click "Generate token"
+# 6. Copy the token
+
+# Set token environment variable
+export GITHUB_TOKEN="ghp_yourTokenHere"
+
+# Run installer (will use token for API requests)
+./install.sh
+
+# Or pass inline
+GITHUB_TOKEN="ghp_yourTokenHere" ./install.sh
+```
+
+**Option 3: Manual installation**
+```bash
+# Download plugin manually
+wget https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/TrueNASPlugin.pm
+
+# Install manually
+cp TrueNASPlugin.pm /usr/share/perl5/PVE/Storage/Custom/
+chmod 644 /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
+systemctl restart pvedaemon pveproxy
+```
+
+### Service Restart Failures
+
+**Symptom**: Plugin installed but Proxmox services won't restart
+
+**Error Messages**:
+```bash
+ERROR: Service pvedaemon failed to start
+Service status: failed (Result: exit-code)
+
+WARNING: Service pveproxy is not running
+Please check service status manually
+```
+
+**Diagnosis**:
+```bash
+# Check service status
+systemctl status pvedaemon
+systemctl status pveproxy
+
+# View detailed errors
+journalctl -u pvedaemon -n 100
+journalctl -u pveproxy -n 100
+
+# Check plugin syntax
+perl -c /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
+
+# Look for Perl module dependencies
+grep -i "can't locate" /var/log/syslog
+```
+
+**Solutions**:
+
+**Plugin syntax error**:
+```bash
+# If perl -c shows errors, rollback
+./install.sh
+# Choose: "Rollback to previous version"
+
+# Report issue on GitHub if latest version has syntax errors
+```
+
+**Missing Perl modules**:
+```bash
+# Install common Perl modules
+apt-get install libwww-perl libjson-perl libhttp-message-perl
+
+# Restart services
+systemctl restart pvedaemon pveproxy
+```
+
+**Configuration conflict**:
+```bash
+# Check storage configuration
+cat /etc/pve/storage.cfg
+
+# Look for syntax errors or invalid parameters
+# Comment out problematic storage entries temporarily
+
+# Restart services
+systemctl restart pvedaemon pveproxy
+```
+
+### Configuration Wizard Issues
+
+**Symptom**: Configuration wizard fails to save or validate settings
+
+**Common Issues**:
+
+**"TrueNAS API connectivity test failed"**
+```bash
+# Wizard shows:
+✗ TrueNAS API connectivity test failed
+Could not connect to https://192.168.1.100/api/v2.0/system/info
+
+# Common causes:
+# 1. TrueNAS IP incorrect or unreachable
+# 2. API key invalid or expired
+# 3. Firewall blocking port 443/80
+# 4. TrueNAS API service not running
+```
+
+**Solutions**:
+```bash
+# Test connectivity manually
+ping 192.168.1.100
+
+# Test API access (replace IP and API key)
+curl -k -H "Authorization: Bearer 1-YOUR-API-KEY" \
+  https://192.168.1.100/api/v2.0/system/info
+
+# Should return JSON with system info
+
+# Check TrueNAS API service
+# In TrueNAS web UI: System Settings → Services → Middleware (should be running)
+
+# Verify API key is valid
+# In TrueNAS web UI: Credentials → Local Users → [user] → Edit
+# Check that API key section shows active key
+```
+
+**"Dataset does not exist on TrueNAS"**
+```bash
+# Wizard shows:
+✗ Dataset 'tank/proxmox' not found on TrueNAS
+
+# Dataset doesn't exist or API can't access it
+```
+
+**Solutions**:
+```bash
+# Check dataset exists on TrueNAS
+ssh root@truenas-ip
+zfs list tank/proxmox
+
+# If dataset doesn't exist, create it
+zfs create tank/proxmox
+zfs set compression=lz4 tank/proxmox
+
+# If dataset exists but wizard can't see it:
+# - Verify API key has permissions
+# - Check dataset name format (no trailing slashes)
+# - Ensure pool is mounted
+```
+
+**"Failed to write to storage.cfg"**
+```bash
+ERROR: Failed to write configuration to /etc/pve/storage.cfg
+Permission denied
+
+# Installer can't modify storage configuration
+```
+
+**Solutions**:
+```bash
+# Verify running as root
+whoami  # Should show "root"
+
+# Check /etc/pve is mounted (cluster filesystem)
+mount | grep /etc/pve
+
+# Should show: pve-cluster on /etc/pve
+
+# If not mounted (cluster issue):
+systemctl status pve-cluster
+systemctl restart pve-cluster
+
+# Check storage.cfg permissions
+ls -l /etc/pve/storage.cfg
+
+# Manual configuration (if wizard fails)
+nano /etc/pve/storage.cfg
+
+# Add configuration manually:
+truenasplugin: truenas-storage
+    api_host 192.168.1.100
+    api_key 1-your-api-key
+    target_iqn iqn.2005-10.org.freenas.ctl:proxmox
+    dataset tank/proxmox
+    discovery_portal 192.168.1.100:3260
+    content images
+    shared 1
+```
+
+### Health Check Failures
+
+**Symptom**: Health check reports failures after installation
+
+**Common Failures**:
+
+**"Plugin file not found"**
+```bash
+✗ Plugin file exists
+File not found: /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
+
+# Plugin wasn't installed correctly
+```
+
+**Solution**:
+```bash
+# Verify installation
+ls -l /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
+
+# If missing, reinstall
+./install.sh
+# Choose: "Install latest version"
+```
+
+**"No storage configuration found"**
+```bash
+✗ Storage configuration found
+No 'truenasplugin' entries in /etc/pve/storage.cfg
+
+# Storage not configured yet
+```
+
+**Solution**:
+```bash
+# Run configuration wizard
+./install.sh
+# Choose: "Configure storage"
+
+# Or check if storage.cfg has entries
+grep truenasplugin /etc/pve/storage.cfg
+```
+
+**"iSCSI sessions not established"**
+```bash
+⚠ iSCSI sessions established
+Warning: No active iSCSI sessions found
+
+# No volumes created yet, or iSCSI login failed
+```
+
+**Solution**:
+```bash
+# This is normal if no VMs are using TrueNAS storage yet
+# Create a test volume to verify iSCSI:
+pvesm alloc truenas-storage 999 test-disk-0 1G
+
+# Check iSCSI sessions
+iscsiadm -m session
+
+# Should show session to TrueNAS IP
+
+# Clean up test volume
+pvesm free truenas-storage:vm-999-disk-0-lun1
+```
+
+**"Service not running"**
+```bash
+✗ Service pvedaemon running
+Status: inactive (dead)
+
+# Critical Proxmox service not running
+```
+
+**Solution**:
+```bash
+# Start service
+systemctl start pvedaemon
+
+# Check for errors
+systemctl status pvedaemon
+journalctl -u pvedaemon -n 50
+
+# If won't start, check plugin syntax
+perl -c /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
+
+# Rollback if plugin is causing issues
+./install.sh
+# Choose: "Rollback to previous version"
+```
+
+### Installer Logs
+
+**Location**: `/var/log/truenas-installer.log`
+
+**Viewing logs**:
+```bash
+# View all logs
+cat /var/log/truenas-installer.log
+
+# View recent logs
+tail -n 100 /var/log/truenas-installer.log
+
+# Follow logs in real-time
+tail -f /var/log/truenas-installer.log
+
+# Search for errors
+grep ERROR /var/log/truenas-installer.log
+
+# Search for specific operation
+grep "Installing plugin" /var/log/truenas-installer.log
+```
+
+**Log format**:
+```
+[2025-10-25 14:32:15] INFO: Installer started (v1.0.0)
+[2025-10-25 14:32:16] INFO: Detected cluster: 3 nodes
+[2025-10-25 14:32:17] INFO: Downloading plugin v1.0.7...
+[2025-10-25 14:32:18] SUCCESS: Plugin installed successfully
+[2025-10-25 14:32:20] ERROR: Failed to restart pvedaemon
+```
 
 ---
 
@@ -334,6 +829,417 @@ iscsiadm -m node -T iqn.2005-10.org.freenas.ctl:proxmox --logout
 iscsiadm -m node -T iqn.2005-10.org.freenas.ctl:proxmox \
   -p YOUR_TRUENAS_IP:3260 --login
 ```
+
+## NVMe/TCP Connection Issues
+
+These issues are specific to `transport_mode nvme-tcp` configurations. For iSCSI issues, see the previous section.
+
+### "nvme-cli is not installed"
+
+**Symptom**: Plugin reports nvme-cli package is missing
+
+**Error Message**:
+```
+ERROR: nvme-cli is not installed on this system
+NVMe/TCP transport requires nvme-cli package
+```
+
+**Solution**:
+```bash
+# Install nvme-cli package
+apt-get update
+apt-get install nvme-cli
+
+# Verify installation
+nvme version
+# Expected: nvme version 2.x or later
+```
+
+**Verify nvme-cli is working**:
+```bash
+# Check for NVMe devices (should work even without targets)
+nvme list
+
+# If command not found, reinstall
+apt-get install --reinstall nvme-cli
+```
+
+### "Could not determine host NQN"
+
+**Symptom**: Plugin cannot find the host NQN identifier
+
+**Error Message**:
+```
+ERROR: Could not determine host NQN
+No hostnqn configured and /etc/nvme/hostnqn does not exist
+```
+
+**Diagnosis**:
+```bash
+# Check if hostnqn file exists
+cat /etc/nvme/hostnqn
+
+# If missing or empty, generate one
+```
+
+**Solutions**:
+
+#### 1. Generate Host NQN
+```bash
+# Generate new host NQN
+nvme gen-hostnqn > /etc/nvme/hostnqn
+
+# Verify it was created
+cat /etc/nvme/hostnqn
+# Example output: nqn.2014-08.org.nvmexpress:uuid:81d0b800-0d47-11ea-a719-d0fedbf91400
+```
+
+#### 2. Configure Explicit Host NQN
+```bash
+# Alternative: Set hostnqn in storage.cfg
+nano /etc/pve/storage.cfg
+
+# Add to NVMe storage configuration:
+hostnqn nqn.2014-08.org.nvmexpress:uuid:your-custom-uuid
+```
+
+### "Failed to connect to any NVMe/TCP portal"
+
+**Symptom**: Cannot establish NVMe/TCP connection to TrueNAS
+
+**Error Message**:
+```
+ERROR: Failed to connect to any NVMe/TCP portal
+Attempted portals:
+  - 192.168.1.100:4420 (failed: connection refused)
+```
+
+**Diagnosis**:
+```bash
+# Check if subsystem is already connected
+nvme list-subsys
+
+# Check for NVMe devices
+nvme list
+
+# Test network connectivity
+ping 192.168.1.100
+telnet 192.168.1.100 4420
+```
+
+**Solutions**:
+
+#### 1. Verify TrueNAS NVMe-oF Service
+```bash
+# Check service status via API
+curl -k -X GET 'https://TRUENAS_IP/api/v2.0/service?service=nvmet' \
+  -H 'Authorization: Bearer YOUR_API_KEY'
+
+# Should show: "state": "RUNNING"
+
+# Start service if not running
+curl -k -X POST 'https://TRUENAS_IP/api/v2.0/service/start' \
+  -H 'Authorization: Bearer YOUR_API_KEY' \
+  -H 'Content-Type: application/json' \
+  -d '{"service": "nvmet"}'
+```
+
+In TrueNAS Web UI:
+- Navigate to **System Settings** → **Services**
+- Find **NVMe-oF Target**
+- Click toggle to start
+- (Optional) Enable **Start Automatically**
+
+#### 2. Check Network Connectivity
+```bash
+# Verify portal IP is reachable
+ping -c 3 192.168.1.100
+
+# Test NVMe/TCP port (4420)
+telnet 192.168.1.100 4420
+# Should connect successfully (Ctrl+C to exit)
+
+# If blocked, check firewalls:
+# - TrueNAS firewall rules
+# - Network firewall/ACLs
+# - Proxmox iptables
+```
+
+#### 3. Verify Portal Configuration
+```bash
+# Check TrueNAS NVMe ports
+curl -k -X GET 'https://TRUENAS_IP/api/v2.0/nvmet/port' \
+  -H 'Authorization: Bearer YOUR_API_KEY'
+
+# Should show port 4420 listening on 0.0.0.0 or specific IPs
+# Example output:
+# {
+#   "addr_trtype": "TCP",
+#   "addr_trsvcid": 4420,
+#   "addr_traddr": "0.0.0.0"
+# }
+```
+
+#### 4. Check Storage Configuration
+```bash
+# Verify discovery_portal in storage.cfg
+grep discovery_portal /etc/pve/storage.cfg
+
+# For NVMe/TCP, should be IP:4420 (not 3260)
+discovery_portal 192.168.1.100:4420
+
+# Verify subsystem_nqn is correctly formatted
+grep subsystem_nqn /etc/pve/storage.cfg
+# Should start with nqn.YYYY-MM.
+```
+
+#### 5. Manual Connection Test
+```bash
+# Try manual NVMe/TCP connection
+nvme connect -t tcp \
+  -n nqn.2005-10.org.freenas.ctl:proxmox-test \
+  -a 192.168.1.100 \
+  -s 4420
+
+# Check if connection succeeded
+nvme list-subsys | grep -A 5 "proxmox-test"
+
+# Disconnect after test
+nvme disconnect -n nqn.2005-10.org.freenas.ctl:proxmox-test
+```
+
+### DH-CHAP Authentication Failures
+
+**Symptom**: Connection fails with authentication errors when using DH-CHAP secrets
+
+**Error Message**:
+```
+ERROR: NVMe connect failed: authentication failed
+Controller rejected host authentication
+```
+
+**Diagnosis**:
+```bash
+# Check kernel logs for auth errors
+dmesg | grep -i nvme | grep -i auth
+
+# Verify secrets are configured
+grep nvme_dhchap /etc/pve/storage.cfg
+```
+
+**Solutions**:
+
+#### 1. Verify Secret Matching
+```bash
+# Check TrueNAS host configuration
+curl -k -X GET 'https://TRUENAS_IP/api/v2.0/nvmet/host' \
+  -H 'Authorization: Bearer YOUR_API_KEY'
+
+# Compare hostnqn and dhchap_key with Proxmox configuration
+cat /etc/nvme/hostnqn
+grep nvme_dhchap_secret /etc/pve/storage.cfg
+```
+
+**The host NQN and secret must match exactly between Proxmox and TrueNAS.**
+
+#### 2. Regenerate Secrets
+```bash
+# Generate new host secret
+nvme gen-dhchap-key /dev/nvme0 --key-length=32 --hmac=1
+# Output: DHHC-1:01:base64data...
+
+# Update on both sides:
+# 1. Proxmox: Add to storage.cfg as nvme_dhchap_secret
+# 2. TrueNAS: Update via API or GUI for the host NQN
+```
+
+#### 3. Check Subsystem Access Control
+```bash
+# Verify subsystem allows host
+curl -k -X GET 'https://TRUENAS_IP/api/v2.0/nvmet/subsys' \
+  -H 'Authorization: Bearer YOUR_API_KEY'
+
+# Check allow_any_host setting
+# If false, host must be explicitly linked to subsystem
+```
+
+#### 4. Test Without Authentication
+```bash
+# Temporarily remove DH-CHAP secrets to test connectivity
+nano /etc/pve/storage.cfg
+
+# Comment out secrets:
+# nvme_dhchap_secret DHHC-1:01:...
+# nvme_dhchap_ctrl_secret DHHC-1:01:...
+
+# Set subsystem allow_any_host = true in TrueNAS
+
+# Restart pvedaemon
+systemctl restart pvedaemon
+
+# Try creating a test volume
+# If this works, the issue is with authentication configuration
+```
+
+## NVMe/TCP Namespace Issues
+
+### "Could not locate NVMe device for UUID"
+
+**Symptom**: Namespace created but device path not found
+
+**Error Message**:
+```
+ERROR: Could not locate NVMe device for UUID after 5 seconds
+Expected device: /dev/disk/by-id/nvme-uuid.550e8400-e29b-41d4-a716-446655440000
+```
+
+**Diagnosis**:
+```bash
+# Check if subsystem is connected
+nvme list-subsys | grep -i <subsystem_nqn>
+
+# List NVMe devices
+nvme list
+
+# Check for UUID symlinks
+ls -la /dev/disk/by-id/nvme-uuid.*
+```
+
+**Solutions**:
+
+#### 1. Verify Subsystem Connection
+```bash
+# Check if subsystem shows as connected
+nvme list-subsys
+
+# Look for your subsystem with "live" status:
+# nvme-subsysX - NQN=nqn.2005-10.org.freenas.ctl:proxmox-test
+# \
+#  +- nvmeX tcp traddr=192.168.1.100,trsvcid=4420 live
+
+# If not connected, connection failed
+# See "Failed to connect to any NVMe/TCP portal" section above
+```
+
+#### 2. Trigger udev Rescan
+```bash
+# Manually settle udev events
+udevadm settle
+
+# Wait a moment
+sleep 2
+
+# Check for device again
+ls -la /dev/disk/by-id/nvme-uuid.*
+
+# Reload udev rules if needed
+udevadm control --reload-rules
+udevadm trigger
+```
+
+#### 3. Verify Namespace Exists on TrueNAS
+```bash
+# Check TrueNAS namespaces
+curl -k -X GET 'https://TRUENAS_IP/api/v2.0/nvmet/namespace' \
+  -H 'Authorization: Bearer YOUR_API_KEY'
+
+# Look for namespace with matching device_uuid
+# Verify it's enabled and associated with correct subsystem
+```
+
+#### 4. Check Kernel Logs
+```bash
+# Look for NVMe errors
+dmesg | grep -i nvme | tail -50
+
+# Look for device discovery messages
+dmesg | grep -i "nvme.*namespace"
+```
+
+### Namespace Creation Fails
+
+**Symptom**: Cannot create NVMe namespace on TrueNAS
+
+**Error Messages**:
+```
+ERROR: Failed to create NVMe namespace
+TrueNAS API returned error: subsystem not found
+```
+
+**Solutions**:
+
+#### 1. Verify NVMe-oF Service Running
+```bash
+# Check service status
+curl -k -X GET 'https://TRUENAS_IP/api/v2.0/service?service=nvmet' \
+  -H 'Authorization: Bearer YOUR_API_KEY'
+
+# Must show "state": "RUNNING"
+```
+
+#### 2. Check Dataset Exists
+```bash
+# Verify ZFS dataset configured in storage.cfg exists
+curl -k -X GET 'https://TRUENAS_IP/api/v2.0/pool/dataset/id/tank%2Fproxmox' \
+  -H 'Authorization: Bearer YOUR_API_KEY'
+
+# Replace tank/proxmox with your dataset path (URL-encoded)
+# %2F = / (slash)
+```
+
+#### 3. Verify WebSocket API Transport
+```bash
+# NVMe operations require WebSocket transport
+grep api_transport /etc/pve/storage.cfg
+
+# Must be:
+api_transport ws
+
+# NOT:
+# api_transport rest  (REST does not support nvmet.* API calls)
+```
+
+#### 4. Check Subsystem Exists
+```bash
+# List subsystems
+curl -k -X GET 'https://TRUENAS_IP/api/v2.0/nvmet/subsys' \
+  -H 'Authorization: Bearer YOUR_API_KEY'
+
+# Verify subsystem with your configured subsystem_nqn exists
+# Plugin should auto-create it, but may fail if service issues
+```
+
+### "REST API not supported for NVMe-oF operations"
+
+**Symptom**: NVMe operations fail with API transport error
+
+**Error Message**:
+```
+ERROR: REST API not supported for NVMe-oF operations
+NVMe namespace management requires WebSocket transport
+Please set api_transport = ws in storage configuration
+```
+
+**Solution**:
+```bash
+# Edit storage configuration
+nano /etc/pve/storage.cfg
+
+# Find your NVMe storage configuration
+# Add or change to WebSocket transport:
+truenasplugin: truenas-nvme
+    api_transport ws
+    api_scheme wss
+    # ... other parameters
+
+# Restart Proxmox services
+systemctl restart pvedaemon pveproxy
+```
+
+**Why WebSocket is Required**:
+- TrueNAS `nvmet.*` API endpoints (subsystem, namespace, port) only work via WebSocket
+- REST API does not expose these endpoints
+- This is a TrueNAS SCALE limitation, not a plugin limitation
 
 ## Volume Creation Issues
 

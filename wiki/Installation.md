@@ -2,6 +2,609 @@
 
 Complete installation instructions for the TrueNAS Proxmox VE Storage Plugin.
 
+## Table of Contents
+- [Automated Installation (Recommended)](#automated-installation-recommended)
+- [Manual Installation](#manual-installation)
+- [Requirements](#requirements)
+- [TrueNAS SCALE Setup](#truenas-scale-setup)
+- [Post-Installation Verification](#post-installation-verification)
+- [Troubleshooting Installation](#troubleshooting-installation)
+
+## Automated Installation (Recommended)
+
+The TrueNAS plugin includes a comprehensive automated installer that handles installation, updates, configuration, and management through an interactive menu system.
+
+### Quick Start - One-Line Installation
+
+Install the plugin with a single command:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash
+```
+
+Or using curl:
+```bash
+curl -sSL https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash
+```
+
+The installer will:
+1. ✅ Check for required dependencies (curl/wget, perl)
+2. ✅ Download the latest plugin from GitHub
+3. ✅ Validate plugin syntax before installation
+4. ✅ Install to the correct directory with proper permissions
+5. ✅ Restart Proxmox services automatically
+6. ✅ Offer to configure storage immediately
+7. ✅ Run optional health checks
+
+### Installer Features
+
+#### Interactive Menu System
+After installation, the installer provides a full-featured management interface:
+
+```
+╔══════════════════════════════════════════════════════════╗
+║              TRUENAS PROXMOX VE PLUGIN                   ║
+║                  Installer v1.0.0                        ║
+╚══════════════════════════════════════════════════════════╝
+
+Plugin Status: Installed (v1.0.6)
+Update Available: v1.0.7
+
+Main Menu:
+  1) Update plugin
+  2) Install specific version
+  3) Configure storage
+  4) Diagnostics
+  5) Manage backups
+  6) Rollback to previous version
+  7) Uninstall plugin
+  8) Exit
+
+Choose an option:
+```
+
+#### Available Operations
+
+**Installation & Updates**
+- Install latest version from GitHub
+- Install specific version (numbered version selection, no typing required)
+- Update plugin with sub-menu for local or cluster-wide update
+- Automatic update detection and notification
+
+**Configuration Management**
+- Interactive configuration wizard
+- Add, edit, or delete storage configurations
+- Delete storage with typed confirmation (storage name must be entered exactly)
+- Transport mode selection (iSCSI or NVMe/TCP)
+- Guided setup for all storage parameters
+- Input validation (IP addresses, API keys, dataset names, NQNs)
+- TrueNAS API connectivity testing
+- Dataset verification via API
+- Automatic portal discovery for multipath configuration
+- Transport-specific checks (nvme-cli for NVMe/TCP, multipath-tools for iSCSI)
+- Automatic backup of storage.cfg
+
+**Diagnostics Menu**
+- Unified diagnostics menu for troubleshooting and maintenance
+- 12-point comprehensive health validation
+  - Transport-aware validation (iSCSI and NVMe/TCP)
+  - Plugin file verification and syntax check
+  - Storage configuration validation
+  - TrueNAS API connectivity test
+  - iSCSI session monitoring or NVMe connection verification
+  - Multipath status check (dm-multipath for iSCSI, native for NVMe)
+  - Orphaned resource detection (iSCSI only)
+  - Service verification (pvedaemon, pveproxy)
+- Integrated orphan cleanup functionality
+  - Detects orphaned iSCSI extents, zvols, and target-extent mappings
+  - Displays detailed orphan list with reasons
+  - Typed "DELETE" confirmation required for safety
+  - Ordered deletion (mappings, then extents, then zvols)
+- Integrated plugin function testing
+  - 8 core tests validating plugin operations (storage, volumes, snapshots, clones, resize, VM lifecycle)
+  - Interactive confirmation with typed "ACCEPT"
+  - Storage selection from configured TrueNAS storages
+  - Health-check style display with spinners and inline status
+  - Automatic cleanup of test VMs
+  - Dynamic VM ID selection (990+)
+- Color-coded status indicators
+- Animated spinners during checks
+
+**Backup & Recovery**
+- Automatic backup before any changes
+- Timestamped backup files with version info
+- View all backups with statistics
+- Rollback to any previous version
+- Backup management (delete old backups, keep latest N)
+- Smart cleanup with age/count/size thresholds
+
+**Cluster Support**
+- Automatic cluster node detection
+- Cluster-wide installation from single command
+- SSH connectivity validation
+- Sequential remote installation with progress tracking
+- Automatic retry logic for failed nodes
+- Per-node success/failure reporting
+
+### Command-Line Options
+
+```bash
+# Display installer version
+./install.sh --version
+
+# Show help and usage information
+./install.sh --help
+
+# Non-interactive mode (for automation/scripts)
+./install.sh --non-interactive
+```
+
+### Non-Interactive Installation
+
+For automation or CI/CD pipelines:
+
+```bash
+# Download and install automatically
+wget -qO- https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash -s -- --non-interactive
+```
+
+Or download first:
+```bash
+# Download installer
+wget https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh
+chmod +x install.sh
+
+# Run in non-interactive mode
+./install.sh --non-interactive
+```
+
+Non-interactive mode will:
+- Install the latest plugin version automatically
+- Skip all interactive prompts
+- Use safe defaults for all options
+- Log all actions to `/var/log/truenas-installer.log`
+- Exit with appropriate status codes (0=success, 1=error)
+
+### Installer Workflow Examples
+
+#### First-Time Installation
+```bash
+# Run the one-liner
+wget -qO- https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash
+
+# Installer will:
+# 1. Download and install plugin v1.0.7 (latest)
+# 2. Prompt: "Would you like to configure storage now? (Y/n)"
+# 3. If yes: Launch configuration wizard
+# 4. Prompt: "Would you like to run a health check? (Y/n)"
+# 5. If yes: Run 11-point health validation
+# 6. Display next steps and documentation links
+```
+
+#### Updating Existing Installation
+```bash
+# Run the installer again
+./install.sh
+
+# Main menu will show:
+# "Plugin Status: Installed (v1.0.6)"
+# "Update Available: v1.0.7"
+
+# Choose option 1: "Update plugin"
+# Sub-menu will present:
+#   1) Update this node only
+#   2) Update all cluster nodes (if cluster detected)
+#   0) Cancel
+
+# After selecting update target, installer will:
+# 1. Create backup of v1.0.6
+# 2. Download and install v1.0.7
+# 3. Validate syntax
+# 4. Restart services
+# 5. Offer to run health check
+```
+
+#### Configuration Wizard
+```bash
+# From main menu, choose "Configure storage"
+
+# If existing storages found, sub-menu appears:
+#   1) Edit an existing storage
+#   2) Add a new storage
+#   3) Delete a storage
+#   0) Cancel
+
+# === Adding New Storage ===
+# Wizard will prompt for:
+Storage name (e.g., 'truenas-storage'): truenas-prod
+TrueNAS IP address: 192.168.1.100
+TrueNAS API key: 1-abc123def456...
+ZFS dataset path: tank/proxmox
+
+# Transport mode selection:
+Select transport protocol:
+  1) iSCSI (traditional, widely compatible)
+  2) NVMe/TCP (modern, lower latency)
+Transport mode (1-2) [1]: 1
+
+# === If iSCSI selected ===
+iSCSI target IQN: iqn.2005-10.org.freenas.ctl:proxmox
+Portal IP (optional, press Enter to use TrueNAS IP): 192.168.1.100
+Block size [16k]: 16k
+Enable sparse volumes? (0/1) [1]: 1
+
+# Advanced Options:
+Enable multipath I/O for redundancy/load balancing? (y/N): y
+
+# If multipath enabled, wizard will:
+# ✓ Check for multipath-tools package installation (iSCSI)
+# ✓ Discover available portal IPs from TrueNAS network interfaces
+# ✓ Present selectable list of discovered portals
+# ✓ Allow manual portal entry if discovery fails
+# ✓ Warn if no additional portals configured
+
+# === If NVMe/TCP selected ===
+# ✓ Checks for nvme-cli package (offers to install if missing)
+# ✓ Auto-populates host NQN from /etc/nvme/hostnqn (or generates one)
+NVMe subsystem NQN (e.g., nqn.2005-10.org.freenas.ctl:proxmox): nqn.2005-10.org.freenas.ctl:proxmox-nvme
+Portal IP (default: 192.168.1.100:4420): 192.168.1.100:4420
+Block size [16k]: 16k
+Enable sparse volumes? (0/1) [1]: 1
+
+# NVMe/TCP uses native kernel multipath:
+# ✓ Detects native NVMe multipath status
+# ✓ Discovers available portals (port 4420)
+# ✓ No dm-multipath required
+
+# Example multipath portal selection:
+Discovering available portals from TrueNAS...
+Found available portal IPs:
+  1) 192.168.1.101
+  2) 192.168.1.102
+  3) 192.168.2.100
+
+Select additional portals for multipath (space-separated numbers, e.g., '1 2')
+Note: Portals should be on different subnets for proper multipath operation
+Portal numbers (or press Enter to skip): 1 2
+
+# Wizard then:
+# ✓ Tests TrueNAS API connectivity
+# ✓ Verifies dataset exists
+# ✓ Generates configuration block with transport-specific settings
+# ✓ Shows preview for review
+# ✓ Backs up /etc/pve/storage.cfg
+# ✓ Appends new configuration
+# ✓ Confirms success
+# ✓ Provides transport-specific verification commands
+
+# === Deleting Storage ===
+# Select "Delete a storage" from configuration menu
+# Choose storage from numbered list
+# Warning displayed about implications (VMs will lose disk access)
+# Type exact storage name to confirm deletion
+# Storage block removed from /etc/pve/storage.cfg
+# Optionally run orphan cleanup if iSCSI storage
+```
+
+#### Diagnostics Menu
+```bash
+# From main menu, choose "Diagnostics"
+
+# Diagnostics sub-menu:
+#   1) Run health check
+#   2) Cleanup orphaned resources
+#   3) Run plugin function test
+#   0) Back to main menu
+
+# === Option 1: Health Check ===
+# Select storage from list
+# Screen clears and displays "Health Check" header
+# Shows "Running health check on storage: X" message
+# Health check validates (with spinners and 30-character label formatting):
+# Plugin file:                   ✓ Installed v1.1.3
+# Storage configuration:         ✓ Configured
+# Storage status:                ✓ Active (space usage shown)
+# Content type:                  ✓ images
+# TrueNAS API:                   ✓ Reachable on IP:port
+# Dataset:                       ✓ dataset/path
+# Target IQN/Subsystem NQN:      ✓ (transport-specific)
+# Discovery portal:              ✓ IP:port
+# iSCSI sessions/NVMe connections: ✓ (transport-specific)
+# Orphaned resources:            ✓ None detected (iSCSI only)
+# Service pvedaemon:             ✓ Running
+# Service pveproxy:              ✓ Running
+# Multipath configuration:       ✓ (dm-multipath or native NVMe, if enabled)
+
+# Summary: 12/12 checks passed (0 warnings, 0 critical)
+
+# Note: Health checks automatically detect transport mode and perform
+# transport-specific validation (iSCSI vs NVMe/TCP)
+# All labels use 30-character fixed width for consistent alignment
+
+# === Option 2: Cleanup Orphaned Resources ===
+# Select storage from list
+# Scans for orphaned iSCSI resources:
+#   - Extents pointing to deleted zvols
+#   - Zvols without corresponding extents
+#   - Target-extent mappings without extents
+# Displays detailed orphan list with reasons
+# Type "DELETE" (in caps) to confirm cleanup
+# Deletes orphans in safe order (mappings → extents → zvols)
+# Note: iSCSI only - NVMe/TCP shows unsupported message
+
+# === Option 3: Run Plugin Function Test ===
+# Displays "Plugin Function Test" header after storage selection
+# Shows test description and requirements
+# Shows what operations will be performed
+# Type "ACCEPT" (in caps) to confirm
+# Select storage to test from configured list
+# Screen clears and shows "Running plugin function test on storage: X"
+# Displays detected transport mode (iSCSI or NVMe/TCP)
+# Runs 8 comprehensive tests with 30-character label formatting:
+#   Storage accessibility         ✓ Storage active and accessible
+#   Volume creation                ✓ Created 4GB disk successfully
+#   Volume listing                 ✓ Retrieved volume configuration
+#   Snapshot operations            ✓ Snapshot created and verified
+#   Clone operations               ✓ Cloned VM from snapshot
+#   Volume resize                  ✓ Expanded disk by 1GB
+#   VM start/stop lifecycle        ✓ VM started and stopped
+#   Volume deletion                ✓ Cleaned up test resources
+# Summary: "Plugin Function Test Summary: 8/8 tests passed" (or failure count)
+# All test VMs automatically cleaned up
+# Note: Uses health-check style display with spinners and inline status updates
+# Ctrl+C gracefully interrupts with cleanup and user-friendly message
+```
+
+#### Rollback to Previous Version
+```bash
+# From main menu, choose "Rollback to previous version"
+
+# Displays available backups:
+Available Backups:
+  1) v1.0.7 - 2025-10-25 14:32:15 (2 hours ago) - 89.2 KB
+  2) v1.0.6 - 2025-10-24 09:15:42 (1 day ago) - 88.8 KB
+  3) v1.0.5 - 2025-10-20 11:22:03 (5 days ago) - 87.1 KB
+
+Select backup to restore (1-3):
+```
+
+#### Backup Management
+```bash
+# From main menu, choose "Manage backups"
+
+# Shows statistics:
+Total backups: 12 files (1.1 MB)
+Oldest: 2025-08-15 (70 days ago)
+Newest: 2025-10-25 (2 hours ago)
+
+# Options:
+1) View all backups
+2) Delete backups older than N days
+3) Keep only latest N backups
+4) Delete all backups
+5) Return to main menu
+
+# Example: Keep only latest 5
+# Installer will:
+# ✓ List backups to be deleted (7 files)
+# ✓ Confirm deletion
+# ✓ Delete old backups
+# ✓ Log actions
+# ✓ Show freed space
+```
+
+### Cluster Installation with Installer
+
+For Proxmox clusters, the installer can deploy to all nodes simultaneously:
+
+#### Option 1: Cluster-Wide Installation (Recommended)
+
+Run the installer interactively on any cluster node:
+
+```bash
+# On any cluster node
+wget https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh
+chmod +x install.sh
+./install.sh
+
+# The installer will:
+# 1. Detect cluster membership automatically
+# 2. Offer "Install latest version (all cluster nodes)" in menu
+# 3. Validate SSH connectivity to all nodes
+# 4. Install on local node first
+# 5. Deploy to all remote nodes sequentially
+# 6. Show per-node success/failure status
+# 7. Offer retry for any failed nodes
+```
+
+**Features**:
+- ✅ Single command deploys to entire cluster
+- ✅ Pre-flight SSH validation
+- ✅ Automatic backup on each node
+- ✅ Progress tracking ([1/3], [2/3], [3/3])
+- ✅ Detailed failure reporting
+- ✅ Automatic retry with 5-second backoff
+
+**Requirements**:
+- Passwordless SSH between cluster nodes (automatically configured by Proxmox)
+- Interactive mode (cluster-wide installation not available in --non-interactive)
+
+**Example Output**:
+```
+Installing TrueNAS Plugin (Cluster-Wide)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Current node: pve-m920x-1
+Remote nodes: 2
+  • pve-m920x-2 (10.15.14.196)
+  • pve-m920x-3 (10.15.14.197)
+
+Validating SSH connectivity to cluster nodes...
+  Testing pve-m920x-2 (10.15.14.196)... ✓ Reachable
+  Testing pve-m920x-3 (10.15.14.197)... ✓ Reachable
+
+All cluster nodes are reachable via SSH
+
+Installing on local node (pve-m920x-1)...
+✓ Local node installation completed
+
+Installing on remote cluster nodes...
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[1/2] pve-m920x-2 (10.15.14.196): ✓ Success
+[2/2] pve-m920x-3 (10.15.14.197): ✓ Success
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Successfully updated 3 of 3 nodes:
+  ✓ pve-m920x-1
+  ✓ pve-m920x-2
+  ✓ pve-m920x-3
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+#### Option 2: Manual Installation on Each Node
+
+If you prefer manual installation:
+
+```bash
+# On first node
+wget -qO- https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash
+
+# On remaining nodes
+ssh root@node2 "wget -qO- https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash"
+ssh root@node3 "wget -qO- https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash"
+```
+
+### Cluster Installation Troubleshooting
+
+**SSH Connectivity Issues**
+
+If cluster installation fails SSH validation:
+
+```bash
+# Test SSH manually from current node
+ssh root@<node-ip> hostname
+
+# Should return the node hostname without prompting for password
+# If it prompts for password, Proxmox cluster SSH keys may not be set up
+
+# Check SSH key distribution
+ls -la /root/.ssh/authorized_keys
+
+# Verify cluster membership
+cat /etc/pve/.members
+
+# Check cluster status
+pvecm status
+```
+
+**Partial Installation Failures**
+
+If some nodes succeed and others fail:
+
+1. Review the failure reason shown in the summary
+2. Use the automatic retry option when prompted
+3. Check logs on failed nodes: `ssh root@<failed-node> 'tail /var/log/truenas-installer.log'`
+4. Fix the issue (network, disk space, permissions)
+5. Re-run cluster installation - already-updated nodes are skipped
+
+**Non-Interactive Mode Limitation**
+
+Cluster-wide installation requires interactive mode:
+
+```bash
+# This will NOT install cluster-wide
+./install.sh --non-interactive
+
+# Use interactive mode for cluster deployment
+./install.sh
+# Then select cluster-wide option from menu
+```
+
+**Manual Verification**
+
+After cluster installation, verify on each node:
+
+```bash
+# Check plugin installed on all nodes
+for node in node1 node2 node3; do
+  ssh root@$node "ls -la /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm"
+done
+
+# Verify version on all nodes
+for node in node1 node2 node3; do
+  echo -n "$node: "
+  ssh root@$node "perl -ne 'print \$1 if /VERSION\s*=\s*['\''\"]\([0-9.]+\)/' /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm"
+done
+
+# Check services running
+for node in node1 node2 node3; do
+  echo "$node:"
+  ssh root@$node "systemctl is-active pvedaemon pveproxy"
+done
+```
+
+### Installer Logs
+
+All installer operations are logged for troubleshooting:
+
+```bash
+# View installer logs
+tail -f /var/log/truenas-installer.log
+
+# Check for errors
+grep ERROR /var/log/truenas-installer.log
+
+# View recent operations
+tail -n 100 /var/log/truenas-installer.log
+
+# Check remote installation logs
+grep "Remote installation" /var/log/truenas-installer.log
+```
+
+### Installer Troubleshooting
+
+**Missing Dependencies**
+```bash
+# Installer checks for: curl or wget, perl
+# If missing, installer will display clear error:
+
+ERROR: Required dependency 'curl' or 'wget' not found
+Please install: apt-get install curl wget
+
+# Install dependencies:
+apt-get update
+apt-get install curl perl
+```
+
+**Permission Issues**
+```bash
+# Installer must run as root
+# If not root, you'll see:
+
+ERROR: This script must be run as root
+Please run: sudo ./install.sh
+
+# Fix:
+sudo ./install.sh
+```
+
+**GitHub API Rate Limiting**
+```bash
+# If you hit GitHub rate limits:
+
+ERROR: GitHub API rate limit exceeded
+Please try again in 1 hour, or use a GitHub token
+
+# Wait or use authentication:
+export GITHUB_TOKEN=your_github_token
+./install.sh
+```
+
+## Manual Installation
+
+If you prefer manual installation or need more control over the process, follow these steps.
+
 ## Requirements
 
 ### Software Requirements
