@@ -1,5 +1,35 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.1.5 (November 8, 2025)
+
+### 🐛 **Critical Bug Fix: Snapshot Error Handling**
+
+#### **Fixed silent snapshot creation failures on multi-disk VMs**
+- **Fixed `volume_snapshot()` function to properly validate API responses** - Plugin now ensures snapshot creation succeeds before reporting success to Proxmox
+  - **Problem**: Function ignored API call results and always returned success, causing VM lock states on multi-disk VMs
+  - **Impact**: When snapshot creation failed on TrueNAS, Proxmox thought it succeeded, resulting in orphaned snapshots and locked VMs
+  - **Root cause**: `volume_snapshot()` called `_api_call()` but ignored the return value completely
+  - **Solution implemented**:
+    - Captures the API call result
+    - Validates result using `_handle_api_result_with_job_support()` for proper async operation handling
+    - Dies with clear error message if snapshot creation fails (prevents silent failures)
+    - Logs all snapshot operations to syslog for audit trails
+    - Prevents VM lock states caused by inconsistent Proxmox/TrueNAS snapshot state
+
+### 🔍 **Audit Trail Improvements**
+- All snapshot operations now logged via syslog:
+  - `Creating ZFS snapshot: <full-snapshot-name>`
+  - `ZFS snapshot created successfully: <full-snapshot-name>`
+  - `Failed to create snapshot <name>: <error-message>`
+- Enables better troubleshooting of snapshot failures in production
+
+### 📋 **Testing**
+- Comprehensive multi-disk snapshot test integrated into plugin test suite
+- Validates atomic snapshot operations across iSCSI and NVMe storage
+- Snapshot creation/deletion verified on test environments
+
+---
+
 ## Version 1.1.4 (November 8, 2025)
 
 ### 🐛 **Bug Fixes**

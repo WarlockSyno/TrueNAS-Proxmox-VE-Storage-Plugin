@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '1.1.4';
+our $VERSION = '1.1.5';
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -1600,15 +1600,27 @@ sub volume_snapshot {
     my ($class, $scfg, $storeid, $volname, $snapname, $vmstate) = @_;
     my (undef, $zname) = $class->parse_volname($volname);
     my $full = $scfg->{dataset} . '/' . $zname; # pool/dataset/.../vm-<id>-disk-<n>
+    my $snap_full = $full . '@' . $snapname;    # full snapshot name for logging
+
+    syslog('info', "Creating ZFS snapshot: $snap_full");
 
     # Create ZFS snapshot for the disk
     # TrueNAS REST: POST /zfs/snapshot { "dataset": "<pool/ds/...>", "name": "<snap>", "recursive": false }
     # Snapshot will be <pool/ds/...>@<snapname>
     my $payload = { dataset => $full, name => $snapname, recursive => JSON::PP::false };
-    _api_call(
+    my $result = _api_call(
         $scfg, 'zfs.snapshot.create', [ $payload ],
         sub { _rest_call($scfg, 'POST', '/zfs/snapshot', $payload) },
     );
+
+    # Handle potential async job for snapshot creation
+    my $job_result = _handle_api_result_with_job_support($scfg, $result, "snapshot creation for $snap_full");
+    if (!$job_result->{success}) {
+        syslog('err', "Failed to create snapshot $snap_full: " . $job_result->{error});
+        die $job_result->{error};
+    }
+
+    syslog('info', "ZFS snapshot created successfully: $snap_full");
 
     # Note: vmstate ($vmstate parameter) is handled automatically by Proxmox:
     # - If vmstate_storage is 'shared': Proxmox creates vmstate volumes on this storage

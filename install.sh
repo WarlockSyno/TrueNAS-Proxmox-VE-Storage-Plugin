@@ -2254,21 +2254,52 @@ menu_plugin_test() {
         return 1
     fi
 
-    info "Available TrueNAS storage:"
-    while IFS= read -r storage; do
-        echo "  • $storage"
-    done <<< "$storages"
-    echo
+    # Prompt for storage selection with retry loop
+    local storage_name=""
+    local storage_error=""
+    local first_try=true
 
-    # Prompt for storage selection
-    local storage_name
-    read -rp "Enter storage name to test: " storage_name
+    while true; do
+        # On retry, clear screen and reshow banner
+        if [[ "$first_try" == "false" ]]; then
+            clear_screen
+            print_banner
+            echo
+            info "Plugin Function Test"
+            echo
+            info "Detecting TrueNAS storage configurations..."
+            echo
+        fi
+        first_try=false
 
-    # Validate storage exists
-    if ! echo "$storages" | grep -q "^${storage_name}$"; then
-        error "Storage '$storage_name' not found in configuration"
-        return 1
-    fi
+        # Show error if validation failed
+        if [[ -n "$storage_error" ]]; then
+            error "$storage_error"
+            echo
+            storage_error=""
+        fi
+
+        info "Available TrueNAS storage:"
+        while IFS= read -r storage; do
+            echo "  • $storage"
+        done <<< "$storages"
+        echo
+
+        read -rp "Enter storage name to test (or press Enter for first): " storage_name
+
+        if [[ -z "$storage_name" ]]; then
+            storage_name=$(echo "$storages" | head -1)
+            info "Using: $storage_name"
+            break
+        fi
+
+        # Validate storage exists
+        if echo "$storages" | grep -q "^${storage_name}$"; then
+            break
+        else
+            storage_error="Storage '$storage_name' not found in configuration"
+        fi
+    done
 
     # Clear screen and show header for test execution
     clear_screen
@@ -2695,6 +2726,107 @@ test_snapshot_operations() {
     return 0
 }
 
+# Test 4b: Multi-disk Snapshot Operations (tests snapshot consistency with multiple disks)
+test_multidisk_snapshot_operations() {
+    # This test creates a VM with multiple disks on the same storage and verifies
+    # that snapshot creation properly validates all disks (fixes silent failures)
+    local storage_name="$1"
+    local multidisk_vm_id=$((TEST_VM_BASE + 100))
+    local snapshot_name="multidisk-snap-$(date +%s)"
+
+    printf "%-30s " "Create multi-disk VM:"
+    start_spinner
+
+    # Create VM with 2 disks on the same storage
+    if ! test_api_call POST "/nodes/$NODE_NAME/qemu" \
+        --vmid "$multidisk_vm_id" \
+        --name "test-multidisk-vm" \
+        --memory 512 \
+        --cores 1 \
+        --scsihw "virtio-scsi-pci" >/dev/null 2>&1; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Create multi-disk VM:")${c1}✗${c0} Failed"
+        return 1
+    fi
+
+    # Add first disk
+    if ! test_api_call PUT "/nodes/$NODE_NAME/qemu/$multidisk_vm_id/config" \
+        --scsi0 "${storage_name}:5" >/dev/null 2>&1; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Create multi-disk VM:")${c1}✗${c0} Failed to add disk 0"
+        return 1
+    fi
+
+    # Add second disk
+    if ! test_api_call PUT "/nodes/$NODE_NAME/qemu/$multidisk_vm_id/config" \
+        --scsi1 "${storage_name}:5" >/dev/null 2>&1; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Create multi-disk VM:")${c1}✗${c0} Failed to add disk 1"
+        return 1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Create multi-disk VM:")${c2}✓${c0} VM created with 2 disks"
+
+    printf "%-30s " "Snapshot multi-disk VM:"
+    start_spinner
+
+    # Create snapshot - both disks must succeed or fail atomically
+    output=$(test_api_call POST "/nodes/$NODE_NAME/qemu/$multidisk_vm_id/snapshot" \
+        --snapname "$snapshot_name" \
+        --description "Multi-disk snapshot test" 2>&1)
+
+    if [ $? -ne 0 ]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Snapshot multi-disk VM:")${c1}✗${c0} Snapshot creation failed"
+        return 1
+    fi
+
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 60 >/dev/null 2>&1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Snapshot multi-disk VM:")${c2}✓${c0} Snapshot created"
+
+    printf "%-30s " "Delete multi-disk snapshot:"
+    start_spinner
+
+    # Verify deletion works correctly on both disks
+    output=$(test_api_call DELETE "/nodes/$NODE_NAME/qemu/$multidisk_vm_id/snapshot/$snapshot_name" 2>&1)
+    if [ $? -ne 0 ]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Delete multi-disk snapshot:")${c1}✗${c0} Failed"
+        return 1
+    fi
+
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 60 >/dev/null 2>&1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Delete multi-disk snapshot:")${c2}✓${c0} Deleted successfully"
+
+    printf "%-30s " "Cleanup multi-disk VM:"
+    start_spinner
+
+    # Delete the test VM
+    output=$(test_api_call DELETE "/nodes/$NODE_NAME/qemu/$multidisk_vm_id" 2>&1)
+    if [ $? -ne 0 ]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Cleanup multi-disk VM:")${c1}⚠${c0} Could not delete VM"
+        return 1
+    fi
+
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 60 >/dev/null 2>&1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Cleanup multi-disk VM:")${c2}✓${c0} VM cleaned up"
+
+    return 0
+}
+
 # Test 5: Clone Operations
 test_clone_operations() {
     local clone_snapshot
@@ -3081,6 +3213,14 @@ run_plugin_test() {
     # Test 4: Snapshot Operations
     ((tests_total++))
     if test_snapshot_operations; then
+        ((tests_passed++))
+    else
+        ((tests_failed++))
+    fi
+
+    # Test 4b: Multi-disk Snapshot Operations
+    ((tests_total++))
+    if test_multidisk_snapshot_operations "$storage_name"; then
         ((tests_passed++))
     else
         ((tests_failed++))
