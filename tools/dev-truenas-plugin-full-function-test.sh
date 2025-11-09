@@ -1535,6 +1535,472 @@ test_efi_vm_creation() {
 }
 
 # ============================================================================
+# Phase 22: Multi-Disk Advanced Operations
+# ============================================================================
+
+test_multidisk_advanced_operations() {
+    local base_vmid=$1
+    local test_num=$2
+    local test_name_prefix="Multi-Disk Advanced Operations"
+
+    log_info "Starting multi-disk advanced operations test suite"
+    echo | tee -a "$LOG_FILE"
+
+    # Test 1: Multi-Disk Snapshot Operations (validates v1.1.5 fix)
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    local test_name="$test_name_prefix: Snapshots (3 disks)"
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    local vmid=$base_vmid
+
+    # Cleanup
+    pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+    sleep $API_SETTLE_TIME
+
+    # Create VM with 3 disks
+    log_info "Creating VM with 3 disks for snapshot test"
+    if ! qm create "$vmid" -name "test-multidisk-snap" -memory 512 -scsihw "virtio-scsi-pci" >/dev/null 2>&1; then
+        log_error "Failed to create VM"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - VM creation failed")
+        return 1
+    fi
+
+    # Allocate and attach 3 disks
+    for i in {0..2}; do
+        local volid
+        volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+            -vmid "$vmid" \
+            -filename "vm-${vmid}-disk-${i}" \
+            -size "5G" \
+            --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+
+        if [[ -z "$volid" ]] || [[ "$volid" == *"error"* ]]; then
+            log_error "Failed to allocate disk $i"
+            pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+            FAILED_TESTS=$((FAILED_TESTS + 1))
+            TEST_RESULTS+=("FAIL: $test_name - Disk $i allocation failed")
+            return 1
+        fi
+
+        if ! qm set "$vmid" -scsi${i} "$volid" >/dev/null 2>&1; then
+            log_error "Failed to attach disk $i"
+            pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+            FAILED_TESTS=$((FAILED_TESTS + 1))
+            TEST_RESULTS+=("FAIL: $test_name - Disk $i attachment failed")
+            return 1
+        fi
+
+        sleep $DISK_ATTACH_WAIT
+    done
+
+    log_success "Created VM with 3 disks"
+    sleep $API_SETTLE_TIME
+
+    # Create snapshot across all 3 disks
+    local snapshot_name="multidisk-snap-$(date +%s)"
+    log_info "Creating snapshot across 3 disks: $snapshot_name"
+    local snap_start=$(date +%s)
+    if ! qm snapshot "$vmid" "$snapshot_name" --description "Multi-disk test snapshot" >/dev/null 2>&1; then
+        log_error "Failed to create multi-disk snapshot"
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Snapshot creation failed")
+        return 1
+    fi
+    local snap_duration=$(($(date +%s) - snap_start))
+
+    # Verify snapshot exists
+    local snaplist
+    snaplist=$(qm listsnapshot "$vmid" 2>/dev/null | grep "$snapshot_name" || echo "")
+    if [[ -z "$snaplist" ]]; then
+        log_error "Snapshot not found in list"
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Snapshot verification failed")
+        return 1
+    fi
+
+    log_success "Multi-disk snapshot created in ${snap_duration}s"
+    track_timing "multidisk_snapshot_create" "$snap_duration"
+
+    # Delete snapshot
+    log_info "Deleting multi-disk snapshot"
+    if ! qm delsnapshot "$vmid" "$snapshot_name" >/dev/null 2>&1; then
+        log_error "Failed to delete multi-disk snapshot"
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Snapshot deletion failed")
+        return 1
+    fi
+
+    sleep $API_SETTLE_TIME
+
+    # Verify snapshot deleted
+    snaplist=$(qm listsnapshot "$vmid" 2>/dev/null | grep "$snapshot_name" || echo "")
+    if [[ -n "$snaplist" ]]; then
+        log_error "Snapshot still exists after deletion"
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Snapshot cleanup failed")
+        return 1
+    fi
+
+    log_success "Multi-disk snapshot deleted successfully"
+
+    # Cleanup
+    pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1
+    wait_for_vm_deletion "$vmid" "$vmid" 5
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "Multi-disk snapshot test completed (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    echo | tee -a "$LOG_FILE"
+    test_num=$((test_num + 1))
+
+    # Test 2: Multi-Disk Clone Operations
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    test_name="$test_name_prefix: Clone (3 disks)"
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    start_time=$(date +%s)
+
+    local base_clone_vmid=$((base_vmid + 1))
+    local clone_vmid=$((base_vmid + 2))
+
+    # Cleanup
+    pvesh delete "/nodes/$NODE/qemu/$base_clone_vmid" >/dev/null 2>&1 || true
+    pvesh delete "/nodes/$NODE/qemu/$clone_vmid" >/dev/null 2>&1 || true
+    sleep $API_SETTLE_TIME
+
+    # Create base VM with 3 disks
+    log_info "Creating base VM with 3 disks for clone test"
+    if ! qm create "$base_clone_vmid" -name "test-multidisk-clone-base" -memory 512 -scsihw "virtio-scsi-pci" >/dev/null 2>&1; then
+        log_error "Failed to create base VM"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Base VM creation failed")
+        return 1
+    fi
+
+    # Allocate and attach 3 disks
+    for i in {0..2}; do
+        local volid
+        volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+            -vmid "$base_clone_vmid" \
+            -filename "vm-${base_clone_vmid}-disk-${i}" \
+            -size "5G" \
+            --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+
+        if ! qm set "$base_clone_vmid" -scsi${i} "$volid" >/dev/null 2>&1; then
+            log_error "Failed to attach disk $i to base VM"
+            pvesh delete "/nodes/$NODE/qemu/$base_clone_vmid" >/dev/null 2>&1 || true
+            FAILED_TESTS=$((FAILED_TESTS + 1))
+            TEST_RESULTS+=("FAIL: $test_name - Base VM disk attachment failed")
+            return 1
+        fi
+
+        sleep $DISK_ATTACH_WAIT
+    done
+
+    log_success "Base VM created with 3 disks"
+    sleep $API_SETTLE_TIME
+
+    # Create full clone
+    log_info "Creating full clone with all 3 disks"
+    local clone_start=$(date +%s)
+    if ! qm clone "$base_clone_vmid" "$clone_vmid" --name "test-multidisk-clone" --full --storage "$STORAGE_ID" >/dev/null 2>&1; then
+        log_error "Failed to create multi-disk clone"
+        pvesh delete "/nodes/$NODE/qemu/$base_clone_vmid" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Clone operation failed")
+        return 1
+    fi
+    local clone_duration=$(($(date +%s) - clone_start))
+
+    sleep $API_SETTLE_TIME
+
+    # Verify clone has all 3 disks
+    log_info "Verifying clone has all 3 disks"
+    local clone_disk_count
+    clone_disk_count=$(pvesm list "$STORAGE_ID" --vmid "$clone_vmid" 2>/dev/null | tail -n +2 | wc -l)
+
+    if [[ $clone_disk_count -ne 3 ]]; then
+        log_error "Clone has $clone_disk_count disks, expected 3"
+        pvesh delete "/nodes/$NODE/qemu/$base_clone_vmid" >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$NODE/qemu/$clone_vmid" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Clone disk count mismatch")
+        return 1
+    fi
+
+    log_success "Multi-disk clone created in ${clone_duration}s with all 3 disks"
+    track_timing "multidisk_clone" "$clone_duration"
+
+    # Cleanup both VMs
+    pvesh delete "/nodes/$NODE/qemu/$base_clone_vmid" >/dev/null 2>&1
+    pvesh delete "/nodes/$NODE/qemu/$clone_vmid" >/dev/null 2>&1
+    wait_for_vm_deletion "$base_clone_vmid" "$clone_vmid" 5
+
+    # Verify all disks cleaned up
+    local remaining_base
+    local remaining_clone
+    remaining_base=$(pvesm list "$STORAGE_ID" --vmid "$base_clone_vmid" 2>/dev/null | tail -n +2 | wc -l)
+    remaining_clone=$(pvesm list "$STORAGE_ID" --vmid "$clone_vmid" 2>/dev/null | tail -n +2 | wc -l)
+
+    if [[ $remaining_base -ne 0 ]] || [[ $remaining_clone -ne 0 ]]; then
+        log_error "Orphaned disks after cleanup (base: $remaining_base, clone: $remaining_clone)"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Cleanup verification failed")
+        return 1
+    fi
+
+    log_success "All disks cleaned up successfully"
+
+    duration=$(($(date +%s) - start_time))
+    log_success "Multi-disk clone test completed (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    echo | tee -a "$LOG_FILE"
+    test_num=$((test_num + 1))
+
+    # Test 3: Multi-Disk Resize Operations
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    test_name="$test_name_prefix: Resize (3 disks)"
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    start_time=$(date +%s)
+
+    vmid=$((base_vmid + 3))
+
+    # Cleanup
+    pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+    sleep $API_SETTLE_TIME
+
+    # Create VM with 3 disks
+    log_info "Creating VM with 3 disks for resize test"
+    if ! qm create "$vmid" -name "test-multidisk-resize" -memory 512 -scsihw "virtio-scsi-pci" >/dev/null 2>&1; then
+        log_error "Failed to create VM"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - VM creation failed")
+        return 1
+    fi
+
+    # Allocate and attach 3 disks (all 5GB initially)
+    for i in {0..2}; do
+        local volid
+        volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+            -vmid "$vmid" \
+            -filename "vm-${vmid}-disk-${i}" \
+            -size "5G" \
+            --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+
+        if ! qm set "$vmid" -scsi${i} "$volid" >/dev/null 2>&1; then
+            log_error "Failed to attach disk $i"
+            pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+            FAILED_TESTS=$((FAILED_TESTS + 1))
+            TEST_RESULTS+=("FAIL: $test_name - Disk attachment failed")
+            return 1
+        fi
+
+        sleep $DISK_ATTACH_WAIT
+    done
+
+    log_success "Created VM with 3 x 5GB disks"
+    sleep $API_SETTLE_TIME
+
+    # Resize disk 0 from 5GB to 10GB
+    log_info "Resizing disk 0 from 5GB to 10GB"
+    if ! qm resize "$vmid" scsi0 "10G" >/dev/null 2>&1; then
+        log_error "Failed to resize disk 0"
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Resize operation failed")
+        return 1
+    fi
+
+    sleep $DELETION_WAIT
+
+    # Verify sizes: disk0 should be 10GB, disks 1-2 should still be 5GB
+    local disk_sizes
+    disk_sizes=$(pvesm list "$STORAGE_ID" --vmid "$vmid" 2>/dev/null | tail -n +2 | awk '{print $4}')
+
+    local expected_0=$((10 * 1024 * 1024 * 1024))
+    local expected_1_2=$((5 * 1024 * 1024 * 1024))
+
+    local disk_array=($disk_sizes)
+    local size_mismatch=0
+
+    if [[ ${#disk_array[@]} -ne 3 ]]; then
+        log_error "Expected 3 disks, found ${#disk_array[@]}"
+        size_mismatch=1
+    elif [[ ${disk_array[0]} -ne $expected_0 ]]; then
+        log_error "Disk 0 size: ${disk_array[0]}, expected: $expected_0"
+        size_mismatch=1
+    elif [[ ${disk_array[1]} -ne $expected_1_2 ]]; then
+        log_error "Disk 1 size: ${disk_array[1]}, expected: $expected_1_2"
+        size_mismatch=1
+    elif [[ ${disk_array[2]} -ne $expected_1_2 ]]; then
+        log_error "Disk 2 size: ${disk_array[2]}, expected: $expected_1_2"
+        size_mismatch=1
+    fi
+
+    if [[ $size_mismatch -eq 1 ]]; then
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Size verification failed")
+        return 1
+    fi
+
+    log_success "Resize verified: disk0=10GB, disks1-2=5GB"
+
+    # Cleanup
+    pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1
+    wait_for_vm_deletion "$vmid" "$vmid" 5
+
+    duration=$(($(date +%s) - start_time))
+    log_success "Multi-disk resize test completed (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    echo | tee -a "$LOG_FILE"
+    test_num=$((test_num + 1))
+
+    # Test 4: Multi-Disk Migration (cluster only)
+    if [[ $IS_CLUSTER -eq 1 ]]; then
+        TOTAL_TESTS=$((TOTAL_TESTS + 1))
+        test_name="$test_name_prefix: Migration (3 disks)"
+        echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+        start_time=$(date +%s)
+
+        vmid=$((base_vmid + 4))
+
+        # Cleanup
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$TARGET_NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        sleep $API_SETTLE_TIME
+
+        # Create VM with 3 disks
+        log_info "Creating VM with 3 disks for migration test on $NODE"
+        if ! qm create "$vmid" -name "test-multidisk-migrate" -memory 512 -scsihw "virtio-scsi-pci" >/dev/null 2>&1; then
+            log_error "Failed to create VM"
+            FAILED_TESTS=$((FAILED_TESTS + 1))
+            TEST_RESULTS+=("FAIL: $test_name - VM creation failed")
+            return 1
+        fi
+
+        # Allocate and attach 3 disks
+        for i in {0..2}; do
+            local volid
+            volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+                -vmid "$vmid" \
+                -filename "vm-${vmid}-disk-${i}" \
+                -size "5G" \
+                --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+
+            if ! qm set "$vmid" -scsi${i} "$volid" >/dev/null 2>&1; then
+                log_error "Failed to attach disk $i"
+                pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+                FAILED_TESTS=$((FAILED_TESTS + 1))
+                TEST_RESULTS+=("FAIL: $test_name - Disk attachment failed")
+                return 1
+            fi
+
+            sleep $DISK_ATTACH_WAIT
+        done
+
+        log_success "Created VM with 3 disks"
+        sleep $API_SETTLE_TIME
+
+        # Start VM for live migration
+        log_info "Starting VM for live migration"
+        if ! qm start "$vmid" >/dev/null 2>&1; then
+            log_error "Failed to start VM"
+            pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+            FAILED_TESTS=$((FAILED_TESTS + 1))
+            TEST_RESULTS+=("FAIL: $test_name - VM start failed")
+            return 1
+        fi
+
+        sleep 3
+
+        # Live migrate to target node
+        log_info "Live migrating VM from $NODE to $TARGET_NODE"
+        local migrate_start=$(date +%s)
+        if ! qm migrate "$vmid" "$TARGET_NODE" --online >/dev/null 2>&1; then
+            log_error "Failed to live migrate to $TARGET_NODE"
+            qm stop "$vmid" >/dev/null 2>&1 || true
+            pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+            FAILED_TESTS=$((FAILED_TESTS + 1))
+            TEST_RESULTS+=("FAIL: $test_name - Live migration failed")
+            return 1
+        fi
+        local migrate_duration=$(($(date +%s) - migrate_start))
+
+        sleep $API_SETTLE_TIME
+
+        # Verify VM on target node
+        if ! pvesh get "/nodes/$TARGET_NODE/qemu/$vmid/status/current" >/dev/null 2>&1; then
+            log_error "VM not found on $TARGET_NODE after migration"
+            FAILED_TESTS=$((FAILED_TESTS + 1))
+            TEST_RESULTS+=("FAIL: $test_name - Migration verification failed")
+            return 1
+        fi
+
+        log_success "Live migration completed in ${migrate_duration}s"
+        track_timing "multidisk_live_migration" "$migrate_duration"
+
+        # Offline migrate back to original node
+        log_info "Stopping VM for offline migration back"
+        pvesh create "/nodes/$TARGET_NODE/qemu/$vmid/status/stop" >/dev/null 2>&1 || true
+        sleep 2
+
+        log_info "Offline migrating VM from $TARGET_NODE back to $NODE"
+        migrate_start=$(date +%s)
+        if ! pvesh create "/nodes/$TARGET_NODE/qemu/$vmid/migrate" -target "$NODE" >/dev/null 2>&1; then
+            log_error "Failed to migrate back to $NODE"
+            pvesh delete "/nodes/$TARGET_NODE/qemu/$vmid" >/dev/null 2>&1 || true
+            FAILED_TESTS=$((FAILED_TESTS + 1))
+            TEST_RESULTS+=("FAIL: $test_name - Return migration failed")
+            return 1
+        fi
+        migrate_duration=$(($(date +%s) - migrate_start))
+
+        sleep $API_SETTLE_TIME
+
+        log_success "Offline migration back completed in ${migrate_duration}s"
+        track_timing "multidisk_offline_migration" "$migrate_duration"
+
+        # Verify all 3 disks intact after round-trip
+        local final_disk_count
+        final_disk_count=$(pvesm list "$STORAGE_ID" --vmid "$vmid" 2>/dev/null | tail -n +2 | wc -l)
+
+        if [[ $final_disk_count -ne 3 ]]; then
+            log_error "After round-trip migration: $final_disk_count disks, expected 3"
+            pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+            FAILED_TESTS=$((FAILED_TESTS + 1))
+            TEST_RESULTS+=("FAIL: $test_name - Disk integrity check failed")
+            return 1
+        fi
+
+        log_success "All 3 disks intact after round-trip migration"
+
+        # Cleanup
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1
+        wait_for_vm_deletion "$vmid" "$vmid" 5
+
+        duration=$(($(date +%s) - start_time))
+        log_success "Multi-disk migration test completed (${duration}s)"
+        PASSED_TESTS=$((PASSED_TESTS + 1))
+        TEST_RESULTS+=("PASS: $test_name")
+        echo | tee -a "$LOG_FILE"
+    else
+        log_info "Skipping multi-disk migration test - not in a cluster"
+        echo | tee -a "$LOG_FILE"
+    fi
+
+    return 0
+}
+
+# ============================================================================
 # Phase 11: Live Migration
 # ============================================================================
 
@@ -3044,6 +3510,23 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
 
+    # Phase 22: Multi-Disk Advanced Operations
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo "  PHASE 22: Multi-Disk Advanced Operations Tests" | tee -a "$LOG_FILE"
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo | tee -a "$LOG_FILE"
+
+    vmid=$((VMID_START + 31))
+    test_multidisk_advanced_operations "$vmid" "$test_num"
+    echo | tee -a "$LOG_FILE"
+    # test_num is incremented inside test_multidisk_advanced_operations for each sub-test
+    # Count how many tests were added (3 or 4 depending on cluster)
+    if [[ $IS_CLUSTER -eq 1 ]]; then
+        test_num=$((test_num + 4))
+    else
+        test_num=$((test_num + 3))
+    fi
+
     # Cluster-based tests (only if cluster detected)
     if [[ $IS_CLUSTER -eq 1 ]]; then
         # Phase 11: Live Migration
@@ -3129,18 +3612,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
 
-    # Phase 20: Interrupted Operations Test
-    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
-    echo "  PHASE 20: Interrupted Operations Test" | tee -a "$LOG_FILE"
-    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
-    echo | tee -a "$LOG_FILE"
-
-    vmid=$((VMID_START + 29))
-    test_interrupted_operations "$vmid" "$test_num"
-    echo | tee -a "$LOG_FILE"
-    test_num=$((test_num + 1))
-
-    # Phase 21: Large Disk Operations Test
+    # Phase 21: Large Disk Operations Test (moved before Phase 20 to avoid storage locks)
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo "  PHASE 21: Large Disk Operations Test" | tee -a "$LOG_FILE"
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -3148,6 +3620,17 @@ main() {
 
     vmid=$((VMID_START + 30))
     test_large_disk_operations "$vmid" "$test_num"
+    echo | tee -a "$LOG_FILE"
+    test_num=$((test_num + 1))
+
+    # Phase 20: Interrupted Operations Test (moved after Phase 21 to prevent storage locks)
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo "  PHASE 20: Interrupted Operations Test" | tee -a "$LOG_FILE"
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo | tee -a "$LOG_FILE"
+
+    vmid=$((VMID_START + 29))
+    test_interrupted_operations "$vmid" "$test_num"
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
 
