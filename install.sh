@@ -4818,6 +4818,62 @@ run_health_check() {
         check_result "Dataset" "CRITICAL" "Not configured"
     fi
 
+    # Check 6.5: Dataset type validation (must be FILESYSTEM, not VOLUME)
+    local api_key
+    api_key=$(get_storage_config_value "$storage_name" "api_key")
+    local api_insecure
+    api_insecure=$(get_storage_config_value "$storage_name" "api_insecure")
+
+    if [[ -n "$dataset" ]] && [[ -n "$api_host" ]] && [[ -n "$api_key" ]]; then
+        printf "%-30s " "Dataset type:"
+        start_spinner
+
+        local curl_opts="-s"
+        [[ "$api_insecure" == "1" ]] && curl_opts="$curl_opts -k"
+
+        # Make API call to fetch all datasets
+        local dataset_info
+        dataset_info=$(curl $curl_opts -H "Authorization: Bearer $api_key" \
+            "https://$api_host/api/v2.0/pool/dataset" 2>/dev/null)
+        local api_status=$?
+
+        stop_spinner
+
+        if [[ $api_status -ne 0 ]] || [[ -z "$dataset_info" ]]; then
+            # API call failed - warn but don't fail critically
+            local dataset_result="${COLOR_YELLOW}⚠${COLOR_RESET} Cannot validate (API error)"
+            echo -e "\r$(printf "%-30s " "Dataset type:")${dataset_result}"
+            ((warnings++))
+            ((checks_total++))
+        else
+            # Parse JSON to find our dataset and extract its type
+            # We need to find the entry with matching "id" and get its "type" field
+            local ds_type
+            ds_type=$(echo "$dataset_info" | grep -B2 -A10 "\"id\": *\"$dataset\"" | \
+                grep '"type"' | head -1 | sed -E 's/.*"type": *"([^"]+)".*/\1/')
+
+            local dataset_result
+            if [[ "$ds_type" == "FILESYSTEM" ]]; then
+                dataset_result="${COLOR_GREEN}✓${COLOR_RESET} FILESYSTEM (correct)"
+                ((checks_passed++))
+            elif [[ "$ds_type" == "VOLUME" ]]; then
+                dataset_result="${COLOR_RED}✗${COLOR_RESET} VOLUME (must be FILESYSTEM - zvols cannot have child zvols)"
+                ((errors++))
+            elif [[ -n "$ds_type" ]]; then
+                dataset_result="${COLOR_YELLOW}⚠${COLOR_RESET} Unknown type: $ds_type"
+                ((warnings++))
+            else
+                dataset_result="${COLOR_RED}✗${COLOR_RESET} Dataset not found on TrueNAS"
+                ((errors++))
+            fi
+
+            echo -e "\r$(printf "%-30s " "Dataset type:")${dataset_result}"
+            ((checks_total++))
+        fi
+    else
+        check_result "Dataset type" "SKIP" "Missing dataset or API config"
+    fi
+
     # Detect transport mode
     local transport_mode
     transport_mode=$(get_storage_config_value "$storage_name" "transport_mode")
