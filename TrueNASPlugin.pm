@@ -3165,6 +3165,12 @@ sub free_image {
     my (undef, $zname, undef, undef, undef, undef, undef, $metadata) = $class->parse_volname($volname);
     my $full_ds = $scfg->{dataset} . '/' . $zname;
 
+    # Protect weight volume from deletion - it maintains target visibility
+    if ($zname eq 'pve-plugin-weight') {
+        die "Cannot delete weight volume '$volname' - it maintains target visibility and prevents storage outages.\n" .
+            "Weight volumes are critical infrastructure and must persist to keep iSCSI targets discoverable.\n";
+    }
+
     # Level 2: Verbose - parsed details
     _log($scfg, 2, 'debug', "free_image: zname=$zname, metadata=$metadata, full_ds=$full_ds");
 
@@ -3399,7 +3405,21 @@ sub _free_image_iscsi {
         eval { PVE::Tools::run_command(['udevadm','settle'], outfunc=>sub{}) };
     }
 
+    # Self-healing: Verify weight volume exists after deletion
+    # This prevents target undiscoverability when all VM volumes are deleted
+    # IMPORTANT: Must run BEFORE logout_on_free to avoid race condition where
+    # we logout before creating the weight volume, leaving it unmapped
+    eval {
+        _log($scfg, 2, 'debug', "Self-healing: Verifying weight volume after deletion");
+        _ensure_target_visible($scfg);
+    };
+    if ($@) {
+        # Non-fatal warning - weight verification failed but volume deletion succeeded
+        _log($scfg, 0, 'warning', "Self-healing: Weight volume verification failed: $@");
+    }
+
     # Optional: logout if no LUNs remain for this target on this node
+    # Runs AFTER self-healing so weight volume is created before we check LUN count
     if ($scfg->{logout_on_free}) {
         eval {
             if (_session_has_no_luns($scfg)) {
@@ -3932,28 +3952,9 @@ sub _ensure_target_visible {
 
     _log($scfg, 1, 'info', "Pre-flight: Target $target_name exists on TrueNAS (ID: $target_id)");
 
-    # Step 2: Check if target is discoverable via iscsiadm
-    my $target_discoverable = 0;
-    eval {
-        # Try discovery
-        my @discovery_output = _run_lines(['iscsiadm', '-m', 'discovery', '-t', 'sendtargets', '-p', $portal]);
-        for my $line (@discovery_output) {
-            if ($line =~ /\b\Q$iqn\E\b/) {
-                $target_discoverable = 1;
-                last;
-            }
-        }
-    };
-
-    if ($target_discoverable) {
-        _log($scfg, 1, 'info', "Pre-flight: Target $iqn is discoverable");
-        return 1; # Target is visible, nothing to do
-    }
-
-    _log($scfg, 1, 'info', "Pre-flight: Target $iqn is NOT discoverable - creating weight zvol");
-
-    # Step 3: Target exists but isn't discoverable - likely no extents
-    # Create weight zvol if it doesn't exist
+    # Step 2: Proactively ensure weight zvol exists (regardless of current discoverability)
+    # This prevents issues where weight gets deleted and target becomes undiscoverable
+    _log($scfg, 1, 'info', "Pre-flight: Ensuring weight volume exists for target reliability");
     my $weight_exists = 0;
     eval {
         my $ds = _tn_dataset_get($scfg, $weight_zname);
@@ -4038,7 +4039,7 @@ sub _ensure_target_visible {
 
     # Step 6: Verify target is now discoverable
     sleep 2; # Give TrueNAS time to update
-    $target_discoverable = 0;
+    my $target_discoverable = 0;
     eval {
         my @discovery_output = _run_lines(['iscsiadm', '-m', 'discovery', '-t', 'sendtargets', '-p', $portal]);
         for my $line (@discovery_output) {
@@ -4050,10 +4051,10 @@ sub _ensure_target_visible {
     };
 
     if ($target_discoverable) {
-        _log($scfg, 1, 'info', "Pre-flight: Target $iqn is now discoverable");
+        _log($scfg, 1, 'info', "Pre-flight: Target $iqn is discoverable - weight volume ensures persistence");
         return 1;
     } else {
-        _log($scfg, 0, 'warning', "Pre-flight: Target $iqn still not discoverable after weight zvol creation");
+        _log($scfg, 0, 'warning', "Pre-flight: Target $iqn not discoverable despite weight volume - may need manual intervention");
         # Don't die - let iSCSI login handle the error with better diagnostics
         return 0;
     }

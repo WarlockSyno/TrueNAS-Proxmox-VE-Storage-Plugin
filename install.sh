@@ -5097,6 +5097,41 @@ run_health_check() {
         check_result "PVE daemon" "CRITICAL" "Not running"
     fi
 
+    # Check 13: Weight volume presence (iSCSI only)
+    if [[ "$transport_mode" == "iscsi" ]]; then
+        local weight_zvol="${dataset}/pve-plugin-weight"
+        local weight_encoded=$(echo "$weight_zvol" | sed 's/\//%2F/g')
+        local weight_check_failed=0
+
+        # Check if weight zvol exists via API
+        local zvol_response=$(curl -sk -H "Authorization: Bearer $api_key" \
+            "https://$api_host/api/v2.0/pool/dataset/id/$weight_encoded" 2>/dev/null)
+
+        if ! echo "$zvol_response" | grep -q '"id"'; then
+            check_result "Weight volume presence" "WARNING" "Weight zvol missing"
+            weight_check_failed=1
+        fi
+
+        # Check if weight extent exists (only if zvol exists)
+        if [[ $weight_check_failed -eq 0 ]]; then
+            local extent_response=$(curl -sk -H "Authorization: Bearer $api_key" \
+                "https://$api_host/api/v2.0/iscsi/extent" 2>/dev/null)
+
+            if ! echo "$extent_response" | grep -q '"name": "pve-plugin-weight"'; then
+                check_result "Weight volume presence" "WARNING" "Weight extent missing"
+                weight_check_failed=1
+            fi
+        fi
+
+        # If both exist, report OK
+        if [[ $weight_check_failed -eq 0 ]]; then
+            check_result "Weight volume presence" "OK" "Present and configured"
+        fi
+    else
+        # NVMe/TCP mode - skip weight check (not applicable)
+        check_result "Weight volume presence" "SKIP" "Not applicable for NVMe/TCP"
+    fi
+
     # Summary
     echo
     info "Health Summary:"
