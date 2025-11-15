@@ -1,5 +1,41 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.1.6 (November 14, 2025)
+
+### 🐛 **Critical Bug Fixes**
+
+#### **Weight Volume Protection and Self-Healing**
+- **Fixed weight zvol deletion vulnerability** - Plugin now prevents accidental deletion and automatically recreates weight volume
+  - **Problem**: Weight volume (`pve-plugin-weight`) could be manually deleted, causing iSCSI target to become undiscoverable
+  - **Root cause**: No safeguards prevented deletion of critical infrastructure volume that maintains target visibility
+  - **Impact**: If weight volume was deleted and all VM volumes removed, iSCSI target would disappear from discovery, causing storage outages
+  - **Solution implemented**:
+    - Added deletion guard that dies with error when attempting to delete weight volume (line 3169)
+    - Implemented self-healing operation that verifies weight volume after every volume deletion (lines 3408-3419)
+    - Self-healing automatically recreates weight volume if missing via `_ensure_target_visible()`
+    - Runs before `logout_on_free` to prevent race conditions
+    - Non-fatal warning if self-healing fails (doesn't block volume deletion)
+
+### 🔧 **Technical Details**
+- Modified `free_image()` function (lines 3169-3171, 3408-3419)
+  - Added weight volume deletion protection with explanatory error message
+  - Integrated self-healing verification after successful volume deletion
+  - Positioned self-healing before logout logic to ensure weight exists before session cleanup
+- Enhanced error messages explain weight volume purpose and importance
+
+### 📊 **Impact**
+- **Storage reliability**: Prevents storage outages caused by missing weight volumes
+- **Automatic recovery**: Self-healing recreates weight volume when needed, no manual intervention required
+- **Safety**: Weight volume cannot be accidentally deleted through normal plugin operations
+- **Graceful degradation**: Self-healing failures log warnings but don't block volume deletion operations
+
+### ✅ **Validation**
+- Tested weight volume deletion protection (properly rejects deletion attempts)
+- Verified self-healing recreates weight volume after all VM volumes deleted
+- Confirmed no race conditions between weight creation and session logout
+
+---
+
 ## Version 1.1.5 (November 8, 2025)
 
 ### 🐛 **Critical Bug Fix: Snapshot Error Handling**
