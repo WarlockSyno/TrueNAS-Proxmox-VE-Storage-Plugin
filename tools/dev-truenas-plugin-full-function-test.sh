@@ -1535,7 +1535,7 @@ test_efi_vm_creation() {
 }
 
 # ============================================================================
-# Phase 22: Multi-Disk Advanced Operations
+# Phase 23: Multi-Disk Advanced Operations
 # ============================================================================
 
 test_multidisk_advanced_operations() {
@@ -3612,18 +3612,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
 
-    # Phase 21: Large Disk Operations Test (moved before Phase 20 to avoid storage locks)
-    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
-    echo "  PHASE 21: Large Disk Operations Test" | tee -a "$LOG_FILE"
-    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
-    echo | tee -a "$LOG_FILE"
-
-    vmid=$((VMID_START + 30))
-    test_large_disk_operations "$vmid" "$test_num"
-    echo | tee -a "$LOG_FILE"
-    test_num=$((test_num + 1))
-
-    # Phase 20: Interrupted Operations Test (moved after Phase 21 to prevent storage locks)
+    # Phase 20: Interrupted Operations Test
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo "  PHASE 20: Interrupted Operations Test" | tee -a "$LOG_FILE"
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -3631,6 +3620,17 @@ main() {
 
     vmid=$((VMID_START + 29))
     test_interrupted_operations "$vmid" "$test_num"
+    echo | tee -a "$LOG_FILE"
+    test_num=$((test_num + 1))
+
+    # Phase 21: Large Disk Operations Test
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo "  PHASE 21: Large Disk Operations Test" | tee -a "$LOG_FILE"
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo | tee -a "$LOG_FILE"
+
+    vmid=$((VMID_START + 30))
+    test_large_disk_operations "$vmid" "$test_num"
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
 
