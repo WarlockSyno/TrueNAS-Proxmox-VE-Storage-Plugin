@@ -1,0 +1,7166 @@
+#!/usr/bin/env bash
+# vim: noai:ts=4:sw=4:expandtab
+# shellcheck disable=SC2015,SC2016
+#
+# TrueNAS Proxmox VE Plugin Installer
+# Interactive installation, update, and configuration wizard
+#
+# TODO: Orphan resource detection currently only supports iSCSI mode.
+#       NVMe/TCP orphan detection requires WebSocket API support which is
+#       not yet implemented in bash. Future enhancement should add WebSocket
+#       client for nvmet.subsys.query and nvmet.namespace.query calls.
+
+set -euo pipefail
+
+# ============================================================================
+# CONSTANTS AND CONFIGURATION
+# ============================================================================
+
+readonly INSTALLER_VERSION="1.1.0"
+readonly GITHUB_REPO="WarlockSyno/truenasplugin"
+readonly PLUGIN_FILE="/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm"
+readonly STORAGE_CFG="/etc/pve/storage.cfg"
+readonly BACKUP_DIR="/var/lib/truenas-plugin-backups"
+readonly LOG_FILE="/var/log/truenas-installer.log"
+
+# Exit codes
+readonly EXIT_SUCCESS=0
+readonly EXIT_ERROR=1
+readonly EXIT_USER_CANCEL=2
+
+# Escape sequence helper
+esc() {
+    case $1 in
+        CUU) printf '\033[%sA' "${2:-1}" ;;      # cursor up
+        CUD) printf '\033[%sB' "${2:-1}" ;;      # cursor down
+        CUF) printf '\033[%sC' "${2:-1}" ;;      # cursor forward
+        CUB) printf '\033[%sD' "${2:-1}" ;;      # cursor backward
+        SCP) printf '\033[s' ;;                   # save cursor position
+        RCP) printf '\033[u' ;;                   # restore cursor position
+        SGR) printf '\033[%sm' "$2" ;;            # Select Graphic Rendition
+    esac
+}
+
+# Detect terminal color support
+detect_color_support() {
+    # Check COLORTERM for truecolor support first (before TTY check)
+    if [[ "${COLORTERM:-}" =~ (truecolor|24bit) ]]; then
+        echo "truecolor"
+        return
+    fi
+
+    # Check TERM environment variable for explicit color capability
+    if [[ "$TERM" =~ 256color ]]; then
+        echo "256"
+        return
+    elif [[ "$TERM" =~ (xterm-color|.*-256|xterm-16color) ]]; then
+        echo "256"
+        return
+    fi
+
+    # Try tput if available
+    local colors
+    colors=$(tput colors 2>/dev/null || echo 0)
+
+    if [[ "$colors" -ge 256 ]]; then
+        echo "256"
+    elif [[ "$colors" -ge 16 ]]; then
+        echo "16"
+    elif [[ "$colors" -ge 8 ]]; then
+        echo "8"
+    else
+        # Enhanced fallback logic
+        # SSH sessions typically support 256 colors
+        if [[ -n "$SSH_CLIENT" || -n "$SSH_TTY" || -n "$SSH_CONNECTION" ]]; then
+            echo "256"
+        elif [[ "$TERM" =~ (xterm|screen|tmux|rxvt|linux|ansi|vt) ]]; then
+            echo "16"
+        else
+            # Check if we have a TTY - if so, assume basic colors
+            if [[ -t 1 ]] || [[ -t 0 ]]; then
+                echo "16"
+            else
+                echo "none"
+            fi
+        fi
+    fi
+}
+
+# Color support level (can be overridden with INSTALLER_COLORS env var)
+readonly COLOR_SUPPORT="${INSTALLER_COLORS:-$(detect_color_support)}"
+
+# Debug: Show detected color support (comment out in production)
+# Uncomment the line below to debug color detection:
+# echo "DEBUG: COLOR_SUPPORT=$COLOR_SUPPORT TERM=$TERM SSH_CLIENT=${SSH_CLIENT:-none}" >&2
+
+# Color definitions (Dylan Araps style)
+c0=$(esc SGR 0)      # reset
+c1=$(esc SGR 31)     # red
+c2=$(esc SGR 32)     # green
+c3=$(esc SGR 33)     # yellow
+c4=$(esc SGR 34)     # blue
+c5=$(esc SGR 35)     # magenta
+c6=$(esc SGR 36)     # cyan
+c7=$(esc SGR 37)     # white
+c8=$(esc SGR 1)      # bold
+
+# Legacy color compatibility
+readonly COLOR_RESET="$c0"
+readonly COLOR_RED="$c1"
+readonly COLOR_GREEN="$c2"
+readonly COLOR_YELLOW="$c3"
+readonly COLOR_BLUE="$c4"
+readonly COLOR_CYAN="$c6"
+readonly COLOR_BOLD="$c8"
+
+# 256-color palette generator
+color256() {
+    printf '\033[38;5;%dm' "$1"
+}
+
+# RGB color (truecolor) generator
+rgb() {
+    printf '\033[38;2;%d;%d;%dm' "$1" "$2" "$3"
+}
+
+# Generate gradient color for line number (0-based)
+# Uses cyan to blue gradient (Neofetch-inspired)
+gradient_color() {
+    local line_num="$1"
+    local total_lines="${2:-15}"
+
+    case "$COLOR_SUPPORT" in
+        truecolor)
+            # Smooth RGB gradient: cyan (0,255,255) -> blue (0,100,255) -> deep blue (0,50,200)
+            local ratio=$((line_num * 100 / total_lines))
+            local r=0
+            local g=$((255 - ratio * 155 / 100))
+            local b=$((255 - ratio * 55 / 100))
+            rgb "$r" "$g" "$b"
+            ;;
+        256)
+            # Use 256-color palette: cyan spectrum
+            # Colors: 51(cyan) -> 45 -> 39 -> 33(blue)
+            local colors=(51 50 49 48 45 44 39 38 33 32 27 26 21 20 19)
+            local idx=$((line_num * ${#colors[@]} / total_lines))
+            [[ $idx -ge ${#colors[@]} ]] && idx=$((${#colors[@]} - 1))
+            color256 "${colors[$idx]}"
+            ;;
+        16|8)
+            # Gradient using basic colors: cyan -> blue
+            # Divide into thirds for smooth-ish transition
+            local third=$((total_lines / 3))
+            if [[ $line_num -lt $third ]]; then
+                # First third: bright cyan
+                printf '\033[1;36m'
+            elif [[ $line_num -lt $((third * 2)) ]]; then
+                # Middle third: cyan
+                printf '%s' "$c6"
+            else
+                # Last third: blue
+                printf '%s' "$c4"
+            fi
+            ;;
+        *)
+            # No color support - return empty string
+            :
+            ;;
+    esac
+}
+
+# ============================================================================
+# LOGGING AND OUTPUT FUNCTIONS
+# ============================================================================
+
+# Global spinner control
+SPINNER_PID=""
+
+# Start spinner animation
+start_spinner() {
+    local spinner_chars=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local spinner_pos=0
+
+    # Hide cursor
+    printf "\033[?25l" >&2
+
+    # Create a wrapper script that runs spinner in its own process group
+    # This ensures all children (including sleep) can be killed together
+    local spinner_script="/tmp/.installer-spinner-$$.sh"
+    cat > "$spinner_script" << 'SPINNER_EOF'
+#!/bin/bash
+# Create new process group
+set -m
+
+# Trap to kill entire process group on exit
+cleanup() {
+    # Kill all processes in this process group
+    kill -- -$$ 2>/dev/null || true
+    exit 0
+}
+trap cleanup TERM INT HUP EXIT
+
+# Spinner loop
+spinner_chars=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+spinner_pos=0
+max_iterations=3000
+iterations=0
+
+while [[ $iterations -lt $max_iterations ]]; do
+    printf "\033[s%s\033[u" "${spinner_chars[$spinner_pos]}" >&2
+    spinner_pos=$(( (spinner_pos + 1) % 10 ))
+    iterations=$((iterations + 1))
+    sleep 0.1
+done
+SPINNER_EOF
+
+    chmod +x "$spinner_script"
+
+    # Start spinner script in background
+    "$spinner_script" &
+    SPINNER_PID=$!
+
+    # Give it a moment to set up its process group
+    sleep 0.05
+}
+
+# Stop spinner animation
+stop_spinner() {
+    if [[ -n "$SPINNER_PID" ]] && [[ "$SPINNER_PID" != "0" ]]; then
+        # Check if process exists
+        if kill -0 "$SPINNER_PID" 2>/dev/null; then
+            # Kill the entire process group (negative PID)
+            # This kills the spinner script AND all its children (including sleep)
+            kill -- -"$SPINNER_PID" 2>/dev/null || true
+
+            # Also send to the process itself
+            kill -TERM "$SPINNER_PID" 2>/dev/null || true
+
+            # Wait briefly for termination (max 1 second)
+            local wait_count=0
+            while [[ $wait_count -lt 10 ]]; do
+                if ! kill -0 "$SPINNER_PID" 2>/dev/null; then
+                    break
+                fi
+                sleep 0.1
+                wait_count=$((wait_count + 1))
+            done
+
+            # Force kill if still alive
+            if kill -0 "$SPINNER_PID" 2>/dev/null; then
+                kill -9 "$SPINNER_PID" 2>/dev/null || true
+                kill -9 -"$SPINNER_PID" 2>/dev/null || true
+            fi
+
+            # Final cleanup: kill any remaining children
+            pkill -P "$SPINNER_PID" 2>/dev/null || true
+        fi
+
+        # Clean up temporary spinner script
+        rm -f "/tmp/.installer-spinner-$$.sh" 2>/dev/null || true
+
+        SPINNER_PID=""
+    fi
+
+    # Show cursor - calling code will overwrite spinner with \r
+    printf "\033[?25h" >&2
+}
+
+# Clear screen
+clear_screen() {
+    printf '\033[2J\033[H'
+}
+
+# Clear from cursor to end of screen
+clear_below() {
+    printf '\033[0J'
+}
+
+# Display ASCII banner with gradient colors
+print_banner() {
+    # Banner lines array
+    local -a lines=(
+        "    "
+        "   d8P                                                       "
+        "d888888P                                                     "
+        "  ?88'    88bd88b?88   d8P d8888b  88bd88b  d888b8b   .d888b,"
+        "  88P     88P'  \`d88   88 d8b_,dP  88P' ?8bd8P' ?88   ?8b,   "
+        "  88b    d88     ?8(  d88 88b     d88   88P88b  ,88b    \`?8b "
+        "  \`?8b  d88'     \`?88P'?8b\`?888P'd88'   88b\`?88P'\`88b\`?888P' "
+        "                                                              "
+        "              d8b                      d8,          "
+        "              88P                     \`8P           "
+        "             d88                                    "
+        "   ?88,.d88b,888  ?88   d8P d888b8b    88b  88bd88b "
+        "   \`?88'  ?88?88  d88   88 d8P' ?88    88P  88P' ?8b"
+        "     88b  d8P 88b ?8(  d88 88b  ,88b  d88  d88   88P"
+        "     888888P'  88b\`?88P'?8b\`?88P'\`88bd88' d88'   88b"
+        "     88P'                         )88               "
+        "    d88                          ,88P     For Proxmox VE"
+        "    ?8P                      \`?8888P                "
+        " "
+    )
+
+    local total_lines=${#lines[@]}
+
+    # Print each line with gradient color
+    local i=0
+    for line in "${lines[@]}"; do
+        local color
+        color=$(gradient_color "$i" "$total_lines")
+        printf '%b%s%b\n' "$color" "$line" "$c0"
+        i=$((i + 1))
+    done
+}
+
+# Initialize logging
+init_logging() {
+    mkdir -p "$(dirname "$LOG_FILE")"
+    touch "$LOG_FILE" 2>/dev/null || {
+        echo "Warning: Cannot create log file at $LOG_FILE" >&2
+        return 1
+    }
+    log "INFO" "Installer started (version $INSTALLER_VERSION)"
+}
+
+# Write to log file
+log() {
+    local level="$1"
+    shift
+    local message="$*"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [$level] $message" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+# Info message (blue)
+info() {
+    printf '%b\n' "${c4}  ${*}${c0}"
+    log "INFO" "$*"
+}
+
+# Success message (green)
+success() {
+    printf '%b\n' "${c2}  ${*}${c0}"
+    log "SUCCESS" "$*"
+}
+
+# Warning message (yellow)
+warning() {
+    printf '%b\n' "${c3}  ${*}${c0}"
+    log "WARNING" "$*"
+}
+
+# Error message (red)
+error() {
+    printf '%b\n' "${c1}  ${*}${c0}" >&2
+    log "ERROR" "$*"
+}
+
+# Fatal error - print and exit
+fatal() {
+    error "$*"
+    exit $EXIT_ERROR
+}
+
+# Print section header
+print_header() {
+    printf '\n%b\n' "${c6}${c8}${*}${c0}"
+    printf '%b\n\n' "${c6}$(printf '%*s' ${#1} '' | tr ' ' '-')${c0}"
+}
+
+# ============================================================================
+# PRIVILEGE AND DEPENDENCY CHECKS
+# ============================================================================
+
+# Check if running as root
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        fatal "This installer must be run as root. Please use: sudo $0"
+    fi
+    log "INFO" "Root privilege check passed"
+}
+
+# Check required dependencies
+check_dependencies() {
+    local missing_deps=()
+    local deps=("perl" "systemctl")
+
+    # Check for wget or curl
+    if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
+        missing_deps+=("wget or curl")
+    fi
+
+    # Check other dependencies
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" >/dev/null 2>&1; then
+            missing_deps+=("$dep")
+        fi
+    done
+
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        error "Missing required dependencies: ${missing_deps[*]}"
+        echo
+        info "Please install missing dependencies:"
+        echo "  apt-get update && apt-get install -y ${missing_deps[*]}"
+        echo
+        exit $EXIT_ERROR
+    fi
+
+    log "INFO" "All dependencies satisfied"
+}
+
+# ============================================================================
+# CLUSTER DETECTION
+# ============================================================================
+
+# Detect if running on a Proxmox cluster node
+is_cluster_node() {
+    # Check if /etc/pve directory exists and has cluster configuration
+    if [[ -d "/etc/pve/nodes" ]] && [[ $(find /etc/pve/nodes -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l) -gt 1 ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Get cluster node count
+get_cluster_node_count() {
+    if [[ -d "/etc/pve/nodes" ]]; then
+        find /etc/pve/nodes -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l
+    else
+        echo "0"
+    fi
+}
+
+# Display cluster warning
+show_cluster_warning() {
+    local node_count
+    node_count=$(get_cluster_node_count)
+
+    if [[ "$node_count" -gt 1 ]]; then
+        echo
+        warning "⚠️  Proxmox Cluster Detected (${node_count} nodes)"
+        echo
+        info "This installer only updates the current node."
+        info "To update all cluster nodes, use the cluster update script:"
+        echo
+        echo "  wget https://raw.githubusercontent.com/${GITHUB_REPO}/main/tools/update-cluster.sh"
+        echo "  chmod +x update-cluster.sh"
+        echo "  ./update-cluster.sh node1 node2 node3"
+        echo
+        return 0
+    fi
+    return 1
+}
+
+# Get current node name from cluster membership
+get_current_node_name() {
+    if [[ ! -f /etc/pve/.members ]]; then
+        echo ""
+        return 1
+    fi
+
+    # Extract nodename from JSON
+    grep -Po '"nodename":\s*"\K[^"]+' /etc/pve/.members 2>/dev/null || echo ""
+}
+
+# Get list of all cluster nodes with their IPs
+# Returns array of "nodename:ip" strings
+get_cluster_nodes() {
+    if [[ ! -f /etc/pve/.members ]]; then
+        return 1
+    fi
+
+    local -a nodes=()
+    local content
+    content=$(cat /etc/pve/.members 2>/dev/null) || return 1
+
+    # Validate basic JSON structure
+    if [[ ! "$content" =~ \{.*nodelist.*\} ]]; then
+        log "ERROR" "Invalid or corrupted /etc/pve/.members file - missing nodelist structure"
+        return 1
+    fi
+
+    # Extract nodelist section and parse each node entry
+    # Look for pattern: "nodename": { ... "ip": "x.x.x.x" ... }
+    local in_nodelist=false
+    local current_node=""
+
+    while IFS= read -r line; do
+        # Check if we're in the nodelist section
+        if [[ "$line" =~ \"nodelist\" ]]; then
+            in_nodelist=true
+            continue
+        fi
+
+        if [[ "$in_nodelist" == true ]]; then
+            # Extract node name from line like: "nodename": {
+            # Supports any valid hostname (alphanumeric, dots, hyphens, underscores)
+            if [[ "$line" =~ \"([a-zA-Z0-9._-]+)\":[[:space:]]*\{ ]]; then
+                current_node="${BASH_REMATCH[1]}"
+            fi
+
+            # Extract IP from line like: "ip": "10.15.14.195"
+            if [[ -n "$current_node" ]] && [[ "$line" =~ \"ip\":[[:space:]]*\"([0-9.]+)\" ]]; then
+                local ip="${BASH_REMATCH[1]}"
+
+                # Validate IP format (basic check for x.x.x.x pattern)
+                if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+                    # Validate each octet is 0-255
+                    local valid=true
+                    IFS='.' read -ra octets <<< "$ip"
+                    for octet in "${octets[@]}"; do
+                        if [[ "$octet" -gt 255 ]]; then
+                            valid=false
+                            break
+                        fi
+                    done
+
+                    if [[ "$valid" == true ]]; then
+                        nodes+=("${current_node}:${ip}")
+                    fi
+                fi
+                current_node=""
+            fi
+
+            # Exit nodelist section when we hit the closing brace for the nodelist object
+            # Only exit if we have nodes and we're not in a node sub-object (current_node is empty)
+            if [[ "$line" =~ ^[[:space:]]*\}[[:space:]]*(,)?[[:space:]]*$ ]]; then
+                if [[ ${#nodes[@]} -gt 0 ]] && [[ -z "$current_node" ]]; then
+                    break
+                fi
+            fi
+        fi
+    done <<< "$content"
+
+    # Output the nodes array
+    printf '%s\n' "${nodes[@]}"
+    return 0
+}
+
+# Get list of remote cluster nodes (excludes current node)
+# Returns array of "nodename:ip" strings
+get_remote_cluster_nodes() {
+    local current_node
+    current_node=$(get_current_node_name)
+
+    if [[ -z "$current_node" ]]; then
+        return 1
+    fi
+
+    local -a all_nodes
+    mapfile -t all_nodes < <(get_cluster_nodes)
+
+    local -a remote_nodes=()
+    for node in "${all_nodes[@]}"; do
+        local name="${node%%:*}"
+        if [[ "$name" != "$current_node" ]]; then
+            remote_nodes+=("$node")
+        fi
+    done
+
+    # Output the remote nodes array
+    printf '%s\n' "${remote_nodes[@]}"
+    return 0
+}
+
+# Validate SSH connectivity to a cluster node
+# Args: $1 = node IP
+# Returns: 0 on success, 1 on failure
+validate_ssh_to_node() {
+    local node_ip="$1"
+
+    if [[ -z "$node_ip" ]]; then
+        return 1
+    fi
+
+    # Test SSH with timeout and batch mode (no password prompts)
+    if ssh -o ConnectTimeout=5 \
+           -o BatchMode=yes \
+           -o StrictHostKeyChecking=accept-new \
+           "root@${node_ip}" "echo test" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Validate SSH connectivity to all cluster nodes
+# Populates arrays: ssh_reachable_nodes, ssh_unreachable_nodes
+# Returns: 0 if all nodes reachable, 1 if any unreachable
+validate_cluster_ssh() {
+    local -a remote_nodes
+    mapfile -t remote_nodes < <(get_remote_cluster_nodes)
+
+    if [[ ${#remote_nodes[@]} -eq 0 ]]; then
+        info "No remote cluster nodes found"
+        return 0
+    fi
+
+    info "Validating SSH connectivity to cluster nodes..."
+    echo
+
+    ssh_reachable_nodes=()
+    ssh_unreachable_nodes=()
+
+    for node_info in "${remote_nodes[@]}"; do
+        local node_name="${node_info%%:*}"
+        local node_ip="${node_info##*:}"
+
+        printf "  Testing %s (%s)... " "$node_name" "$node_ip"
+
+        if validate_ssh_to_node "$node_ip"; then
+            echo "${c3}✓ Reachable${c0}"
+            ssh_reachable_nodes+=("$node_info")
+        else
+            echo "${c5}✗ Unreachable${c0}"
+            ssh_unreachable_nodes+=("$node_info")
+        fi
+    done
+
+    echo
+
+    if [[ ${#ssh_unreachable_nodes[@]} -gt 0 ]]; then
+        warning "Some nodes are not reachable via SSH:"
+        for node_info in "${ssh_unreachable_nodes[@]}"; do
+            local node_name="${node_info%%:*}"
+            local node_ip="${node_info##*:}"
+            echo "  • $node_name ($node_ip)"
+        done
+        echo
+        info "Ensure passwordless SSH is configured between cluster nodes"
+        info "To test manually: ssh root@<node_ip> hostname"
+        return 1
+    fi
+
+    success "All cluster nodes are reachable via SSH"
+    return 0
+}
+
+# ============================================================================
+# INSTALLATION STATE DETECTION
+# ============================================================================
+
+# Get currently installed plugin version
+get_installed_version() {
+    if [[ ! -f "$PLUGIN_FILE" ]]; then
+        echo ""
+        return 1
+    fi
+
+    # Extract version from plugin file
+    local version
+    version=$(perl -ne 'print $1 if /VERSION\s*=\s*['\''"]([0-9]+\.[0-9]+\.[0-9]+)/' "$PLUGIN_FILE" 2>/dev/null || echo "")
+
+    if [[ -z "$version" ]]; then
+        # Try alternative version extraction
+        version=$(perl -ne 'print $1 if /version:\s*([0-9]+\.[0-9]+\.[0-9]+)/' "$PLUGIN_FILE" 2>/dev/null || echo "")
+    fi
+
+    echo "$version"
+}
+
+# Get pre-release status for installed version
+# Returns: "true" if pre-release, "false" otherwise
+get_installed_prerelease_status() {
+    local version="$1"
+
+    if [[ -z "$version" ]]; then
+        echo "false"
+        return 0
+    fi
+
+    # Fetch release data from GitHub for this version
+    local release_data
+    release_data=$(github_api_call "/releases/tags/v${version}" 2>/dev/null) || {
+        # If API call fails, assume not a pre-release
+        echo "false"
+        return 0
+    }
+
+    get_release_prerelease_status "$release_data"
+}
+
+# Check if plugin is installed
+is_plugin_installed() {
+    [[ -f "$PLUGIN_FILE" ]]
+}
+
+# Get installation state summary
+get_install_state() {
+    if is_plugin_installed; then
+        local version
+        version=$(get_installed_version)
+        if [[ -n "$version" ]]; then
+            echo "installed:$version"
+        else
+            echo "installed:unknown"
+        fi
+    else
+        echo "not_installed"
+    fi
+}
+
+# ============================================================================
+# ERROR HANDLING
+# ============================================================================
+
+# Cleanup on error
+cleanup_on_error() {
+    local exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        error "Installation failed with exit code $exit_code"
+        log "ERROR" "Installation failed with exit code $exit_code"
+    fi
+}
+
+# Cleanup all background processes
+cleanup_all() {
+    # Stop spinner first
+    stop_spinner
+
+    # Kill any remaining background jobs
+    local jobs_pids
+    jobs_pids=$(jobs -p 2>/dev/null || true)
+    if [[ -n "$jobs_pids" ]]; then
+        # shellcheck disable=SC2086
+        kill $jobs_pids 2>/dev/null || true
+    fi
+
+    # Extra safety: kill any orphaned sleep 0.1 processes that belong to this script
+    # This is a safety net for any edge cases
+    pkill -f "sleep 0\.1" 2>/dev/null || true
+
+    # Restore cursor visibility
+    printf "\033[?25h" >&2
+
+    # If interrupted (not normal exit), show user-friendly message
+    if [[ "${1:-}" == "interrupted" ]]; then
+        echo
+        echo
+        warning "Installation interrupted by user"
+    fi
+}
+
+# Set up error trap and cleanup
+trap 'cleanup_all; cleanup_on_error' EXIT
+trap 'cleanup_all interrupted; exit 130' INT
+trap 'cleanup_all; exit 143' TERM
+
+# ============================================================================
+# ARGUMENT PARSING
+# ============================================================================
+
+# Show help message
+show_help() {
+    cat << EOF
+TrueNAS Proxmox VE Plugin Installer v${INSTALLER_VERSION}
+
+Usage: $0 [OPTIONS]
+
+OPTIONS:
+    --version           Display installer version
+    --non-interactive   Run in non-interactive mode with defaults
+    --help              Show this help message
+
+EXAMPLES:
+    # Interactive installation (default)
+    $0
+
+    # Non-interactive installation
+    $0 --non-interactive
+
+    # One-liner installation from GitHub (auto-detects non-interactive)
+    curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh | bash
+
+    # Or with wget
+    wget -qO- https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh | bash
+
+For more information, visit:
+https://github.com/${GITHUB_REPO}
+
+EOF
+}
+
+# Parse command line arguments
+parse_arguments() {
+    NON_INTERACTIVE=false
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --version)
+                echo "TrueNAS Proxmox VE Plugin Installer v${INSTALLER_VERSION}"
+                exit 0
+                ;;
+            --non-interactive)
+                NON_INTERACTIVE=true
+                shift
+                ;;
+            --help|-h)
+                show_help
+                exit 0
+                ;;
+            *)
+                error "Unknown option: $1"
+                echo
+                show_help
+                exit $EXIT_ERROR
+                ;;
+        esac
+    done
+}
+
+# ============================================================================
+# GITHUB API INTEGRATION
+# ============================================================================
+
+# Detect which download tool to use
+get_download_tool() {
+    if command -v curl >/dev/null 2>&1; then
+        echo "curl"
+    elif command -v wget >/dev/null 2>&1; then
+        echo "wget"
+    else
+        return 1
+    fi
+}
+
+# Download file using available tool
+download_file() {
+    local url="$1"
+    local output="$2"
+    local tool
+    tool=$(get_download_tool)
+
+    log "INFO" "Downloading $url to $output using $tool"
+
+    case "$tool" in
+        curl)
+            curl -fsSL -o "$output" "$url" || return 1
+            ;;
+        wget)
+            wget -q -O "$output" "$url" || return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Download to stdout
+download_stdout() {
+    local url="$1"
+    local tool
+    tool=$(get_download_tool)
+
+    case "$tool" in
+        curl)
+            curl -fsSL "$url" || return 1
+            ;;
+        wget)
+            wget -q -O - "$url" || return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Fetch GitHub API data
+github_api_call() {
+    local endpoint="$1"
+    local url="https://api.github.com/repos/${GITHUB_REPO}${endpoint}"
+
+    log "INFO" "GitHub API call: $url"
+
+    local response
+    response=$(download_stdout "$url" 2>&1) || {
+        log "ERROR" "GitHub API call failed: $url"
+        return 1
+    }
+
+    # Check for rate limiting - only check message field if response lacks expected success fields
+    # GitHub success responses have tag_name, assets, etc. Error responses have message field.
+    if ! echo "$response" | grep -q '"tag_name"\|"assets"\|"version"'; then
+        # This looks like an error response, check for rate limit message
+        if echo "$response" | grep -q '"message"'; then
+            local message
+            message=$(echo "$response" | grep -Po '"message":\s*"\K[^"]+')
+            if [[ "$message" == *"rate limit"* ]]; then
+                error "GitHub API rate limit exceeded. Please try again later."
+                log "ERROR" "GitHub API rate limit exceeded"
+                return 1
+            fi
+        fi
+    fi
+
+    echo "$response"
+}
+
+# Get latest release from GitHub
+get_latest_release() {
+    local release_data
+    release_data=$(github_api_call "/releases/latest") || {
+        error "Failed to fetch latest release from GitHub"
+        info "Please check your internet connection and try again"
+        return 1
+    }
+
+    echo "$release_data"
+}
+
+# Get all releases from GitHub
+get_all_releases() {
+    local releases_data
+    releases_data=$(github_api_call "/releases") || {
+        error "Failed to fetch releases from GitHub"
+        return 1
+    }
+
+    echo "$releases_data"
+}
+
+# Extract version from release data
+get_release_version() {
+    local release_data="$1"
+    echo "$release_data" | grep -Po '"tag_name":\s*"\K[^"]+' | sed 's/^v//'
+}
+
+# Check if release is a pre-release
+# Returns: "true" if pre-release, "false" otherwise
+get_release_prerelease_status() {
+    local release_data="$1"
+    local prerelease
+    prerelease=$(echo "$release_data" | grep -Po '"prerelease":\s*\K(true|false)' | head -1)
+    echo "${prerelease:-false}"
+}
+
+# Get download URL for plugin file from release
+get_plugin_download_url() {
+    local release_data="$1"
+    local plugin_url
+
+    # Try to find TrueNASPlugin.pm in assets
+    # Use sed to extract assets section more reliably than grep -Pzo
+    plugin_url=""
+
+    # Check if the asset exists and extract its download URL
+    if echo "$release_data" | grep -q '"name":\s*"TrueNASPlugin\.pm"'; then
+        # Found the matching asset, extract the browser_download_url from context
+        local context_lines
+        context_lines=$(echo "$release_data" | grep -A 10 '"name":\s*"TrueNASPlugin\.pm"')
+        plugin_url=$(echo "$context_lines" | grep -Po '"browser_download_url":\s*"\K[^"]+' | head -1)
+    fi
+
+    if [[ -z "$plugin_url" || "$plugin_url" == "null" ]]; then
+        # Fallback to raw GitHub URL
+        local tag_name
+        tag_name=$(echo "$release_data" | grep -Po '"tag_name":\s*"\K[^"]+')
+        plugin_url="https://raw.githubusercontent.com/${GITHUB_REPO}/${tag_name}/TrueNASPlugin.pm"
+    fi
+
+    echo "$plugin_url"
+}
+
+# Compare two semantic versions
+# Returns: 0 if equal, 1 if v1 > v2, 2 if v1 < v2
+compare_versions() {
+    local v1="$1"
+    local v2="$2"
+
+    if [[ "$v1" == "$v2" ]]; then
+        return 0
+    fi
+
+    local IFS=.
+    local i ver1=($v1) ver2=($v2)
+
+    # Fill empty positions with zeros
+    for ((i=${#ver1[@]}; i<${#ver2[@]}; i++)); do
+        ver1[i]=0
+    done
+
+    for ((i=0; i<${#ver1[@]}; i++)); do
+        if [[ -z ${ver2[i]} ]]; then
+            ver2[i]=0
+        fi
+        if ((10#${ver1[i]} > 10#${ver2[i]})); then
+            return 1
+        fi
+        if ((10#${ver1[i]} < 10#${ver2[i]})); then
+            return 2
+        fi
+    done
+
+    return 0
+}
+
+# Check if update is available
+# Returns: "version:prerelease" (e.g., "1.1.3:true") if update available, empty otherwise
+check_for_updates() {
+    local current_version="$1"
+    local latest_release
+    latest_release=$(get_latest_release) || return 1
+
+    local latest_version
+    latest_version=$(get_release_version "$latest_release")
+
+    local is_prerelease
+    is_prerelease=$(get_release_prerelease_status "$latest_release")
+
+    log "INFO" "Current version: $current_version, Latest version: $latest_version, Pre-release: $is_prerelease"
+
+    compare_versions "$current_version" "$latest_version"
+    local result=$?
+
+    if [[ $result -eq 2 ]]; then
+        # Current version is older
+        echo "${latest_version}:${is_prerelease}"
+        return 0
+    else
+        # Current version is same or newer
+        return 1
+    fi
+}
+
+# Download plugin file with progress
+download_plugin() {
+    local url="$1"
+    local output="$2"
+    local show_progress="${3:-true}"
+
+    if [[ "$show_progress" == "true" ]]; then
+        info "Downloading plugin from GitHub..."
+    fi
+
+    # Create temporary file
+    local temp_file="${output}.tmp"
+
+    if download_file "$url" "$temp_file"; then
+        mv "$temp_file" "$output"
+        log "INFO" "Plugin downloaded successfully to $output"
+        return 0
+    else
+        rm -f "$temp_file"
+        log "ERROR" "Failed to download plugin from $url"
+        return 1
+    fi
+}
+
+# ============================================================================
+# BACKUP AND ROLLBACK
+# ============================================================================
+
+# Create backup of plugin file
+backup_plugin() {
+    if [[ ! -f "$PLUGIN_FILE" ]]; then
+        log "INFO" "No existing plugin to backup"
+        return 0
+    fi
+
+    mkdir -p "$BACKUP_DIR"
+
+    local timestamp
+    timestamp=$(date '+%Y%m%d_%H%M%S')
+    local version
+    version=$(get_installed_version)
+    local backup_file="${BACKUP_DIR}/TrueNASPlugin.pm.backup.${version:-unknown}.${timestamp}"
+
+    cp "$PLUGIN_FILE" "$backup_file" || {
+        error "Failed to create backup"
+        return 1
+    }
+
+    success "Backup created: $backup_file"
+    log "INFO" "Backup created: $backup_file"
+    return 0
+}
+
+# List available backups
+list_backups() {
+    if [[ ! -d "$BACKUP_DIR" ]]; then
+        return 1
+    fi
+
+    find "$BACKUP_DIR" -name "TrueNASPlugin.pm.backup.*" -type f | sort -r
+}
+
+# Human-readable file size
+format_size() {
+    local bytes="$1"
+    local size
+
+    if [[ "$bytes" -lt 1024 ]]; then
+        echo "${bytes}B"
+    elif [[ "$bytes" -lt $((1024 * 1024)) ]]; then
+        size=$((bytes / 1024))
+        echo "${size}KB"
+    elif [[ "$bytes" -lt $((1024 * 1024 * 1024)) ]]; then
+        size=$((bytes / 1024 / 1024))
+        echo "${size}MB"
+    else
+        size=$((bytes / 1024 / 1024 / 1024))
+        echo "${size}GB"
+    fi
+}
+
+# Calculate backup age in days
+backup_age_days() {
+    local backup_file="$1"
+    local file_time
+    local current_time
+    local age_seconds
+
+    file_time=$(stat -c %Y "$backup_file" 2>/dev/null || stat -f %m "$backup_file" 2>/dev/null)
+    current_time=$(date +%s)
+    age_seconds=$((current_time - file_time))
+    echo $((age_seconds / 86400))
+}
+
+# Format age in human-readable form
+format_age() {
+    local days="$1"
+
+    if [[ "$days" -eq 0 ]]; then
+        echo "Today"
+    elif [[ "$days" -eq 1 ]]; then
+        echo "1 day ago"
+    elif [[ "$days" -lt 30 ]]; then
+        echo "${days} days ago"
+    elif [[ "$days" -lt 365 ]]; then
+        local months=$((days / 30))
+        if [[ "$months" -eq 1 ]]; then
+            echo "1 month ago"
+        else
+            echo "${months} months ago"
+        fi
+    else
+        local years=$((days / 365))
+        if [[ "$years" -eq 1 ]]; then
+            echo "1 year ago"
+        else
+            echo "${years} years ago"
+        fi
+    fi
+}
+
+# Scan backups and return statistics
+scan_backups() {
+    local backups
+    backups=$(list_backups 2>/dev/null || true)
+
+    if [[ -z "$backups" ]]; then
+        echo "0:0:0:0"  # count:total_size:oldest_age:newest_age
+        return
+    fi
+
+    local count=0
+    local total_size=0
+    local oldest_age=0
+    local newest_age=999999
+
+    while IFS= read -r backup; do
+        ((count++))
+        local size
+        size=$(stat -c %s "$backup" 2>/dev/null || stat -f %z "$backup" 2>/dev/null)
+        total_size=$((total_size + size))
+
+        local age
+        age=$(backup_age_days "$backup")
+
+        if [[ "$age" -gt "$oldest_age" ]]; then
+            oldest_age="$age"
+        fi
+
+        if [[ "$age" -lt "$newest_age" ]]; then
+            newest_age="$age"
+        fi
+    done <<< "$backups"
+
+    echo "${count}:${total_size}:${oldest_age}:${newest_age}"
+}
+
+# Check if backup cleanup should be offered
+should_offer_cleanup() {
+    local stats
+    stats=$(scan_backups)
+
+    IFS=':' read -r count total_size oldest_age newest_age <<< "$stats"
+
+    # Thresholds (can be customized via env vars)
+    local max_backups="${BACKUP_MAX_COUNT:-10}"
+    local max_age_days="${BACKUP_MAX_AGE_DAYS:-90}"
+    local max_size_mb="${BACKUP_MAX_SIZE_MB:-100}"
+
+    local total_size_mb=$((total_size / 1024 / 1024))
+
+    # Offer cleanup if any threshold is exceeded
+    if [[ "$count" -gt "$max_backups" ]] || \
+       [[ "$oldest_age" -gt "$max_age_days" ]] || \
+       [[ "$total_size_mb" -gt "$max_size_mb" ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+# ============================================================================
+# PLUGIN INSTALLATION
+# ============================================================================
+
+# Validate plugin syntax
+validate_plugin() {
+    local plugin_file="$1"
+
+    info "Validating plugin syntax..."
+    if perl -c "$plugin_file" >/dev/null 2>&1; then
+        success "Plugin syntax is valid"
+        return 0
+    else
+        error "Plugin syntax validation failed"
+        perl -c "$plugin_file" 2>&1 | head -10
+        return 1
+    fi
+}
+
+# Install plugin file
+install_plugin_file() {
+    local source="$1"
+    local backup="${2:-true}"
+
+    # Create backup if requested and file exists
+    if [[ "$backup" == "true" ]]; then
+        backup_plugin || {
+            error "Backup failed. Installation aborted for safety."
+            return 1
+        }
+    fi
+
+    # Validate plugin before installation
+    if ! validate_plugin "$source"; then
+        error "Plugin validation failed. Installation aborted."
+        return 1
+    fi
+
+    # Ensure target directory exists
+    local plugin_dir
+    plugin_dir="$(dirname "$PLUGIN_FILE")"
+    if [[ ! -d "$plugin_dir" ]]; then
+        info "Creating plugin directory $plugin_dir..."
+        mkdir -p "$plugin_dir" || {
+            error "Failed to create plugin directory"
+            return 1
+        }
+    fi
+
+    # Install plugin
+    info "Installing plugin to $PLUGIN_FILE..."
+    cp "$source" "$PLUGIN_FILE" || {
+        error "Failed to copy plugin file"
+        return 1
+    }
+
+    # Set correct permissions
+    chown root:root "$PLUGIN_FILE"
+    chmod 644 "$PLUGIN_FILE"
+
+    success "Plugin installed successfully"
+    log "INFO" "Plugin installed to $PLUGIN_FILE"
+    return 0
+}
+
+# Restart PVE services
+restart_pve_services() {
+    info "Restarting Proxmox services..."
+
+    local services=("pvedaemon" "pveproxy")
+    local failed=false
+
+    for service in "${services[@]}"; do
+        if systemctl restart "$service" 2>/dev/null; then
+            success "Restarted $service"
+        else
+            error "Failed to restart $service"
+            failed=true
+        fi
+    done
+
+    if [[ "$failed" == "true" ]]; then
+        warning "Some services failed to restart. Please check manually."
+        return 1
+    fi
+
+    # Wait a moment and verify services are running
+    sleep 2
+    for service in "${services[@]}"; do
+        if systemctl is-active --quiet "$service"; then
+            success "$service is running"
+        else
+            error "$service is not running"
+            failed=true
+        fi
+    done
+
+    if [[ "$failed" == "true" ]]; then
+        return 1
+    fi
+
+    success "All Proxmox services restarted successfully"
+    return 0
+}
+
+# Install plugin on a remote cluster node
+# Args: $1 = node IP, $2 = local plugin file path, $3 = version string (for backup naming)
+# Returns: 0 on success, 1 on failure, 2 on success with service restart failure
+install_plugin_on_remote_node() {
+    local node_ip="$1"
+    local plugin_file="$2"
+    local version="$3"
+
+    if [[ -z "$node_ip" || ! -f "$plugin_file" ]]; then
+        log "ERROR" "Remote installation: Invalid parameters (ip=$node_ip, file=$plugin_file)"
+        return 1
+    fi
+
+    local temp_remote="/tmp/TrueNASPlugin.pm.$$"
+    log "INFO" "Starting remote installation to $node_ip (version $version)"
+
+    # Transfer plugin file to remote node
+    if ! ssh -o ConnectTimeout=10 -o BatchMode=yes "root@${node_ip}" \
+        "cat > ${temp_remote}" < "$plugin_file" 2>/dev/null; then
+        log "ERROR" "Remote installation to $node_ip: SSH transfer failed"
+        echo "SSH transfer failed"
+        return 1
+    fi
+    log "INFO" "Remote installation to $node_ip: File transferred successfully"
+
+    # Validate plugin syntax on remote node
+    if ! ssh "root@${node_ip}" "perl -c ${temp_remote}" >/dev/null 2>&1; then
+        ssh "root@${node_ip}" "rm -f ${temp_remote}" 2>/dev/null
+        log "ERROR" "Remote installation to $node_ip: Syntax validation failed"
+        echo "Syntax validation failed"
+        return 1
+    fi
+    log "INFO" "Remote installation to $node_ip: Syntax validation passed"
+
+    # Create backup directory on remote if it doesn't exist
+    ssh "root@${node_ip}" "mkdir -p ${BACKUP_DIR}" 2>/dev/null
+
+    # Create backup on remote node (if plugin exists) using remote timestamp
+    local backup_result
+    backup_result=$(ssh "root@${node_ip}" "
+        if [[ -f ${PLUGIN_FILE} ]]; then
+            remote_ts=\$(date +%Y%m%d_%H%M%S)
+            if cp ${PLUGIN_FILE} ${BACKUP_DIR}/TrueNASPlugin.pm.backup.${version}.\${remote_ts} 2>&1; then
+                echo 'success'
+            else
+                echo 'failed'
+            fi
+        else
+            echo 'no-plugin'
+        fi
+    " 2>&1)
+
+    if [[ "$backup_result" == "failed" ]]; then
+        log "WARNING" "Remote installation to $node_ip: Backup creation failed (proceeding anyway)"
+        echo "Backup creation failed (proceeding anyway)" >&2
+    elif [[ "$backup_result" == "success" ]]; then
+        log "INFO" "Remote installation to $node_ip: Backup created successfully"
+    fi
+
+    # Install plugin on remote node atomically with error handling
+    if ! ssh "root@${node_ip}" "
+        set -e
+        mkdir -p \$(dirname ${PLUGIN_FILE})
+        cp ${temp_remote} ${PLUGIN_FILE}
+        chown root:root ${PLUGIN_FILE}
+        chmod 644 ${PLUGIN_FILE}
+        rm -f ${temp_remote}
+    " 2>&1; then
+        # Clean up temp file on failure
+        ssh "root@${node_ip}" "rm -f ${temp_remote}" 2>/dev/null || true
+        log "ERROR" "Remote installation to $node_ip: Installation failed"
+        echo "Installation failed"
+        return 1
+    fi
+    log "INFO" "Remote installation to $node_ip: Plugin installed successfully"
+
+    # Restart services on remote node
+    if ! ssh "root@${node_ip}" "systemctl restart pvedaemon pveproxy" 2>/dev/null; then
+        log "WARNING" "Remote installation to $node_ip: Service restart failed"
+        echo "Service restart failed - manual restart required"
+        return 2  # Special return code: installed but needs manual service restart
+    fi
+    log "INFO" "Remote installation to $node_ip: Services restarted successfully"
+
+    return 0
+}
+
+# Display cluster installation summary
+# Args: arrays successful_nodes, failed_nodes, failure_reasons
+show_cluster_install_summary() {
+    local total=$((${#successful_nodes[@]} + ${#failed_nodes[@]}))
+
+    echo
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    if [[ ${#successful_nodes[@]} -gt 0 ]]; then
+        success "Successfully updated ${#successful_nodes[@]} of $total nodes:"
+        for node in "${successful_nodes[@]}"; do
+            echo "  ${c3}✓${c0} $node"
+        done
+    fi
+
+    if [[ ${#failed_nodes[@]} -gt 0 ]]; then
+        echo
+        warning "Failed to update ${#failed_nodes[@]} nodes:"
+        for i in "${!failed_nodes[@]}"; do
+            echo "  ${c5}✗${c0} ${failed_nodes[$i]}: ${failure_reasons[$i]}"
+        done
+    fi
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+# Perform cluster-wide installation
+# Args: $1 = version (e.g., "latest" or "1.0.7")
+# Returns: 0 if any nodes succeeded, 1 if all failed
+perform_cluster_wide_installation() {
+    local version="${1:-latest}"
+    local include_local="${2:-true}"
+
+    print_header "Installing TrueNAS Plugin (Cluster-Wide)"
+
+    # Check for non-interactive mode
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        error "Cluster-wide installation requires interactive mode"
+        info "In non-interactive mode, the installer only updates the local node"
+        return 1
+    fi
+
+    # Validate cluster and SSH connectivity
+    if ! is_cluster_node; then
+        error "This is not a cluster node"
+        info "Cluster-wide installation is only available for clustered nodes"
+        return 1
+    fi
+
+    # Get remote nodes
+    local -a remote_nodes
+    mapfile -t remote_nodes < <(get_remote_cluster_nodes)
+
+    if [[ ${#remote_nodes[@]} -eq 0 ]]; then
+        warning "No remote cluster nodes found"
+        info "Falling back to local installation only"
+        perform_installation "$version"
+        return $?
+    fi
+
+    # Show cluster information
+    local current_node
+    current_node=$(get_current_node_name)
+    info "Current node: $current_node"
+    info "Remote nodes: ${#remote_nodes[@]}"
+    for node_info in "${remote_nodes[@]}"; do
+        local node_name="${node_info%%:*}"
+        local node_ip="${node_info##*:}"
+        echo "  • $node_name ($node_ip)"
+    done
+    echo
+
+    # Validate SSH connectivity
+    declare -a ssh_reachable_nodes
+    declare -a ssh_unreachable_nodes
+
+    if ! validate_cluster_ssh; then
+        echo
+        read -rp "Continue with only reachable nodes? (y/N): " continue_choice
+        if [[ ! "$continue_choice" =~ ^[Yy] ]]; then
+            info "Cluster installation cancelled"
+            return 1
+        fi
+        # Update remote_nodes to only include reachable ones
+        remote_nodes=("${ssh_reachable_nodes[@]}")
+    fi
+
+    # Confirmation prompt before proceeding
+    echo
+    warning "This will install/update the TrueNAS plugin on all cluster nodes"
+    info "Total nodes to update: $((${#remote_nodes[@]} + 1)) (1 local + ${#remote_nodes[@]} remote)"
+    echo
+    read -rp "Do you want to proceed? (y/N): " confirm_choice
+    if [[ ! "$confirm_choice" =~ ^[Yy] ]]; then
+        info "Cluster installation cancelled"
+        return 1
+    fi
+
+    # Download plugin from GitHub
+    info "Fetching release from GitHub..."
+    local release_data
+    if [[ "$version" == "latest" ]]; then
+        release_data=$(get_latest_release) || return 1
+    else
+        release_data=$(github_api_call "/releases/tags/v${version}") || {
+            error "Version $version not found"
+            return 1
+        }
+    fi
+
+    local install_version
+    install_version=$(get_release_version "$release_data")
+    info "Installing version: $install_version"
+
+    # Check if this is a pre-release and warn user
+    local is_prerelease
+    is_prerelease=$(get_release_prerelease_status "$release_data")
+    if [[ "$is_prerelease" == "true" ]]; then
+        echo
+        warning "⚠️  This is a PRE-RELEASE version"
+        info "Pre-release versions may contain bugs and are not recommended for production use"
+        echo
+        read -rp "Do you want to continue with cluster-wide installation? (y/N): " confirm
+        if [[ ! "$confirm" =~ ^[Yy] ]]; then
+            info "Installation cancelled"
+            return 1
+        fi
+    fi
+
+    local download_url
+    download_url=$(get_plugin_download_url "$release_data")
+
+    local temp_file="/tmp/TrueNASPlugin.pm.$$"
+    if ! download_plugin "$download_url" "$temp_file"; then
+        error "Failed to download plugin"
+        rm -f "$temp_file"
+        return 1
+    fi
+
+    # Initialize arrays for tracking installation results
+    declare -a successful_nodes=()
+    declare -a failed_nodes=()
+    declare -a failure_reasons=()
+
+    # Install on local node first if requested
+    if [[ "$include_local" == "true" ]]; then
+        echo
+        info "Installing on local node ($current_node)..."
+
+        if install_plugin_file "$temp_file"; then
+            if restart_pve_services; then
+                success "Local node installation completed"
+                successful_nodes+=("$current_node")
+            else
+                warning "Local node installed but services may need manual restart"
+                successful_nodes+=("$current_node (services need restart)")
+            fi
+        else
+            error "Local node installation failed"
+            rm -f "$temp_file"
+            return 1
+        fi
+    fi
+
+    # Install on remote nodes
+    echo
+    info "Installing on remote cluster nodes..."
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo
+
+    local total_nodes=${#remote_nodes[@]}
+    local current=0
+
+    for node_info in "${remote_nodes[@]}"; do
+        ((current++))
+        local node_name="${node_info%%:*}"
+        local node_ip="${node_info##*:}"
+
+        printf "[%d/%d] %s (%s): " "$current" "$total_nodes" "$node_name" "$node_ip"
+        start_spinner
+
+        local error_msg
+        error_msg=$(install_plugin_on_remote_node "$node_ip" "$temp_file" "$install_version" 2>&1)
+        local result=$?
+
+        stop_spinner
+        if [[ $result -eq 0 ]]; then
+            printf "\r[%d/%d] %s (%s): ${c3}✓ Success${c0}\n" "$current" "$total_nodes" "$node_name" "$node_ip"
+            successful_nodes+=("$node_name")
+        elif [[ $result -eq 2 ]]; then
+            printf "\r[%d/%d] %s (%s): ${c4}⚠ Success (restart needed)${c0}\n" "$current" "$total_nodes" "$node_name" "$node_ip"
+            successful_nodes+=("$node_name (services need restart)")
+        else
+            printf "\r[%d/%d] %s (%s): ${c5}✗ Failed${c0}\n" "$current" "$total_nodes" "$node_name" "$node_ip"
+            failed_nodes+=("$node_name")
+            failure_reasons+=("${error_msg:-Unknown error}")
+        fi
+    done
+
+    rm -f "$temp_file"
+
+    # Show summary
+    show_cluster_install_summary
+
+    # Offer retry for failed nodes
+    if [[ ${#failed_nodes[@]} -gt 0 ]]; then
+        echo
+        read -rp "Retry failed nodes? (y/N): " retry_choice
+        if [[ "$retry_choice" =~ ^[Yy] ]]; then
+            info "Waiting 5 seconds before retry..."
+            sleep 5
+
+            # Download plugin again for retry
+            local retry_temp="/tmp/TrueNASPlugin.pm.retry.$$"
+            if download_plugin "$download_url" "$retry_temp"; then
+                echo
+                info "Retrying failed nodes..."
+                echo
+
+                declare -a retry_successful=()
+                declare -a retry_failed=()
+                declare -a retry_reasons=()
+
+                for i in "${!failed_nodes[@]}"; do
+                    local node_name="${failed_nodes[$i]}"
+
+                    # Find node IP from original list
+                    local node_ip=""
+                    for node_info in "${remote_nodes[@]}"; do
+                        if [[ "${node_info%%:*}" == "$node_name" ]]; then
+                            node_ip="${node_info##*:}"
+                            break
+                        fi
+                    done
+
+                    if [[ -z "$node_ip" ]]; then
+                        continue
+                    fi
+
+                    printf "  %s (%s): " "$node_name" "$node_ip"
+
+                    local retry_error
+                    retry_error=$(install_plugin_on_remote_node "$node_ip" "$retry_temp" "$install_version" 2>&1)
+                    local retry_result=$?
+
+                    if [[ $retry_result -eq 0 ]]; then
+                        echo "${c3}✓ Success${c0}"
+                        retry_successful+=("$node_name")
+                        # Move from failed to successful
+                        successful_nodes+=("$node_name")
+                    elif [[ $retry_result -eq 2 ]]; then
+                        echo "${c4}⚠ Success (restart needed)${c0}"
+                        retry_successful+=("$node_name (services need restart)")
+                        successful_nodes+=("$node_name (services need restart)")
+                    else
+                        echo "${c5}✗ Failed${c0}"
+                        retry_failed+=("$node_name")
+                        retry_reasons+=("${retry_error:-Unknown error}")
+                    fi
+                done
+
+                rm -f "$retry_temp"
+
+                # Update failed lists
+                failed_nodes=("${retry_failed[@]}")
+                failure_reasons=("${retry_reasons[@]}")
+
+                # Show updated summary
+                show_cluster_install_summary
+            fi
+        fi
+    fi
+
+    echo
+
+    if [[ ${#successful_nodes[@]} -gt 0 ]]; then
+        success "Cluster-wide installation completed"
+
+        if [[ "$include_local" == "true" ]]; then
+            show_next_steps
+        fi
+
+        return 0
+    else
+        error "All cluster nodes failed to update"
+        return 1
+    fi
+}
+
+# Full installation workflow
+perform_installation() {
+    local version="${1:-latest}"
+
+    print_header "Installing TrueNAS Plugin"
+
+    # Get release information
+    local release_data
+    if [[ "$version" == "latest" ]]; then
+        info "Fetching latest release from GitHub..."
+        release_data=$(get_latest_release) || return 1
+    else
+        info "Fetching release $version from GitHub..."
+        release_data=$(github_api_call "/releases/tags/v${version}") || {
+            error "Version $version not found"
+            return 1
+        }
+    fi
+
+    local install_version
+    install_version=$(get_release_version "$release_data")
+    info "Installing version: $install_version"
+
+    # Check if this is a pre-release and warn user
+    local is_prerelease
+    is_prerelease=$(get_release_prerelease_status "$release_data")
+    if [[ "$is_prerelease" == "true" ]] && [[ "$NON_INTERACTIVE" != "true" ]]; then
+        echo
+        warning "⚠️  This is a PRE-RELEASE version"
+        info "Pre-release versions may contain bugs and are not recommended for production use"
+        echo
+        read -rp "Do you want to continue? (y/N): " confirm
+        if [[ ! "$confirm" =~ ^[Yy] ]]; then
+            info "Installation cancelled"
+            return 1
+        fi
+    fi
+
+    # Get download URL
+    local download_url
+    download_url=$(get_plugin_download_url "$release_data")
+    info "Download URL: $download_url"
+
+    # Download to temporary location
+    local temp_file="/tmp/TrueNASPlugin.pm.$$"
+    if ! download_plugin "$download_url" "$temp_file"; then
+        error "Failed to download plugin"
+        rm -f "$temp_file"
+        return 1
+    fi
+
+    # Install the plugin
+    if ! install_plugin_file "$temp_file"; then
+        error "Installation failed"
+        rm -f "$temp_file"
+        return 1
+    fi
+
+    rm -f "$temp_file"
+
+    # Restart services
+    if ! restart_pve_services; then
+        warning "Plugin installed but services may need manual restart"
+    fi
+
+    echo
+    success "TrueNAS Plugin v${install_version} installed successfully!"
+
+    # Show cluster warning if applicable
+    if is_cluster_node; then
+        show_cluster_warning
+    fi
+
+    # Show next steps
+    show_next_steps
+
+    return 0
+}
+
+# Display next steps and helpful information
+show_next_steps() {
+    echo
+    info "Next steps:"
+    echo "  1. Configure TrueNAS storage (if not done yet)"
+    echo "  2. Run health check to verify connectivity"
+    echo "  3. Create test VM to validate storage"
+    echo
+    info "Useful commands:"
+    echo "  • Check storage status:    pvesm status"
+    echo "  • List TrueNAS storage:    pvesm list <storage-name>"
+    echo "  • Check iSCSI sessions:    iscsiadm -m session"
+    echo
+    info "Documentation:"
+    echo "  • GitHub: https://github.com/${GITHUB_REPO}"
+    echo "  • Wiki: https://github.com/${GITHUB_REPO}/wiki"
+    echo
+    info "Example: Create a test VM"
+    echo "  qm create 999 --name test-vm --memory 2048 --net0 virtio,bridge=vmbr0"
+    echo "  qm set 999 --scsi0 <storage-name>:10"
+    echo "  qm start 999"
+    echo
+}
+
+# ============================================================================
+# INTERACTIVE MENU SYSTEM
+# ============================================================================
+
+# Display menu and get user choice
+show_menu() {
+    local title="$1"
+    shift
+    local options=("$@")
+
+    printf '\n%b\n' "${c6}${c8}${title}${c0}"
+    printf '%b\n\n' "${c6}$(printf '%*s' ${#title} '' | tr ' ' '-')${c0}"
+
+    local i=1
+    for option in "${options[@]}"; do
+        printf '  %b%s%b %s\n' "${c6}" "$i)" "${c0}" "$option"
+        ((i++))
+    done
+    printf '  %b%s%b %s\n\n' "${c3}" "0)" "${c0}" "Exit"
+}
+
+# Read user menu choice
+read_choice() {
+    local max="$1"
+    local choice
+
+    while true; do
+        read -rp "Enter choice [0-${max}]: " choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 0 ]] && [[ "$choice" -le "$max" ]]; then
+            echo "$choice"
+            return 0
+        else
+            # Move cursor up, clear to end of screen, show error, then re-prompt
+            printf "\033[1A\033[J"
+            echo ""
+            echo "  ${c5}✗${c0} Invalid choice. Please enter a number between 0 and $max"
+            echo ""
+        fi
+    done
+}
+
+# Main menu for when plugin is not installed
+menu_not_installed() {
+    while true; do
+        # Clear screen and show banner
+        clear_screen
+        print_banner
+
+        # Check if backups exist
+        local backups
+        backups=$(list_backups 2>/dev/null | wc -l || echo "0")
+        local has_backups=false
+        if [[ "$backups" -gt 0 ]]; then
+            has_backups=true
+        fi
+
+        # Build menu options dynamically
+        local menu_options=("Install latest version" "Install specific version" "View available versions")
+        local max_choice=3
+
+        # Add cluster-wide option if in a cluster
+        local cluster_option_position=0
+        if is_cluster_node; then
+            menu_options+=("Install latest version (all cluster nodes)")
+            max_choice=4
+            cluster_option_position=4
+        fi
+
+        if [[ "$has_backups" = true ]]; then
+            menu_options+=("Restore from backup ($backups available)")
+            max_choice=$((max_choice + 1))
+        fi
+
+        # Check if backup cleanup should be offered
+        local should_manage_backups=false
+        if should_offer_cleanup; then
+            should_manage_backups=true
+            menu_options+=("Manage backups")
+            max_choice=$((max_choice + 1))
+        fi
+
+        show_menu "TrueNAS Plugin - Not Installed" "${menu_options[@]}"
+
+        local choice
+        choice=$(read_choice "$max_choice")
+
+        case $choice in
+            0)
+                info "Exiting installer"
+                exit $EXIT_SUCCESS
+                ;;
+            1)
+                if perform_installation "latest"; then
+                    # Prompt to configure storage after successful installation
+                    if [[ "$NON_INTERACTIVE" != "true" ]]; then
+                        echo
+                        read -rp "Would you like to configure storage now? (y/N): " response
+                        if [[ "$response" =~ ^[Yy] ]]; then
+                            menu_configure_storage
+                            # Offer health check after configuration
+                            echo
+                            read -rp "Would you like to run a health check now? (y/N): " hc_response
+                            if [[ "$hc_response" =~ ^[Yy] ]]; then
+                                echo
+                                menu_health_check
+                            fi
+                        fi
+                    fi
+                    read -rp "Press Enter to return to main menu..."
+                    # After successful installation, break out to re-detect state
+                    return 0
+                else
+                    read -rp "Press Enter to return to main menu..."
+                fi
+                ;;
+            2)
+                if menu_install_specific_version; then
+                    # After successful installation, break out to re-detect state
+                    return 0
+                fi
+                read -rp "Press Enter to return to main menu..."
+                ;;
+            3)
+                menu_view_versions
+                ;;
+            4)
+                # Check if this is cluster-wide option or backup/manage option
+                if [[ "$cluster_option_position" -eq 4 ]]; then
+                    # Cluster-wide installation
+                    if perform_cluster_wide_installation "latest"; then
+                        read -rp "Press Enter to return to main menu..."
+                        return 0
+                    else
+                        read -rp "Press Enter to return to main menu..."
+                    fi
+                elif [[ "$has_backups" = true ]]; then
+                    menu_rollback
+                elif [[ "$should_manage_backups" = true ]]; then
+                    menu_manage_backups
+                else
+                    error "Invalid choice"
+                fi
+                ;;
+            5)
+                if [[ "$has_backups" = true ]]; then
+                    menu_rollback
+                elif [[ "$should_manage_backups" = true ]]; then
+                    menu_manage_backups
+                else
+                    error "Invalid choice"
+                fi
+                ;;
+            6)
+                if [[ "$should_manage_backups" = true ]]; then
+                    menu_manage_backups
+                else
+                    error "Invalid choice"
+                fi
+                ;;
+        esac
+    done
+}
+
+# Sub-menu for choosing update target (local or cluster-wide)
+menu_update_choice() {
+    local current_version="$1"
+
+    clear_screen
+    print_banner
+    echo
+
+    # Build menu options
+    local -a menu_items=("Update this node only")
+    local max_choice=1
+
+    # Add cluster-wide option if in a cluster
+    if is_cluster_node; then
+        menu_items+=("Update all cluster nodes")
+        max_choice=2
+    fi
+
+    show_menu "Select update target" "${menu_items[@]}"
+
+    local choice
+    choice=$(read_choice "$max_choice")
+
+    case $choice in
+        0)
+            return 0
+            ;;
+        1)
+            # Update local node only
+            if perform_installation "latest"; then
+                # Offer to run health check after successful update
+                if [[ "$NON_INTERACTIVE" != "true" ]]; then
+                    echo
+                    read -rp "Would you like to run a health check now? (y/N): " response
+                    if [[ "$response" =~ ^[Yy] ]]; then
+                        echo
+                        menu_health_check
+                    fi
+                fi
+                return 0
+            else
+                return 1
+            fi
+            ;;
+        2)
+            # Update all cluster nodes
+            if is_cluster_node; then
+                if perform_cluster_wide_installation "latest"; then
+                    return 0
+                else
+                    return 1
+                fi
+            else
+                error "Not running in a cluster"
+                return 1
+            fi
+            ;;
+    esac
+}
+
+# Main menu for when plugin is installed
+menu_installed() {
+    local current_version="$1"
+
+    while true; do
+        # Refresh current version in case it was updated
+        local latest_installed_version
+        latest_installed_version=$(get_installed_version)
+        if [[ -n "$latest_installed_version" ]]; then
+            current_version="$latest_installed_version"
+        fi
+
+        # Clear screen and show banner
+        clear_screen
+        print_banner
+
+        # Check if current version is a pre-release
+        local current_prerelease_tag=""
+        local current_is_prerelease
+        current_is_prerelease=$(get_installed_prerelease_status "$current_version" 2>/dev/null)
+        if [[ "$current_is_prerelease" == "true" ]]; then
+            current_prerelease_tag=" ${c3}(Pre-Release)${c0}"
+        fi
+
+        # Check for updates
+        local update_notice=""
+        local update_info
+        if update_info=$(check_for_updates "$current_version" 2>/dev/null); then
+            local latest_version="${update_info%%:*}"
+            local latest_prerelease="${update_info##*:}"
+            local prerelease_tag=""
+
+            if [[ "$latest_prerelease" == "true" ]]; then
+                prerelease_tag=" ${c3}(Pre-Release)${c0}"
+            fi
+
+            update_notice=" (Update available: v${latest_version}${prerelease_tag})"
+        fi
+
+        # Check if backup cleanup should be offered
+        local should_manage_backups=false
+        if should_offer_cleanup; then
+            should_manage_backups=true
+        fi
+
+        # Build menu dynamically
+        local -a menu_items=("Update plugin" "Install specific version" "Configure storage" "Diagnostics" "Rollback to backup")
+        local max_choice=5
+
+        if [[ "$should_manage_backups" = true ]]; then
+            menu_items+=("Manage backups")
+            max_choice=$((max_choice + 1))
+        fi
+
+        menu_items+=("Uninstall plugin")
+        max_choice=$((max_choice + 1))
+
+        show_menu "TrueNAS Plugin v${current_version}${current_prerelease_tag} - Installed${update_notice}" "${menu_items[@]}"
+
+        local choice
+        choice=$(read_choice "$max_choice")
+
+        case $choice in
+            0)
+                info "Exiting installer"
+                exit $EXIT_SUCCESS
+                ;;
+            1)
+                # Update plugin (shows sub-menu for local vs cluster)
+                menu_update_choice "$current_version"
+                read -rp "Press Enter to return to main menu..."
+                ;;
+            2)
+                # Install specific version
+                menu_install_specific_version
+                ;;
+            3)
+                # Configure storage
+                menu_configure_storage
+                ;;
+            4)
+                # Diagnostics
+                menu_diagnostics
+                ;;
+            5)
+                # Rollback to backup
+                menu_rollback
+                ;;
+            6)
+                # Manage backups OR Uninstall (depends on should_manage_backups)
+                if [[ "$should_manage_backups" = true ]]; then
+                    menu_manage_backups
+                else
+                    menu_uninstall
+                    read -rp "Press Enter to return to main menu..."
+                    return 0
+                fi
+                ;;
+            7)
+                # Uninstall plugin (when manage backups is also present)
+                menu_uninstall
+                read -rp "Press Enter to return to main menu..."
+                return 0
+                ;;
+        esac
+    done
+}
+
+# Menu: Diagnostics
+menu_diagnostics() {
+    while true; do
+        clear_screen
+        print_banner
+        echo
+
+        show_menu "Select diagnostic action" \
+            "Run health check" \
+            "Cleanup orphaned resources" \
+            "Run plugin function test" \
+            "Run FIO storage benchmark"
+
+        local choice
+        local raw_choice
+
+        # Read choice allowing both numeric and special inputs
+        while true; do
+            read -rp "Enter choice [0-4]: " raw_choice
+
+            # Check for special extended benchmark mode
+            if [[ "$raw_choice" == "4+" ]]; then
+                EXTENDED_BENCHMARK=true
+                choice=4
+                break
+            elif [[ "$raw_choice" =~ ^[0-9]+$ ]] && [[ "$raw_choice" -ge 0 ]] && [[ "$raw_choice" -le 4 ]]; then
+                EXTENDED_BENCHMARK=false
+                choice="$raw_choice"
+                break
+            else
+                # Move cursor up, clear to end of screen, show error, then re-prompt
+                printf "\\033[1A\\033[J"
+                echo ""
+                echo "  ${c5}✗${c0} Invalid choice. Please enter a number between 0 and 4"
+                echo ""
+            fi
+        done
+
+        case $choice in
+            0)
+                return 0
+                ;;
+            1)
+                # Run health check
+                menu_health_check
+                read -rp "Press Enter to return to diagnostics menu..."
+                ;;
+            2)
+                # Cleanup orphans
+                menu_cleanup_orphans
+                read -rp "Press Enter to return to diagnostics menu..."
+                ;;
+            3)
+                # Run plugin function test
+                menu_plugin_test
+                read -rp "Press Enter to return to diagnostics menu..."
+                ;;
+            4)
+                # Run FIO benchmark (normal or extended based on EXTENDED_BENCHMARK flag)
+                menu_fio_benchmark
+                read -rp "Press Enter to return to diagnostics menu..."
+                ;;
+        esac
+    done
+}
+
+# Menu: Plugin function test
+menu_plugin_test() {
+    clear_screen
+    print_banner
+    echo
+
+    # Show description and warnings
+    info "Plugin Function Test Suite"
+    echo
+    warning "This test will perform the following operations:"
+    echo "  • Validate storage accessibility via Proxmox API"
+    echo "  • Create test VMs with dynamic ID selection"
+    echo "  • Test volume creation, snapshots, and clones"
+    echo "  • Test volume resize operations"
+    echo "  • Test VM start/stop lifecycle"
+    echo "  • Cleanup test VMs automatically"
+    echo
+
+    if is_cluster_node; then
+        info "Cluster detected - additional tests available:"
+        echo "  • VM migration to remote nodes"
+        echo "  • Cross-node VM cloning"
+        echo
+    fi
+
+    warning "Important considerations:"
+    echo "  • Test VMs will be created with IDs automatically selected from available range (990+)"
+    echo "  • Storage must have at least 10GB free space"
+    echo "  • Tests will take approximately 2-5 minutes to complete"
+    echo "  • All test data will be cleaned up after completion"
+    echo "  • Tests are non-destructive to production VMs and data"
+    echo
+
+    # Require typed confirmation
+    info "Type ${c8}ACCEPT${c0} to continue or any other input to return to menu"
+    local confirmation
+    read -rp "Confirmation: " confirmation
+
+    if [[ "$confirmation" != "ACCEPT" ]]; then
+        warning "Test cancelled by user"
+        return 0
+    fi
+
+    # Clear screen and show banner again for storage selection
+    clear_screen
+    print_banner
+    echo
+
+    # Show header
+    info "Plugin Function Test"
+    echo
+
+    # List available TrueNAS storage
+    info "Detecting TrueNAS storage configurations..."
+    echo
+
+    if [[ ! -f "$STORAGE_CFG" ]]; then
+        error "Storage configuration file not found: $STORAGE_CFG"
+        return 1
+    fi
+
+    local storages
+    storages=$(grep "^truenasplugin:" "$STORAGE_CFG" 2>/dev/null | awk '{print $2}')
+
+    if [[ -z "$storages" ]]; then
+        warning "No TrueNAS storage configured"
+        info "Please configure storage first from the main menu"
+        return 1
+    fi
+
+    # Prompt for storage selection with retry loop
+    local storage_name=""
+    local storage_error=""
+    local first_try=true
+
+    while true; do
+        # On retry, clear screen and reshow banner
+        if [[ "$first_try" == "false" ]]; then
+            clear_screen
+            print_banner
+            echo
+            info "Plugin Function Test"
+            echo
+            info "Detecting TrueNAS storage configurations..."
+            echo
+        fi
+        first_try=false
+
+        # Show error if validation failed
+        if [[ -n "$storage_error" ]]; then
+            error "$storage_error"
+            echo
+            storage_error=""
+        fi
+
+        info "Available TrueNAS storage:"
+        while IFS= read -r storage; do
+            echo "  • $storage"
+        done <<< "$storages"
+        echo
+
+        read -rp "Enter storage name to test (or press Enter for first): " storage_name
+
+        if [[ -z "$storage_name" ]]; then
+            storage_name=$(echo "$storages" | head -1)
+            info "Using: $storage_name"
+            break
+        fi
+
+        # Validate storage exists
+        if echo "$storages" | grep -q "^${storage_name}$"; then
+            break
+        else
+            storage_error="Storage '$storage_name' not found in configuration"
+        fi
+    done
+
+    # Clear screen and show header for test execution
+    clear_screen
+    print_banner
+    echo
+
+    info "Plugin Function Test"
+    echo
+
+    info "Running plugin function test on storage: $storage_name"
+    echo
+
+    # Run the test suite
+    run_plugin_test "$storage_name" || true
+
+    return 0
+}
+
+# Menu: FIO storage benchmark
+menu_fio_benchmark() {
+    clear_screen
+    print_banner
+    echo
+
+    # Show description and warnings (adjust based on extended mode)
+    info "FIO Storage Benchmark Suite"
+    echo
+
+    # Adjust warnings based on extended benchmark mode
+    local test_count=30
+    local runtime="25-30 minutes"
+    if [[ "${EXTENDED_BENCHMARK:-false}" == "true" ]]; then
+        test_count=90
+        runtime="75-90 minutes"
+        info "${c3}Extended Mode Activated:${c0} Running with numjobs variations (1, 4, 8)"
+        echo
+    fi
+
+    warning "This benchmark will perform the following operations:"
+    echo "  • Allocate a 10GB test volume directly on storage"
+    echo "  • Run $test_count comprehensive I/O tests at multiple queue depths"
+    echo "  • Test sequential/random read/write bandwidth and IOPS"
+    echo "  • Test latency and mixed workload performance"
+    echo "  • Automatically cleanup test volume after completion"
+    echo
+
+    warning "Important considerations:"
+    echo "  • Storage must have at least 10GB free space"
+    echo "  • Benchmarks will run for $runtime total ($test_count tests)"
+    echo "  • Each test type runs at 5 queue depths (QD=1, 16, 32, 64, 128)"
+    if [[ "${EXTENDED_BENCHMARK:-false}" == "true" ]]; then
+        echo "  • Each queue depth tested with 3 numjobs values (1, 4, 8)"
+    fi
+    echo "  • Tests will generate heavy I/O load on the storage system"
+    echo "  • FIO must be installed on this system (will prompt if missing)"
+    echo "  • All test data will be cleaned up after completion"
+    echo "  • Benchmarks are non-destructive to production data"
+    echo
+
+    # Require typed confirmation
+    info "Type ${c8}ACCEPT${c0} to continue or any other input to return to menu"
+    local confirmation
+    read -rp "Confirmation: " confirmation
+
+    if [[ "$confirmation" != "ACCEPT" ]]; then
+        warning "Benchmark cancelled by user"
+        return 0
+    fi
+
+    # Clear screen and show banner again for storage selection
+    clear_screen
+    print_banner
+    echo
+
+    # Show header
+    info "FIO Storage Benchmark"
+    echo
+
+    # List available TrueNAS storage
+    info "Detecting TrueNAS storage configurations..."
+    echo
+
+    if [[ ! -f "$STORAGE_CFG" ]]; then
+        error "Storage configuration file not found: $STORAGE_CFG"
+        return 1
+    fi
+
+    local storages
+    storages=$(grep "^truenasplugin:" "$STORAGE_CFG" 2>/dev/null | awk '{print $2}')
+
+    if [[ -z "$storages" ]]; then
+        warning "No TrueNAS storage configured"
+        info "Please configure storage first from the main menu"
+        return 1
+    fi
+
+    # Prompt for storage selection with retry loop
+    local storage_name=""
+    local storage_error=""
+    local first_try=true
+
+    while true; do
+        # On retry, clear screen and reshow banner
+        if [[ "$first_try" == "false" ]]; then
+            clear_screen
+            print_banner
+            echo
+            info "FIO Storage Benchmark"
+            echo
+            info "Detecting TrueNAS storage configurations..."
+            echo
+        fi
+        first_try=false
+
+        # Show error if validation failed
+        if [[ -n "$storage_error" ]]; then
+            error "$storage_error"
+            echo
+            storage_error=""
+        fi
+
+        info "Available TrueNAS storage:"
+        while IFS= read -r storage; do
+            echo "  • $storage"
+        done <<< "$storages"
+        echo
+
+        read -rp "Enter storage name to benchmark (or press Enter for first): " storage_name
+
+        if [[ -z "$storage_name" ]]; then
+            storage_name=$(echo "$storages" | head -1)
+            info "Using: $storage_name"
+            break
+        fi
+
+        # Validate storage exists
+        if echo "$storages" | grep -q "^${storage_name}$"; then
+            break
+        else
+            storage_error="Storage '$storage_name' not found in configuration"
+        fi
+    done
+
+    # Clear screen and show header for benchmark execution
+    clear_screen
+    print_banner
+    echo
+
+    info "FIO Storage Benchmark"
+    echo
+
+    info "Running benchmark on storage: $storage_name"
+    echo
+
+    # Run the benchmark suite (pass extended flag)
+    run_fio_benchmark "$storage_name" "${EXTENDED_BENCHMARK:-false}" || true
+
+    return 0
+}
+
+# ============================================================================
+# Plugin Test Suite Functions
+# ============================================================================
+
+# Global test variables
+NODE_NAME=$(hostname)
+TEST_VM_BASE=990
+TEST_VM_CLONE=991
+TEST_API_TIMEOUT=60
+
+# API wrapper function - uses pvesh to interact with Proxmox API
+test_api_call() {
+    local method="$1"
+    local path="$2"
+    shift 2
+    local params=("$@")
+
+    local output
+    local exit_code
+
+    # Build pvesh command
+    case "$method" in
+        GET)
+            output=$(timeout $TEST_API_TIMEOUT pvesh get "$path" "${params[@]}" 2>&1)
+            exit_code=$?
+            ;;
+        POST|CREATE)
+            output=$(timeout $TEST_API_TIMEOUT pvesh create "$path" "${params[@]}" 2>&1)
+            exit_code=$?
+            ;;
+        PUT|SET)
+            output=$(timeout $TEST_API_TIMEOUT pvesh set "$path" "${params[@]}" 2>&1)
+            exit_code=$?
+            ;;
+        DELETE)
+            output=$(timeout $TEST_API_TIMEOUT pvesh delete "$path" "${params[@]}" 2>&1)
+            exit_code=$?
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    # Filter out plugin warning messages
+    output=$(echo "$output" | grep -v "Plugin.*older storage API" || echo "$output")
+
+    echo "$output"
+    return $exit_code
+}
+
+# Function to find available VM IDs dynamically
+test_find_available_vm_ids() {
+    local base_id=${1:-990}
+    local found_base=false
+    local found_clone=false
+
+    # Get list of existing VMs via API
+    local existing_vms=$(test_api_call GET "/cluster/resources" --type vm 2>/dev/null | grep -oP 'vmid.*?\K[0-9]+' || echo "")
+
+    # Search for two consecutive available VM IDs
+    for candidate in $(seq $base_id $((base_id + 100))); do
+        local next_id=$((candidate + 1))
+
+        # Check if both candidate and next_id are available
+        if ! echo "$existing_vms" | grep -qw "$candidate" && \
+           ! echo "$existing_vms" | grep -qw "$next_id"; then
+            TEST_VM_BASE=$candidate
+            TEST_VM_CLONE=$next_id
+            found_base=true
+            found_clone=true
+            break
+        fi
+    done
+
+    if $found_base && $found_clone; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Wait for task completion
+test_wait_for_task() {
+    local task_upid="$1"
+    local max_wait="${2:-120}"
+    local wait_count=0
+
+    if [[ -z "$task_upid" ]]; then
+        return 0
+    fi
+
+    while [ $wait_count -lt $max_wait ]; do
+        # Get task status - API returns table format with "│ status │ stopped │"
+        local output=$(test_api_call GET "/nodes/$NODE_NAME/tasks/$task_upid/status" 2>&1)
+
+        # Check if task is stopped (look for "status" row with "stopped" value)
+        if echo "$output" | grep -q "│ status.*│.*stopped"; then
+            return 0
+        fi
+
+        sleep 1
+        ((wait_count++))
+    done
+
+    return 1
+}
+
+# Test result formatter (matches health check style)
+test_result() {
+    local name="$1"
+    local status="$2"
+    local message="$3"
+
+    printf "%-30s " "${name}:"
+    case "$status" in
+        PASS)
+            echo -e "${c2}✓${c0} $message"
+            ;;
+        FAIL)
+            echo -e "${c1}✗${c0} $message"
+            ;;
+        SKIP)
+            echo -e "${c6}-${c0} $message"
+            ;;
+    esac
+}
+
+# Test 1: Storage Status
+test_storage_status() {
+    local storage_name="$1"
+
+    printf "%-30s " "Storage accessibility:"
+    start_spinner
+
+    if test_api_call GET "/nodes/$NODE_NAME/storage/$storage_name/status" >/dev/null 2>&1; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Storage accessibility:")${c2}✓${c0} API responsive"
+        return 0
+    else
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Storage accessibility:")${c1}✗${c0} Not accessible"
+        return 1
+    fi
+}
+
+# Test 2: Volume Creation
+test_volume_creation() {
+    local storage_name="$1"
+
+    printf "%-30s " "Create test VM:"
+    start_spinner
+
+    local output
+    output=$(test_api_call POST "/nodes/$NODE_NAME/qemu" \
+        --vmid "$TEST_VM_BASE" \
+        --name "test-base-vm" \
+        --memory 512 \
+        --cores 1 \
+        --net0 "virtio,bridge=vmbr0" \
+        --scsihw "virtio-scsi-pci" 2>&1)
+
+    if [[ $? -ne 0 ]]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Create test VM:")${c1}✗${c0} Failed"
+        return 1
+    fi
+
+    local task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" >/dev/null 2>&1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Create test VM:")${c2}✓${c0} VM $TEST_VM_BASE created"
+
+    printf "%-30s " "Add 4GB disk to VM:"
+    start_spinner
+    output=$(test_api_call PUT "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/config" --scsi0 "$storage_name:4" 2>&1)
+    if [ $? -ne 0 ]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Add 4GB disk to VM:")${c1}✗${c0} Failed"
+        return 1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Add 4GB disk to VM:")${c2}✓${c0} Disk provisioned"
+    return 0
+}
+
+# Test 3: Volume Listing
+test_volume_listing() {
+    local storage_name="$1"
+
+    printf "%-30s " "List volumes on storage:"
+    start_spinner
+    if ! test_api_call GET "/nodes/$NODE_NAME/storage/$storage_name/content" >/dev/null 2>&1; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "List volumes on storage:")${c1}✗${c0} Failed"
+        return 1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "List volumes on storage:")${c2}✓${c0} Listed successfully"
+
+    printf "%-30s " "Get VM configuration:"
+    start_spinner
+    if ! test_api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/config" >/dev/null 2>&1; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Get VM configuration:")${c1}✗${c0} Failed"
+        return 1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Get VM configuration:")${c2}✓${c0} Retrieved successfully"
+    return 0
+}
+
+# Test 4: Snapshot Operations
+test_snapshot_operations() {
+    local snapshot_name="test-snap-$(date +%s)"
+
+    printf "%-30s " "Create VM snapshot:"
+    start_spinner
+    output=$(test_api_call POST "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/snapshot" \
+        --snapname "$snapshot_name" \
+        --description "Test snapshot via API" 2>&1)
+
+    if [ $? -ne 0 ]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Create VM snapshot:")${c1}✗${c0} Failed"
+        return 1
+    fi
+
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 60 >/dev/null 2>&1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Create VM snapshot:")${c2}✓${c0} Snapshot created"
+
+    printf "%-30s " "List VM snapshots:"
+    start_spinner
+    if ! test_api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/snapshot" >/dev/null 2>&1; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "List VM snapshots:")${c1}✗${c0} Failed"
+        return 1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "List VM snapshots:")${c2}✓${c0} Listed successfully"
+
+    printf "%-30s " "Create clone base snapshot:"
+    start_spinner
+    local clone_snapshot="clone-base-$(date +%s)"
+    output=$(test_api_call POST "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/snapshot" \
+        --snapname "$clone_snapshot" \
+        --description "Snapshot for clone test" 2>&1)
+
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 60 >/dev/null 2>&1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Create clone base snapshot:")${c2}✓${c0} Clone base ready"
+
+    # Save snapshot name for clone test
+    echo "$clone_snapshot" > /tmp/clone_snapshot_name
+
+    return 0
+}
+
+# Test 4b: Multi-disk Snapshot Operations (tests snapshot consistency with multiple disks)
+test_multidisk_snapshot_operations() {
+    # This test creates a VM with multiple disks on the same storage and verifies
+    # that snapshot creation properly validates all disks (fixes silent failures)
+    local storage_name="$1"
+    local multidisk_vm_id=$((TEST_VM_BASE + 100))
+    local snapshot_name="multidisk-snap-$(date +%s)"
+
+    printf "%-30s " "Create multi-disk VM:"
+    start_spinner
+
+    # Create VM with 2 disks on the same storage
+    if ! test_api_call POST "/nodes/$NODE_NAME/qemu" \
+        --vmid "$multidisk_vm_id" \
+        --name "test-multidisk-vm" \
+        --memory 512 \
+        --cores 1 \
+        --scsihw "virtio-scsi-pci" >/dev/null 2>&1; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Create multi-disk VM:")${c1}✗${c0} Failed"
+        return 1
+    fi
+
+    # Add first disk
+    if ! test_api_call PUT "/nodes/$NODE_NAME/qemu/$multidisk_vm_id/config" \
+        --scsi0 "${storage_name}:5" >/dev/null 2>&1; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Create multi-disk VM:")${c1}✗${c0} Failed to add disk 0"
+        return 1
+    fi
+
+    # Add second disk
+    if ! test_api_call PUT "/nodes/$NODE_NAME/qemu/$multidisk_vm_id/config" \
+        --scsi1 "${storage_name}:5" >/dev/null 2>&1; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Create multi-disk VM:")${c1}✗${c0} Failed to add disk 1"
+        return 1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Create multi-disk VM:")${c2}✓${c0} VM created with 2 disks"
+
+    printf "%-30s " "Snapshot multi-disk VM:"
+    start_spinner
+
+    # Create snapshot - both disks must succeed or fail atomically
+    output=$(test_api_call POST "/nodes/$NODE_NAME/qemu/$multidisk_vm_id/snapshot" \
+        --snapname "$snapshot_name" \
+        --description "Multi-disk snapshot test" 2>&1)
+
+    if [ $? -ne 0 ]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Snapshot multi-disk VM:")${c1}✗${c0} Snapshot creation failed"
+        return 1
+    fi
+
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 60 >/dev/null 2>&1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Snapshot multi-disk VM:")${c2}✓${c0} Snapshot created"
+
+    printf "%-30s " "Delete multi-disk snapshot:"
+    start_spinner
+
+    # Verify deletion works correctly on both disks
+    output=$(test_api_call DELETE "/nodes/$NODE_NAME/qemu/$multidisk_vm_id/snapshot/$snapshot_name" 2>&1)
+    if [ $? -ne 0 ]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Delete multi-disk snapshot:")${c1}✗${c0} Failed"
+        return 1
+    fi
+
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 60 >/dev/null 2>&1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Delete multi-disk snapshot:")${c2}✓${c0} Deleted successfully"
+
+    printf "%-30s " "Cleanup multi-disk VM:"
+    start_spinner
+
+    # Delete the test VM
+    output=$(test_api_call DELETE "/nodes/$NODE_NAME/qemu/$multidisk_vm_id" 2>&1)
+    if [ $? -ne 0 ]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Cleanup multi-disk VM:")${c1}⚠${c0} Could not delete VM"
+        return 1
+    fi
+
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 60 >/dev/null 2>&1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Cleanup multi-disk VM:")${c2}✓${c0} VM cleaned up"
+
+    return 0
+}
+
+# Test 5: Clone Operations
+test_clone_operations() {
+    local clone_snapshot
+    if [[ -f /tmp/clone_snapshot_name ]]; then
+        clone_snapshot=$(cat /tmp/clone_snapshot_name)
+    else
+        test_result "Clone VM from snapshot" "FAIL" "No snapshot available"
+        return 1
+    fi
+
+    printf "%-30s " "Clone VM from snapshot:"
+    start_spinner
+
+    output=$(test_api_call POST "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/clone" \
+        --newid "$TEST_VM_CLONE" \
+        --name "test-clone-vm" \
+        --snapname "$clone_snapshot" 2>&1)
+
+    if [[ $? -ne 0 ]]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Clone VM from snapshot:")${c1}✗${c0} Failed to create"
+        return 1
+    fi
+
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 300 >/dev/null 2>&1
+    fi
+
+    if ! test_api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_CLONE/config" >/dev/null 2>&1; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Clone VM from snapshot:")${c1}✗${c0} Clone not verified"
+        return 1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Clone VM from snapshot:")${c2}✓${c0} VM $TEST_VM_CLONE created"
+    return 0
+}
+
+# Test 6: Volume Resize
+test_volume_resize() {
+    printf "%-30s " "Resize volume (+1GB):"
+    start_spinner
+
+    if ! test_api_call PUT "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/resize" --disk scsi0 --size "+1G" >/dev/null 2>&1; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Resize volume (+1GB):")${c1}✗${c0} Failed"
+        return 1
+    fi
+
+    if ! test_api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/config" >/dev/null 2>&1; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Resize volume (+1GB):")${c1}✗${c0} Verification failed"
+        return 1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Resize volume (+1GB):")${c2}✓${c0} Resized successfully"
+    return 0
+}
+
+# Test 7: VM Start/Stop
+test_vm_start_stop() {
+    printf "%-30s " "Start VM:"
+    start_spinner
+
+    local output=$(test_api_call POST "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/status/start" 2>&1)
+    if [[ $? -ne 0 ]]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Start VM:")${c1}✗${c0} Failed to start"
+        return 1
+    fi
+
+    local task_upid=$(echo "$output" | grep "UPID:" | head -1 | awk '{print $1}')
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 60 >/dev/null 2>&1
+    fi
+
+    sleep 2
+    output=$(test_api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/status/current" 2>&1)
+    if ! echo "$output" | grep -q "│ status.*│.*running"; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Start VM:")${c1}✗${c0} Not running"
+        return 1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Start VM:")${c2}✓${c0} VM started successfully"
+
+    printf "%-30s " "Stop VM:"
+    start_spinner
+    output=$(test_api_call POST "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/status/stop" 2>&1)
+    if [[ $? -ne 0 ]]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Stop VM:")${c1}✗${c0} Failed to stop"
+        return 1
+    fi
+
+    task_upid=$(echo "$output" | grep "UPID:" | head -1 | awk '{print $1}')
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 60 >/dev/null 2>&1
+    fi
+
+    sleep 2
+    output=$(test_api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/status/current" 2>&1)
+    if ! echo "$output" | grep -q "│ status.*│.*stopped"; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Stop VM:")${c1}✗${c0} Not stopped"
+        return 1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Stop VM:")${c2}✓${c0} VM stopped successfully"
+    return 0
+}
+
+# Test 8: Volume Deletion
+test_volume_deletion() {
+    printf "%-30s " "Delete test VMs (--purge):"
+    start_spinner
+
+    if test_api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_CLONE/status/current" >/dev/null 2>&1; then
+        output=$(test_api_call DELETE "/nodes/$NODE_NAME/qemu/$TEST_VM_CLONE" --purge 1 2>&1)
+
+        if [[ $? -ne 0 ]]; then
+            stop_spinner
+            echo -e "\r$(printf "%-30s " "Delete test VMs (--purge):")${c1}✗${c0} Failed to delete clone"
+            return 1
+        fi
+
+        task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+        if [[ -n "$task_upid" ]]; then
+            test_wait_for_task "$task_upid" 60 >/dev/null 2>&1
+        fi
+        sleep 3
+    fi
+
+    output=$(test_api_call DELETE "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE" --purge 1 2>&1)
+
+    if [[ $? -ne 0 ]]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Delete test VMs (--purge):")${c1}✗${c0} Failed to delete base"
+        return 1
+    fi
+
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 60 >/dev/null 2>&1
+    fi
+
+    sleep 3
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Delete test VMs (--purge):")${c2}✓${c0} Volumes cleaned up"
+    return 0
+}
+
+# Cluster Test 1: VM Migration
+test_vm_migration() {
+    local remote_nodes
+    if ! remote_nodes=$(get_remote_cluster_nodes 2>/dev/null); then
+        test_result "Migrate VM to remote node" "SKIP" "No remote nodes"
+        return 0
+    fi
+
+    local target_node_info=$(echo "$remote_nodes" | head -1)
+    local target_node="${target_node_info%%:*}"
+    local target_ip="${target_node_info##*:}"
+
+    if ! validate_ssh_to_node "$target_ip" 2>/dev/null; then
+        test_result "Migrate VM to remote node" "SKIP" "SSH unavailable"
+        return 0
+    fi
+
+    printf "%-30s " "Migrate VM to remote node:"
+    start_spinner
+
+    local migrate_vm_id=$((TEST_VM_BASE + 10))
+    local existing_vms=$(test_api_call GET "/cluster/resources" --type vm 2>/dev/null | grep -oP 'vmid.*?\K[0-9]+' || echo "")
+    while echo "$existing_vms" | grep -qw "$migrate_vm_id"; do
+        migrate_vm_id=$((migrate_vm_id + 1))
+    done
+
+    local output
+    output=$(test_api_call POST "/nodes/$NODE_NAME/qemu" \
+        --vmid "$migrate_vm_id" \
+        --name "test-migrate-vm" \
+        --memory 256 \
+        --cores 1 \
+        --net0 "virtio,bridge=vmbr0" 2>&1)
+
+    if [[ $? -ne 0 ]]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Migrate VM to remote node:")${c6}-${c0} VM creation failed"
+        return 0
+    fi
+
+    local task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" >/dev/null 2>&1
+    fi
+
+    output=$(test_api_call POST "/nodes/$NODE_NAME/qemu/$migrate_vm_id/migrate" \
+        --target "$target_node" \
+        --online 0 2>&1)
+
+    if [[ $? -ne 0 ]]; then
+        test_api_call DELETE "/nodes/$NODE_NAME/qemu/$migrate_vm_id" --purge 1 >/dev/null 2>&1
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Migrate VM to remote node:")${c6}-${c0} Migration failed"
+        return 0
+    fi
+
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 120 >/dev/null 2>&1
+    fi
+
+    test_api_call DELETE "/nodes/$target_node/qemu/$migrate_vm_id" --purge 1 >/dev/null 2>&1
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Migrate VM to remote node:")${c2}✓${c0} Migrated to $target_node"
+    return 0
+}
+
+# Cluster Test 2: Cross-node Clone
+test_cross_node_clone() {
+    local storage_name="$1"
+
+    local remote_nodes
+    if ! remote_nodes=$(get_remote_cluster_nodes 2>/dev/null); then
+        test_result "Clone VM to remote node" "SKIP" "No remote nodes"
+        return 0
+    fi
+
+    local target_node_info=$(echo "$remote_nodes" | head -1)
+    local target_node="${target_node_info%%:*}"
+    local target_ip="${target_node_info##*:}"
+
+    if ! validate_ssh_to_node "$target_ip" 2>/dev/null; then
+        test_result "Clone VM to remote node" "SKIP" "SSH unavailable"
+        return 0
+    fi
+
+    printf "%-30s " "Clone VM to remote node:"
+    start_spinner
+
+    local clone_source_vm=$((TEST_VM_BASE + 20))
+    local existing_vms=$(test_api_call GET "/cluster/resources" --type vm 2>/dev/null | grep -oP 'vmid.*?\K[0-9]+' || echo "")
+    while echo "$existing_vms" | grep -qw "$clone_source_vm"; do
+        clone_source_vm=$((clone_source_vm + 1))
+    done
+
+    local output
+    output=$(test_api_call POST "/nodes/$NODE_NAME/qemu" \
+        --vmid "$clone_source_vm" \
+        --name "test-clone-source" \
+        --memory 256 \
+        --cores 1 \
+        --net0 "virtio,bridge=vmbr0" \
+        --scsihw "virtio-scsi-pci" 2>&1)
+
+    if [[ $? -ne 0 ]]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Clone VM to remote node:")${c6}-${c0} VM creation failed"
+        return 0
+    fi
+
+    local task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" >/dev/null 2>&1
+    fi
+
+    test_api_call PUT "/nodes/$NODE_NAME/qemu/$clone_source_vm/config" --scsi0 "$storage_name:1" >/dev/null 2>&1
+
+    local snapshot_name="cross-node-snap-$(date +%s)"
+    output=$(test_api_call POST "/nodes/$NODE_NAME/qemu/$clone_source_vm/snapshot" \
+        --snapname "$snapshot_name" \
+        --description "Cross-node clone test" 2>&1)
+
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 60 >/dev/null 2>&1
+    fi
+
+    local clone_vm_id=$((clone_source_vm + 1))
+    while echo "$existing_vms" | grep -qw "$clone_vm_id"; do
+        clone_vm_id=$((clone_vm_id + 1))
+    done
+
+    output=$(test_api_call POST "/nodes/$NODE_NAME/qemu/$clone_source_vm/clone" \
+        --newid "$clone_vm_id" \
+        --name "test-clone-remote" \
+        --snapname "$snapshot_name" \
+        --target "$target_node" 2>&1)
+
+    if [[ $? -ne 0 ]]; then
+        test_api_call DELETE "/nodes/$NODE_NAME/qemu/$clone_source_vm" --purge 1 >/dev/null 2>&1
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Clone VM to remote node:")${c6}-${c0} Clone failed"
+        return 0
+    fi
+
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 300 >/dev/null 2>&1
+    fi
+
+    test_api_call DELETE "/nodes/$NODE_NAME/qemu/$clone_source_vm" --purge 1 >/dev/null 2>&1
+    test_api_call DELETE "/nodes/$target_node/qemu/$clone_vm_id" --purge 1 >/dev/null 2>&1
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Clone VM to remote node:")${c2}✓${c0} Cloned to $target_node"
+    return 0
+}
+
+# Cleanup test VMs function
+cleanup_test_vms() {
+    info "Cleaning up any remaining test VMs..."
+
+    # Try to delete both test VMs if they exist
+    if test_api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_CLONE/status/current" >/dev/null 2>&1; then
+        echo "  Removing test VM $TEST_VM_CLONE..."
+        test_api_call DELETE "/nodes/$NODE_NAME/qemu/$TEST_VM_CLONE" --purge 1 >/dev/null 2>&1
+    fi
+
+    if test_api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/status/current" >/dev/null 2>&1; then
+        echo "  Removing test VM $TEST_VM_BASE..."
+        test_api_call DELETE "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE" --purge 1 >/dev/null 2>&1
+    fi
+
+    # Clean up temp files
+    rm -f /tmp/clone_snapshot_name 2>/dev/null
+
+    success "Cleanup complete"
+}
+
+# Main test execution function
+run_plugin_test() {
+    local storage_name="$1"
+    local start_time=$(date +%s)
+
+    # Track test results
+    local tests_passed=0
+    local tests_failed=0
+    local tests_total=0
+
+    # Pre-flight checks (silent)
+    if ! command -v pvesh &> /dev/null; then
+        error "pvesh command not found - cannot run tests"
+        return 1
+    fi
+
+    if ! test_find_available_vm_ids; then
+        error "Failed to find available VM IDs"
+        return 1
+    fi
+
+    # Run local tests
+
+    # Test 1: Storage Status
+    ((tests_total++))
+    if test_storage_status "$storage_name"; then
+        ((tests_passed++))
+    else
+        ((tests_failed++))
+        error "Storage status test failed - aborting test suite"
+        return 1
+    fi
+
+    # Test 2: Volume Creation
+    ((tests_total++))
+    if test_volume_creation "$storage_name"; then
+        ((tests_passed++))
+    else
+        ((tests_failed++))
+        error "Volume creation test failed - attempting cleanup"
+        cleanup_test_vms
+        return 1
+    fi
+
+    # Test 3: Volume Listing
+    ((tests_total++))
+    if test_volume_listing "$storage_name"; then
+        ((tests_passed++))
+    else
+        ((tests_failed++))
+    fi
+
+    # Test 4: Snapshot Operations
+    ((tests_total++))
+    if test_snapshot_operations; then
+        ((tests_passed++))
+    else
+        ((tests_failed++))
+    fi
+
+    # Test 4b: Multi-disk Snapshot Operations
+    ((tests_total++))
+    if test_multidisk_snapshot_operations "$storage_name"; then
+        ((tests_passed++))
+    else
+        ((tests_failed++))
+    fi
+
+    # Test 5: Clone Operations
+    ((tests_total++))
+    if test_clone_operations; then
+        ((tests_passed++))
+    else
+        ((tests_failed++))
+    fi
+
+    # Test 6: Volume Resize
+    ((tests_total++))
+    if test_volume_resize; then
+        ((tests_passed++))
+    else
+        ((tests_failed++))
+    fi
+
+    # Test 7: VM Start/Stop
+    ((tests_total++))
+    if test_vm_start_stop; then
+        ((tests_passed++))
+    else
+        ((tests_failed++))
+    fi
+
+    # Test 8: Volume Deletion
+    ((tests_total++))
+    if test_volume_deletion; then
+        ((tests_passed++))
+    else
+        ((tests_failed++))
+    fi
+
+    # Run cluster tests if in cluster
+    if is_cluster_node; then
+        echo
+        info "Running cluster-specific tests..."
+        echo
+
+        # Cluster Test 1: VM Migration
+        ((tests_total++))
+        if test_vm_migration; then
+            ((tests_passed++))
+        else
+            ((tests_failed++))
+        fi
+
+        # Cluster Test 2: Cross-node Clone
+        ((tests_total++))
+        if test_cross_node_clone "$storage_name"; then
+            ((tests_passed++))
+        else
+            ((tests_failed++))
+        fi
+    fi
+
+    # Generate summary
+    local end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+    local minutes=$((duration / 60))
+    local seconds=$((duration % 60))
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo
+    info "${c8}Plugin Function Test Summary${c0}"
+    echo
+    echo "  Total tests run:    $tests_total"
+    echo "  Tests passed:       ${c2}$tests_passed${c0}"
+    echo "  Tests failed:       ${c1}$tests_failed${c0}"
+    echo "  Duration:           ${minutes}m ${seconds}s"
+    echo
+    echo "  Storage tested:     $storage_name"
+    echo "  Node:               $NODE_NAME"
+    if is_cluster_node; then
+        echo "  Cluster mode:       Yes"
+    else
+        echo "  Cluster mode:       No"
+    fi
+    echo
+    echo "  Log file:           $LOG_FILE"
+    echo
+
+    if [[ $tests_failed -eq 0 ]]; then
+        success "All tests passed! ✓"
+        echo
+    else
+        error "Some tests failed. Please check the log file for details."
+        echo
+    fi
+
+    # Return status based on test results
+    [[ $tests_failed -eq 0 ]] && return 0 || return 1
+}
+
+# Menu: Cleanup orphaned resources
+menu_cleanup_orphans() {
+    clear_screen
+    print_banner
+    echo
+
+    # List available TrueNAS storage
+    info "Detecting TrueNAS storage configurations..."
+    echo
+
+    if [[ ! -f "$STORAGE_CFG" ]]; then
+        warning "No storage.cfg found - please configure storage first"
+        read -rp "Press Enter to continue..."
+        return 1
+    fi
+
+    local storages
+    storages=$(grep "^truenasplugin:" "$STORAGE_CFG" 2>/dev/null | awk '{print $2}')
+
+    if [[ -z "$storages" ]]; then
+        warning "No TrueNAS storage configured"
+        info "Please configure storage first from the main menu"
+        read -rp "Press Enter to continue..."
+        return 1
+    fi
+
+    # Show available storage
+    info "Available TrueNAS storage:"
+    while IFS= read -r storage; do
+        echo "  • $storage"
+    done <<< "$storages"
+    echo
+
+    # Prompt for storage selection
+    local storage_name
+    read -rp "Enter storage name: " storage_name
+
+    if [[ -z "$storage_name" ]]; then
+        warning "Storage name cannot be empty"
+        return 1
+    fi
+
+    # Verify storage exists
+    if ! echo "$storages" | grep -q "^${storage_name}$"; then
+        error "Storage '$storage_name' not found"
+        return 1
+    fi
+
+    # Get storage configuration
+    local api_host api_key dataset api_insecure transport_mode
+    api_host=$(get_storage_config_value "$storage_name" "api_host" || true)
+    api_key=$(get_storage_config_value "$storage_name" "api_key" || true)
+    dataset=$(get_storage_config_value "$storage_name" "dataset" || true)
+    api_insecure=$(get_storage_config_value "$storage_name" "api_insecure" || true)
+    transport_mode=$(get_storage_config_value "$storage_name" "transport_mode" || true)
+
+    # Default to iscsi if not specified
+    [[ -z "$transport_mode" ]] && transport_mode="iscsi"
+
+    # Check if NVMe mode
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        warning "Orphan cleanup is not supported for NVMe/TCP storage"
+        info "NVMe/TCP orphan detection requires WebSocket API (not yet implemented)"
+        return 0
+    fi
+
+    echo
+    info "Detecting orphaned resources for storage '$storage_name'..."
+    echo
+
+    # Set curl options
+    local curl_opts="-s"
+    [[ "$api_insecure" == "1" ]] && curl_opts="$curl_opts -k"
+
+    # Fetch data from TrueNAS API
+    info "Fetching iSCSI extents..."
+    local extents
+    extents=$(curl $curl_opts -H "Authorization: Bearer $api_key" "https://$api_host/api/v2.0/iscsi/extent" 2>/dev/null) || {
+        error "Failed to fetch extents from TrueNAS API"
+        return 1
+    }
+
+    info "Fetching zvols..."
+    local zvols
+    zvols=$(curl $curl_opts -H "Authorization: Bearer $api_key" "https://$api_host/api/v2.0/pool/dataset" 2>/dev/null) || {
+        error "Failed to fetch zvols from TrueNAS API"
+        return 1
+    }
+
+    info "Fetching target-extent mappings..."
+    local targetextents
+    targetextents=$(curl $curl_opts -H "Authorization: Bearer $api_key" "https://$api_host/api/v2.0/iscsi/targetextent" 2>/dev/null) || {
+        error "Failed to fetch targetextents from TrueNAS API"
+        return 1
+    }
+
+    echo
+    info "Analyzing resources..."
+    echo
+
+    # Arrays to store orphan IDs
+    local -a extent_orphans=()
+    local -a te_orphans=()
+    local -a zvol_orphans=()
+    local orphan_count=0
+
+    # Check extents without zvols
+    local extent_data
+    extent_data=$(echo "$extents" | grep -o '"id": *[0-9]*' | sed 's/"id": *//' || true)
+
+    for extent_id in $extent_data; do
+        local extent_disk
+        extent_disk=$(echo "$extents" | sed -n "/{/,/}/{ /\"id\": *${extent_id}/,/}/p }" | \
+                     grep -o '"disk": *"zvol/[^"]*"' | sed 's/"disk": *"zvol\///' | sed 's/"$//' | head -1 || true)
+
+        [[ -z "$extent_disk" ]] && continue
+
+        # Check if zvol is under our dataset and exists
+        if [[ "$extent_disk" == "$dataset/"* ]]; then
+            if ! echo "$zvols" | grep -q "\"id\": *\"${extent_disk}\""; then
+                extent_orphans+=("$extent_id")
+                orphan_count=$((orphan_count + 1))
+            fi
+        fi
+    done
+
+    # Check targetextents without extents
+    local te_data
+    te_data=$(echo "$targetextents" | grep -o '"id": *[0-9]*' | sed 's/"id": *//' || true)
+
+    for te_id in $te_data; do
+        local extent_ref
+        extent_ref=$(echo "$targetextents" | sed -n "/{/,/}/{ /\"id\": *${te_id}/,/}/p }" | \
+                    grep -o '"extent": *[0-9]*' | sed 's/"extent": *//' | head -1 || true)
+
+        [[ -z "$extent_ref" ]] && continue
+
+        if ! echo "$extents" | grep -q "\"id\": *${extent_ref}"; then
+            te_orphans+=("$te_id")
+            orphan_count=$((orphan_count + 1))
+        fi
+    done
+
+    # Check zvols without extents
+    local zvol_ids
+    zvol_ids=$(echo "$zvols" | { grep -B2 -A2 "\"type\": *\"VOLUME\"" || true; } | \
+              { grep "\"id\": *\"${dataset}/" || true; } | sed 's/.*"id": *"\([^"]*\)".*/\1/' || true)
+
+    for zvol_id in $zvol_ids; do
+        local zvol_disk="zvol/${zvol_id}"
+        if ! echo "$extents" | grep -q "\"disk\": *\"${zvol_disk}\""; then
+            zvol_orphans+=("$zvol_id")
+            orphan_count=$((orphan_count + 1))
+        fi
+    done
+
+    # Report findings
+    if [[ $orphan_count -eq 0 ]]; then
+        success "No orphaned resources found"
+        return 0
+    fi
+
+    error "Found $orphan_count orphaned resource(s):"
+    echo
+
+    # Display orphans
+    for extent_id in "${extent_orphans[@]}"; do
+        echo "  • [EXTENT] ID: $extent_id (zvol missing)"
+    done
+
+    for te_id in "${te_orphans[@]}"; do
+        echo "  • [TARGET-EXTENT] ID: $te_id (extent missing)"
+    done
+
+    for zvol_id in "${zvol_orphans[@]}"; do
+        echo "  • [ZVOL] $zvol_id (no extent pointing to this zvol)"
+    done
+
+    echo
+    warning "WARNING: This will permanently delete these orphaned resources!"
+    echo
+
+    # Typed confirmation
+    local confirm
+    read -rp "Type 'DELETE' (all caps) to confirm deletion: " confirm
+    if [[ "$confirm" != "DELETE" ]]; then
+        warning "Confirmation failed. Cleanup cancelled."
+        return 1
+    fi
+
+    echo
+    info "Cleaning up orphaned resources..."
+    echo
+
+    # Delete targetextents first (they reference extents)
+    if [[ ${#te_orphans[@]} -gt 0 ]]; then
+        for te_id in "${te_orphans[@]}"; do
+            info "Deleting target-extent mapping ID: $te_id..."
+            if curl $curl_opts -H "Authorization: Bearer $api_key" -X DELETE "https://$api_host/api/v2.0/iscsi/targetextent/id/$te_id" > /dev/null 2>&1; then
+                success "  Deleted target-extent $te_id"
+            else
+                error "  Failed to delete target-extent $te_id"
+            fi
+        done
+    fi
+
+    # Delete extents
+    if [[ ${#extent_orphans[@]} -gt 0 ]]; then
+        for extent_id in "${extent_orphans[@]}"; do
+            info "Deleting extent ID: $extent_id..."
+            if curl $curl_opts -H "Authorization: Bearer $api_key" -X DELETE "https://$api_host/api/v2.0/iscsi/extent/id/$extent_id" > /dev/null 2>&1; then
+                success "  Deleted extent $extent_id"
+            else
+                error "  Failed to delete extent $extent_id"
+            fi
+        done
+    fi
+
+    # Delete zvols
+    if [[ ${#zvol_orphans[@]} -gt 0 ]]; then
+        for zvol_id in "${zvol_orphans[@]}"; do
+            info "Deleting zvol: $zvol_id..."
+            # URL encode the zvol path
+            local zvol_encoded
+            zvol_encoded=$(echo "$zvol_id" | sed 's|/|%2F|g')
+            if curl $curl_opts -H "Authorization: Bearer $api_key" -X DELETE "https://$api_host/api/v2.0/pool/dataset/id/$zvol_encoded" > /dev/null 2>&1; then
+                success "  Deleted zvol $zvol_id"
+            else
+                error "  Failed to delete zvol $zvol_id"
+            fi
+        done
+    fi
+
+    echo
+    success "Cleanup complete!"
+    return 0
+}
+
+# Menu: Run health check
+menu_health_check() {
+    clear_screen
+    print_banner
+    echo
+
+    # Show header
+    info "Health Check"
+    echo
+
+    # List available TrueNAS storage
+    info "Detecting TrueNAS storage configurations..."
+    echo
+
+    if [[ ! -f "$STORAGE_CFG" ]]; then
+        warning "No storage.cfg found - please configure storage first"
+        read -rp "Press Enter to continue..."
+        return 1
+    fi
+
+    local storages
+    storages=$(grep "^truenasplugin:" "$STORAGE_CFG" 2>/dev/null | awk '{print $2}')
+
+    if [[ -z "$storages" ]]; then
+        warning "No TrueNAS storage configured"
+        info "Please configure storage first from the main menu"
+        read -rp "Press Enter to continue..."
+        return 1
+    fi
+
+    # Show available storage
+    info "Available TrueNAS storage:"
+    echo "$storages" | while read -r storage; do
+        echo "  • $storage"
+    done
+    echo
+
+    # Prompt for storage name
+    local storage_name
+    read -rp "Enter storage name to check (or press Enter for first): " storage_name
+
+    if [[ -z "$storage_name" ]]; then
+        storage_name=$(echo "$storages" | head -1)
+        info "Using: $storage_name"
+    fi
+
+    # Verify storage exists
+    if ! echo "$storages" | grep -q "^${storage_name}$"; then
+        error "Storage '$storage_name' not found"
+        read -rp "Press Enter to continue..."
+        return 1
+    fi
+
+    # Clear screen and show header for health check execution
+    clear_screen
+    print_banner
+    echo
+
+    info "Health Check"
+    echo
+
+    info "Running health check on storage: $storage_name"
+    echo
+
+    # Run health check and capture exit code
+    # Don't let non-zero returns trigger error trap
+    run_health_check "$storage_name" || true
+}
+
+# Extract storage configuration block safely
+get_storage_config_value() {
+    local storage_name="$1"
+    local param_name="$2"
+    local config_block
+
+    # Extract only the configuration block for this storage (stop at next storage entry)
+    config_block=$(awk "/^truenasplugin: ${storage_name}\$/{flag=1; next} /^truenasplugin:/{flag=0} flag" "$STORAGE_CFG")
+
+    # Extract parameter from block
+    echo "$config_block" | grep "^\s*${param_name}" | awk '{print $2}' | head -1
+}
+
+# Detect orphaned resources (transport-aware)
+detect_orphaned_resources() {
+    local storage_name="$1"
+    local transport_mode="$2"
+    local api_host="$3"
+    local api_key="$4"
+    local dataset="$5"
+    local api_insecure="$6"
+
+    # Set curl options
+    local curl_opts="-s"
+    [[ "$api_insecure" == "1" ]] && curl_opts="$curl_opts -k"
+
+    local orphan_count=0
+
+    if [[ "$transport_mode" == "iscsi" ]]; then
+        # iSCSI orphan detection
+
+        # Fetch extents
+        local extents
+        extents=$(curl $curl_opts -H "Authorization: Bearer $api_key" "https://$api_host/api/v2.0/iscsi/extent" 2>/dev/null) || return 1
+
+        # Fetch zvols
+        local zvols
+        zvols=$(curl $curl_opts -H "Authorization: Bearer $api_key" "https://$api_host/api/v2.0/pool/dataset" 2>/dev/null) || return 1
+
+        # Extract extent IDs and disks using grep/sed
+        # Parse JSON: look for "id": <number> and "disk": "zvol/..."
+        local extent_data
+        extent_data=$(echo "$extents" | grep -o '"id": *[0-9]*' | sed 's/"id": *//')
+
+        for extent_id in $extent_data; do
+            # Extract disk path for this extent ID
+            local extent_disk
+            extent_disk=$(echo "$extents" | sed -n "/{/,/}/{ /"'"'"id"'"'": *${extent_id}/,/}/p }" | \
+                         grep -o '"disk": *"zvol/[^"]*"' | sed 's/"disk": *"zvol\///' | sed 's/"$//' | head -1)
+
+            [[ -z "$extent_disk" ]] && continue
+
+            # Check if zvol is under our dataset and exists
+            if [[ "$extent_disk" == "$dataset/"* ]]; then
+                if ! echo "$zvols" | grep -q "\"id\": *\"${extent_disk}\""; then
+                    ((orphan_count++))
+                fi
+            fi
+        done
+
+        # Check for orphaned zvols (zvols without extents)
+        # Extract zvol IDs that match our dataset and type VOLUME
+        local zvol_ids
+        zvol_ids=$(echo "$zvols" | grep -B2 -A2 "\"type\": *\"VOLUME\"" | \
+                  grep "\"id\": *\"${dataset}/" | sed 's/.*"id": *"\([^"]*\)".*/\1/')
+
+        for zvol_id in $zvol_ids; do
+            local zvol_disk="zvol/${zvol_id}"
+            if ! echo "$extents" | grep -q "\"disk\": *\"${zvol_disk}\""; then
+                ((orphan_count++))
+            fi
+        done
+
+    else
+        # NVMe/TCP mode - not supported yet (requires WebSocket API)
+        # Return 0 to indicate no orphans found (skip check)
+        return 0
+    fi
+
+    echo "$orphan_count"
+}
+
+# ============================================================================
+# FIO Benchmark Functions
+# ============================================================================
+
+# FIO benchmark orchestration function
+run_fio_benchmark() {
+    local storage_name="$1"
+    local extended="${2:-false}"
+    local allocated_volume=""
+    local test_device=""
+    local cleanup_done=false
+    local current_fio_pid=""
+
+    # Global flag so fio_run_test can check it
+    declare -g benchmark_interrupted=false
+
+    # Cleanup function for benchmark
+    cleanup_benchmark() {
+        local sig="${1:-EXIT}"
+
+        # Check if cleanup already done (variable may not exist if interrupted early)
+        if [[ "${cleanup_done:-false}" == "true" ]]; then
+            return 0
+        fi
+        cleanup_done=true
+
+        # Set interrupt flag to break out of any running polling loops
+        benchmark_interrupted=true
+
+        # Disable further interrupts during cleanup to prevent corruption
+        trap '' INT TERM
+
+        # Stop spinner if running
+        stop_spinner 2>/dev/null || true
+
+        # Kill specific FIO process if running
+        if [[ -n "${current_fio_pid:-}" ]] && kill -0 "${current_fio_pid:-}" 2>/dev/null; then
+            log "INFO" "Terminating FIO process with PID ${current_fio_pid:-}"
+            kill "${current_fio_pid:-}" 2>/dev/null || true
+            sleep 1
+            # If still running, force kill
+            if kill -0 "${current_fio_pid:-}" 2>/dev/null; then
+                log "WARNING" "FIO process ${current_fio_pid:-} not responding, using SIGKILL"
+                kill -9 "${current_fio_pid:-}" 2>/dev/null || true
+            fi
+        fi
+
+        if [[ -n "${allocated_volume:-}" ]]; then
+            echo
+            info "Cleaning up test volume..."
+
+            # Free the allocated volume
+            pvesm free "$allocated_volume" &>/dev/null || true
+            sleep 2
+
+            success "Cleanup complete"
+        fi
+
+        # Re-enable interrupts and unset traps before returning
+        trap - EXIT INT TERM
+
+        # If interrupted, show message and return to menu
+        if [[ "$sig" == "INT" ]]; then
+            echo
+            warning "Benchmark interrupted by user (CTRL+C)"
+            return 130
+        elif [[ "$sig" == "TERM" ]]; then
+            echo
+            warning "Benchmark terminated"
+            return 143
+        fi
+    }
+
+    # Set trap for cleanup on exit/interrupt
+    trap 'cleanup_benchmark INT' INT
+    trap 'cleanup_benchmark TERM' TERM
+    trap 'cleanup_benchmark EXIT' EXIT
+
+    # Check 1: FIO installation and version validation
+    printf "%-30s " "FIO installation:"
+    if command -v fio &>/dev/null; then
+        local fio_version fio_major fio_minor
+        fio_version=$(fio --version 2>/dev/null | head -1 || echo "unknown")
+
+        # Extract version number (format: fio-3.16 or fio-3.x)
+        if [[ "$fio_version" =~ fio-([0-9]+)\.([0-9]+) ]]; then
+            fio_major="${BASH_REMATCH[1]}"
+            fio_minor="${BASH_REMATCH[2]}"
+
+            # Minimum version requirement: 3.0 (for reliable JSON output)
+            if [[ $fio_major -lt 3 ]]; then
+                echo -e "${COLOR_RED}✗${COLOR_RESET} $fio_version (too old)"
+                echo
+                error "FIO version 3.0 or higher is required for JSON output support"
+                info "Current version: $fio_version"
+                info "Please upgrade FIO using: apt install fio"
+                return 1
+            fi
+        fi
+
+        echo -e "${COLOR_GREEN}✓${COLOR_RESET} $fio_version"
+
+        # Validate JSON output support
+        local json_test
+        json_test=$(fio --output-format=json --version 2>&1)
+        if [[ $? -ne 0 ]] || echo "$json_test" | grep -qi "unknown.*format"; then
+            echo
+            warning "FIO JSON output format may not be supported"
+            info "Benchmark results parsing may fail"
+            echo
+            read -rp "Continue anyway? (y/N): " continue_choice
+            if [[ ! "$continue_choice" =~ ^[Yy] ]]; then
+                return 1
+            fi
+        fi
+    else
+        echo -e "${COLOR_RED}✗${COLOR_RESET} Not installed"
+        echo
+        error "FIO is not installed on this system"
+        info "Please install FIO using: apt install fio"
+        return 1
+    fi
+
+    # Check 2: Storage configuration
+    printf "%-30s " "Storage configuration:"
+    start_spinner
+
+    local api_host api_key dataset transport_mode
+    api_host=$(get_storage_config_value "$storage_name" "api_host")
+    api_key=$(get_storage_config_value "$storage_name" "api_key")
+    dataset=$(get_storage_config_value "$storage_name" "dataset")
+    transport_mode=$(get_storage_config_value "$storage_name" "transport_mode")
+
+    # Default to iSCSI if transport_mode not specified
+    if [[ -z "$transport_mode" ]]; then
+        transport_mode="iscsi"
+    fi
+
+    stop_spinner
+
+    if [[ -z "$api_host" || -z "$api_key" || -z "$dataset" ]]; then
+        echo -e "\r$(printf "%-30s " "Storage configuration:")${COLOR_RED}✗${COLOR_RESET} Incomplete configuration"
+        return 1
+    fi
+
+    echo -e "\r$(printf "%-30s " "Storage configuration:")${COLOR_GREEN}✓${COLOR_RESET} Valid ($transport_mode mode)"
+
+    # Check 3: Find available VM ID for volume allocation
+    printf "%-30s " "Finding available VM ID:"
+    start_spinner
+
+    # Find two consecutive available VM IDs starting from 990
+    if ! test_find_available_vm_ids 990; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Finding available VM ID:")${COLOR_RED}✗${COLOR_RESET} No available VM IDs"
+        error "Cannot find available VM ID in range 990-1090"
+        return 1
+    fi
+
+    # Use the first available ID for the FIO benchmark volume
+    local benchmark_vm_id=$TEST_VM_BASE
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Finding available VM ID:")${COLOR_GREEN}✓${COLOR_RESET} Using VM ID $benchmark_vm_id"
+
+    # Check 4: Allocate test volume directly on storage
+    printf "%-30s " "Allocating 10GB test volume:"
+    start_spinner
+
+    # Generate unique volume name with timestamp to avoid conflicts
+    local timestamp
+    timestamp=$(date +%s)
+    local unique_name="fio-bench-${timestamp}"
+
+    local alloc_result volume_name
+    alloc_result=$(pvesm alloc "$storage_name" "$benchmark_vm_id" "$unique_name" 10G 2>&1)
+    local alloc_exit=$?
+
+    stop_spinner
+
+    if [[ $alloc_exit -ne 0 ]]; then
+        echo -e "\r$(printf "%-30s " "Allocating 10GB test volume:")${COLOR_RED}✗${COLOR_RESET} Allocation failed"
+        error "Failed to allocate volume: $alloc_result"
+        return 1
+    fi
+
+    # Extract volume name from result (format: storage:volumename)
+    volume_name=$(echo "$alloc_result" | grep -oP "successfully created '\K[^']+")
+    if [[ -z "$volume_name" ]]; then
+        # Parsing failed - try to get volume list from storage
+        volume_name=$(pvesm list "$storage_name" 2>/dev/null | grep "$unique_name" | awk '{print $1}' | head -1)
+    fi
+
+    if [[ -z "$volume_name" ]]; then
+        echo -e "\r$(printf "%-30s " "Allocating 10GB test volume:")${COLOR_RED}✗${COLOR_RESET} Cannot determine volume name"
+        error "Volume was created but name could not be determined"
+        error "Output was: $alloc_result"
+        return 1
+    fi
+
+    allocated_volume="$volume_name"
+
+    # Verify the volume actually exists
+    if ! pvesm list "$storage_name" 2>/dev/null | grep -q "$volume_name"; then
+        echo -e "\r$(printf "%-30s " "Allocating 10GB test volume:")${COLOR_RED}✗${COLOR_RESET} Volume verification failed"
+        error "Volume $volume_name was not found in storage"
+        return 1
+    fi
+
+    echo -e "\r$(printf "%-30s " "Allocating 10GB test volume:")${COLOR_GREEN}✓${COLOR_RESET} $volume_name"
+
+    # Wait for device to appear (sufficient for both iSCSI and NVMe/TCP)
+    printf "%-30s " "Waiting for device (5s):"
+    start_spinner
+    sleep 5
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Waiting for device (5s):")${COLOR_GREEN}✓${COLOR_RESET} Ready"
+
+    # Check 5: Detect device path
+    printf "%-30s " "Detecting device path:"
+    start_spinner
+
+    # Try pvesm path first (authoritative source)
+    test_device=$(pvesm path "$volume_name" 2>/dev/null)
+
+    # If pvesm path didn't work, fall back to detection logic
+    if [[ -z "$test_device" || ! -b "$test_device" ]]; then
+        test_device=$(fio_detect_device_path "$storage_name" "$volume_name")
+    fi
+
+    stop_spinner
+
+    if [[ -z "$test_device" || ! -b "$test_device" ]]; then
+        echo -e "\r$(printf "%-30s " "Detecting device path:")${COLOR_RED}✗${COLOR_RESET} Device not found"
+        error "Could not detect block device for test volume"
+        info "Volume name: $volume_name"
+        info "Available devices: $(ls -1 /dev/sd* /dev/nvme* /dev/mapper/mpath* 2>/dev/null | head -5 | tr '\n' ' ')"
+        cleanup_benchmark
+        return 1
+    fi
+
+    echo -e "\r$(printf "%-30s " "Detecting device path:")${COLOR_GREEN}✓${COLOR_RESET} $test_device"
+
+    # Check 6: Validate device is not in use
+    printf "%-30s " "Validating device is unused:"
+    start_spinner
+
+    # Check if device has filesystem
+    local has_fs
+    has_fs=$(blkid "$test_device" 2>/dev/null)
+
+    # Check if device is mounted
+    local is_mounted
+    is_mounted=$(mount | grep -q "$test_device" && echo "yes" || echo "no")
+
+    stop_spinner
+
+    if [[ -n "$has_fs" ]]; then
+        echo -e "\r$(printf "%-30s " "Validating device is unused:")${COLOR_RED}✗${COLOR_RESET} Device has filesystem"
+        error "Device $test_device has a filesystem: $has_fs"
+        cleanup_benchmark
+        return 1
+    fi
+
+    if [[ "$is_mounted" == "yes" ]]; then
+        echo -e "\r$(printf "%-30s " "Validating device is unused:")${COLOR_RED}✗${COLOR_RESET} Device is mounted"
+        error "Device $test_device is currently mounted"
+        cleanup_benchmark
+        return 1
+    fi
+
+    # Note: VM ID check removed - volumes created with pvesm alloc are not attached to VMs
+    # The filesystem and mount checks above, plus lsof checks in fio_run_test, are sufficient
+
+    echo -e "\r$(printf "%-30s " "Validating device is unused:")${COLOR_GREEN}✓${COLOR_RESET} Device is safe to test"
+
+    echo
+    # Adjust message based on extended mode
+    if [[ "$extended" == "true" ]]; then
+        info "Starting FIO benchmarks (90 tests, 75-90 minutes total)..."
+    else
+        info "Starting FIO benchmarks (30 tests, 25-30 minutes total)..."
+    fi
+    echo
+
+    # Run benchmark tests (pass extended flag)
+    fio_run_benchmark_suite "$test_device" "$transport_mode" "$extended"
+
+    # EXIT trap will handle cleanup automatically
+    return 0
+}
+
+# Detect device path for benchmark test disk
+fio_detect_device_path() {
+    local storage_name="$1"
+    local volume_name="$2"
+    local device_path=""
+
+    # Extract just the volume part (after storage name)
+    local vol_id
+    vol_id=$(echo "$volume_name" | sed "s/${storage_name}://")
+
+    # Detect transport mode
+    local transport_mode use_multipath
+    transport_mode=$(get_storage_config_value "$storage_name" "transport_mode")
+    use_multipath=$(get_storage_config_value "$storage_name" "use_multipath")
+
+    # Default to iSCSI if not specified
+    if [[ -z "$transport_mode" ]]; then
+        transport_mode="iscsi"
+    fi
+
+    # Wait for device to appear and retry up to 40 times (40 seconds after initial 10 second wait = 50 total)
+    local max_retries=40
+    local retry_count=0
+
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        # NVMe-TCP: Look for device in nvme list
+        # The volume ID should match the NVMe namespace
+        while [[ $retry_count -lt $max_retries ]]; do
+            # Get list of all NVMe devices with their details
+            local nvme_devices
+            nvme_devices=$(nvme list 2>/dev/null | tail -n +3)
+
+            # Look for the most recently added device
+            # For NVMe-TCP, we'll find the newest device by checking timestamps
+            local newest_nvme
+            newest_nvme=$(ls -t /dev/nvme*n1 2>/dev/null | head -1)
+
+            if [[ -n "$newest_nvme" && -b "$newest_nvme" ]]; then
+                device_path="$newest_nvme"
+                break
+            fi
+
+            sleep 1
+            ((retry_count++))
+        done
+
+    else
+        # iSCSI: Check for multipath or standard device
+        if [[ "$use_multipath" == "1" ]]; then
+            # Multipath enabled: Look for /dev/mapper/mpathX
+            while [[ $retry_count -lt $max_retries ]]; do
+                # Rescan multipath to pick up new devices
+                multipath -r &>/dev/null || true
+
+                # Get the most recently added multipath device
+                local newest_mpath
+                newest_mpath=$(ls -t /dev/mapper/mpath* 2>/dev/null | head -1)
+
+                if [[ -n "$newest_mpath" && -b "$newest_mpath" ]]; then
+                    device_path="$newest_mpath"
+                    break
+                fi
+
+                sleep 1
+                ((retry_count++))
+            done
+
+        else
+            # Standard iSCSI: Look for /dev/sdX
+            # Get baseline of existing SCSI devices before allocation
+            while [[ $retry_count -lt $max_retries ]]; do
+                # Rescan SCSI bus to pick up new devices
+                echo "- - -" > /proc/scsi/scsi 2>/dev/null || true
+
+                # Find the most recently added SCSI device
+                local newest_sd
+                newest_sd=$(ls -t /dev/sd* 2>/dev/null | grep -E "sd[a-z]+$" | head -1)
+
+                if [[ -n "$newest_sd" && -b "$newest_sd" ]]; then
+                    # Verify it's roughly the right size (around 10GB)
+                    local size_gb
+                    size_gb=$(lsblk -b -dn -o SIZE "$newest_sd" 2>/dev/null | awk '{printf "%.0f", $1/1024/1024/1024}')
+
+                    if [[ -n "$size_gb" && $size_gb -ge 9 && $size_gb -le 11 ]]; then
+                        device_path="$newest_sd"
+                        break
+                    fi
+                fi
+
+                sleep 1
+                ((retry_count++))
+            done
+        fi
+    fi
+
+    echo "$device_path"
+}
+
+# Progress is now shown in section headers instead of bottom progress bar
+
+# Run FIO benchmark suite on a device
+fio_run_benchmark_suite() {
+    local device="$1"
+    local transport_mode="$2"
+    local extended="${3:-false}"
+
+    # Define queue depths to test - same for both transport modes
+    info "Transport mode: ${transport_mode} (testing QD=1, 16, 32, 64, 128)"
+    if [[ "$extended" == "true" ]]; then
+        info "Extended mode: Testing each QD with numjobs=1, 4, 8"
+    fi
+    echo
+
+    local test_num=1
+    local total_tests=30
+    if [[ "$extended" == "true" ]]; then
+        total_tests=90
+    fi
+
+    # Arrays to store results for summary (global scope for access in fio_run_test)
+    # Clear arrays from any previous runs
+    test_names=()
+    test_results=()
+    test_values=()
+    test_numjobs=()
+    declare -ga test_names
+    declare -ga test_results
+    declare -ga test_values
+    declare -ga test_numjobs
+
+    # Determine numjobs values to test
+    local -a numjobs_values=(1)
+    if [[ "$extended" == "true" ]]; then
+        numjobs_values=(1 4 8)
+    fi
+
+    # Sequential Read Bandwidth - 5 queue depths × numjobs values
+    local test_range_end=$((test_num + 5 * ${#numjobs_values[@]} - 1))
+    info "Sequential Read Bandwidth Tests: [${test_num}-${test_range_end}/${total_tests}]"
+    for numjobs in "${numjobs_values[@]}"; do
+        local job_suffix=""
+        [[ "$extended" == "true" ]] && job_suffix=" (jobs=${numjobs})"
+        fio_run_test "Queue Depth = 1${job_suffix}:" "$device" \
+            "seq-read-qd1-jobs${numjobs}" "read" "1M" "1" "20" "bandwidth" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 16${job_suffix}:" "$device" \
+            "seq-read-qd16-jobs${numjobs}" "read" "1M" "16" "20" "bandwidth" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 32${job_suffix}:" "$device" \
+            "seq-read-qd32-jobs${numjobs}" "read" "1M" "32" "20" "bandwidth" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 64${job_suffix}:" "$device" \
+            "seq-read-qd64-jobs${numjobs}" "read" "1M" "64" "20" "bandwidth" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 128${job_suffix}:" "$device" \
+            "seq-read-qd128-jobs${numjobs}" "read" "1M" "128" "20" "bandwidth" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+    done
+    echo
+
+    # Sequential Write Bandwidth - 5 queue depths × numjobs values
+    test_range_end=$((test_num + 5 * ${#numjobs_values[@]} - 1))
+    info "Sequential Write Bandwidth Tests: [${test_num}-${test_range_end}/${total_tests}]"
+    for numjobs in "${numjobs_values[@]}"; do
+        local job_suffix=""
+        [[ "$extended" == "true" ]] && job_suffix=" (jobs=${numjobs})"
+        fio_run_test "Queue Depth = 1${job_suffix}:" "$device" \
+            "seq-write-qd1-jobs${numjobs}" "write" "1M" "1" "20" "bandwidth" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 16${job_suffix}:" "$device" \
+            "seq-write-qd16-jobs${numjobs}" "write" "1M" "16" "20" "bandwidth" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 32${job_suffix}:" "$device" \
+            "seq-write-qd32-jobs${numjobs}" "write" "1M" "32" "20" "bandwidth" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 64${job_suffix}:" "$device" \
+            "seq-write-qd64-jobs${numjobs}" "write" "1M" "64" "20" "bandwidth" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 128${job_suffix}:" "$device" \
+            "seq-write-qd128-jobs${numjobs}" "write" "1M" "128" "20" "bandwidth" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+    done
+    echo
+
+    # Random Read IOPS - 5 queue depths × numjobs values
+    test_range_end=$((test_num + 5 * ${#numjobs_values[@]} - 1))
+    info "Random Read IOPS Tests: [${test_num}-${test_range_end}/${total_tests}]"
+    for numjobs in "${numjobs_values[@]}"; do
+        local job_suffix=""
+        [[ "$extended" == "true" ]] && job_suffix=" (jobs=${numjobs})"
+        fio_run_test "Queue Depth = 1${job_suffix}:" "$device" \
+            "rand-read-qd1-jobs${numjobs}" "randread" "4K" "1" "30" "iops" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 16${job_suffix}:" "$device" \
+            "rand-read-qd16-jobs${numjobs}" "randread" "4K" "16" "30" "iops" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 32${job_suffix}:" "$device" \
+            "rand-read-qd32-jobs${numjobs}" "randread" "4K" "32" "30" "iops" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 64${job_suffix}:" "$device" \
+            "rand-read-qd64-jobs${numjobs}" "randread" "4K" "64" "30" "iops" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 128${job_suffix}:" "$device" \
+            "rand-read-qd128-jobs${numjobs}" "randread" "4K" "128" "30" "iops" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+    done
+    echo
+
+    # Random Write IOPS - 5 queue depths × numjobs values
+    test_range_end=$((test_num + 5 * ${#numjobs_values[@]} - 1))
+    info "Random Write IOPS Tests: [${test_num}-${test_range_end}/${total_tests}]"
+    for numjobs in "${numjobs_values[@]}"; do
+        local job_suffix=""
+        [[ "$extended" == "true" ]] && job_suffix=" (jobs=${numjobs})"
+        fio_run_test "Queue Depth = 1${job_suffix}:" "$device" \
+            "rand-write-qd1-jobs${numjobs}" "randwrite" "4K" "1" "30" "iops" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 16${job_suffix}:" "$device" \
+            "rand-write-qd16-jobs${numjobs}" "randwrite" "4K" "16" "30" "iops" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 32${job_suffix}:" "$device" \
+            "rand-write-qd32-jobs${numjobs}" "randwrite" "4K" "32" "30" "iops" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 64${job_suffix}:" "$device" \
+            "rand-write-qd64-jobs${numjobs}" "randwrite" "4K" "64" "30" "iops" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 128${job_suffix}:" "$device" \
+            "rand-write-qd128-jobs${numjobs}" "randwrite" "4K" "128" "30" "iops" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+    done
+    echo
+
+    # Random Read Latency - 5 queue depths × numjobs values
+    test_range_end=$((test_num + 5 * ${#numjobs_values[@]} - 1))
+    info "Random Read Latency Tests: [${test_num}-${test_range_end}/${total_tests}]"
+    for numjobs in "${numjobs_values[@]}"; do
+        local job_suffix=""
+        [[ "$extended" == "true" ]] && job_suffix=" (jobs=${numjobs})"
+        fio_run_test "Queue Depth = 1${job_suffix}:" "$device" \
+            "rand-read-lat-qd1-jobs${numjobs}" "randread" "4K" "1" "20" "latency" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 16${job_suffix}:" "$device" \
+            "rand-read-lat-qd16-jobs${numjobs}" "randread" "4K" "16" "20" "latency" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 32${job_suffix}:" "$device" \
+            "rand-read-lat-qd32-jobs${numjobs}" "randread" "4K" "32" "20" "latency" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 64${job_suffix}:" "$device" \
+            "rand-read-lat-qd64-jobs${numjobs}" "randread" "4K" "64" "20" "latency" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 128${job_suffix}:" "$device" \
+            "rand-read-lat-qd128-jobs${numjobs}" "randread" "4K" "128" "20" "latency" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+    done
+    echo
+
+    # Mixed 70/30 Workload - 5 queue depths × numjobs values
+    test_range_end=$((test_num + 5 * ${#numjobs_values[@]} - 1))
+    info "Mixed 70/30 Workload Tests: [${test_num}-${test_range_end}/${total_tests}]"
+    for numjobs in "${numjobs_values[@]}"; do
+        local job_suffix=""
+        [[ "$extended" == "true" ]] && job_suffix=" (jobs=${numjobs})"
+        fio_run_test "Queue Depth = 1${job_suffix}:" "$device" \
+            "mixed-7030-qd1-jobs${numjobs}" "randrw" "4K" "1" "30" "mixed" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 16${job_suffix}:" "$device" \
+            "mixed-7030-qd16-jobs${numjobs}" "randrw" "4K" "16" "30" "mixed" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 32${job_suffix}:" "$device" \
+            "mixed-7030-qd32-jobs${numjobs}" "randrw" "4K" "32" "30" "mixed" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 64${job_suffix}:" "$device" \
+            "mixed-7030-qd64-jobs${numjobs}" "randrw" "4K" "64" "30" "mixed" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 128${job_suffix}:" "$device" \
+            "mixed-7030-qd128-jobs${numjobs}" "randrw" "4K" "128" "30" "mixed" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+    done
+
+    # Display benchmark summary
+    echo
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    info "Benchmark Summary"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo
+
+    local completed=0
+    local failed=0
+    for status in "${test_values[@]}"; do
+        if [[ "$status" == "pass" ]]; then
+            ((completed++))
+        else
+            ((failed++))
+        fi
+    done
+
+    info "Total tests run: $total_tests"
+    info "Completed: $completed"
+    if [[ $failed -gt 0 ]]; then
+        error "Failed: $failed"
+    fi
+    echo
+
+    # Show top performers in each category
+    # In extended mode, show separate sections for each numjobs value
+    local -a numjobs_list=(1)
+    if [[ "$extended" == "true" ]]; then
+        numjobs_list=(1 4 8)
+    fi
+
+    # Map test index to queue depth (0=QD1, 1=QD16, 2=QD32, 3=QD64, 4=QD128)
+    local qd_map=(1 16 32 64 128)
+
+    for target_numjobs in "${numjobs_list[@]}"; do
+        if [[ "$extended" == "true" ]]; then
+            echo
+            info "Top Performers (numjobs=${target_numjobs}):"
+        else
+            info "Top Performers:"
+        fi
+        echo
+
+        # Find best sequential read bandwidth (filter by target numjobs)
+        local best_seq_read_idx=-1
+        local best_seq_read_value=0
+        local value unit
+        for i in "${!test_names[@]}"; do
+            # Filter: sequential read tests with matching numjobs
+            if [[ "${test_names[$i]}" =~ ^seq-read- ]] && [[ "${test_numjobs[$i]:-1}" == "$target_numjobs" ]] && [[ "${test_values[$i]:-}" == "pass" ]]; then
+                value=$(echo "${test_results[$i]}" | grep -oP '^[0-9.]+')
+                unit=$(echo "${test_results[$i]}" | grep -oP '(MB|GB)/s')
+                # Normalize to MB/s for comparison
+                if [[ "$unit" == "GB/s" ]]; then
+                    value=$(awk "BEGIN {printf \"%.2f\", $value * 1024}")
+                fi
+                if (( $(echo "$value > $best_seq_read_value" | bc -l 2>/dev/null || echo 0) )); then
+                    best_seq_read_value=$value
+                    best_seq_read_idx=$i
+                fi
+            fi
+        done
+        if [[ $best_seq_read_idx -ge 0 ]]; then
+            # Extract QD from test name (e.g., seq-read-qd64-jobs1 -> 64)
+            local seq_read_qd=$(echo "${test_names[$best_seq_read_idx]}" | grep -oP 'qd\K[0-9]+')
+            printf "  %-22s %20s   (QD=%-3s)\n" "Sequential Read:" "${test_results[$best_seq_read_idx]}" "$seq_read_qd"
+        fi
+
+        # Find best sequential write bandwidth (filter by target numjobs)
+        local best_seq_write_idx=-1
+        local best_seq_write_value=0
+        for i in "${!test_names[@]}"; do
+            # Filter: sequential write tests with matching numjobs
+            if [[ "${test_names[$i]}" =~ ^seq-write- ]] && [[ "${test_numjobs[$i]:-1}" == "$target_numjobs" ]] && [[ "${test_values[$i]:-}" == "pass" ]]; then
+                value=$(echo "${test_results[$i]}" | grep -oP '^[0-9.]+')
+                unit=$(echo "${test_results[$i]}" | grep -oP '(MB|GB)/s')
+                # Normalize to MB/s for comparison
+                if [[ "$unit" == "GB/s" ]]; then
+                    value=$(awk "BEGIN {printf \"%.2f\", $value * 1024}")
+                fi
+                if (( $(echo "$value > $best_seq_write_value" | bc -l 2>/dev/null || echo 0) )); then
+                    best_seq_write_value=$value
+                    best_seq_write_idx=$i
+                fi
+            fi
+        done
+        if [[ $best_seq_write_idx -ge 0 ]]; then
+            local seq_write_qd=$(echo "${test_names[$best_seq_write_idx]}" | grep -oP 'qd\K[0-9]+')
+            printf "  %-22s %20s   (QD=%-3s)\n" "Sequential Write:" "${test_results[$best_seq_write_idx]}" "$seq_write_qd"
+        fi
+
+        # Find best random read IOPS (filter by target numjobs)
+        local best_rand_read_idx=-1
+        local best_rand_read_value=0
+        for i in "${!test_names[@]}"; do
+            # Filter: random read tests with matching numjobs
+            if [[ "${test_names[$i]}" =~ ^rand-read-qd ]] && [[ "${test_numjobs[$i]:-1}" == "$target_numjobs" ]] && [[ "${test_values[$i]:-}" == "pass" ]]; then
+                local value=$(echo "${test_results[$i]}" | tr -d ',' | grep -oP '^[0-9.]+')
+                if [[ -n "$value" ]] && (( $(echo "$value > $best_rand_read_value" | bc -l 2>/dev/null || echo 0) )); then
+                    best_rand_read_value=$value
+                    best_rand_read_idx=$i
+                fi
+            fi
+        done
+        if [[ $best_rand_read_idx -ge 0 ]]; then
+            local rand_read_qd=$(echo "${test_names[$best_rand_read_idx]}" | grep -oP 'qd\K[0-9]+')
+            printf "  %-22s %20s   (QD=%-3s)\n" "Random Read IOPS:" "${test_results[$best_rand_read_idx]}" "$rand_read_qd"
+        fi
+
+        # Find best random write IOPS (filter by target numjobs)
+        local best_rand_write_idx=-1
+        local best_rand_write_value=0
+        for i in "${!test_names[@]}"; do
+            # Filter: random write tests with matching numjobs
+            if [[ "${test_names[$i]}" =~ ^rand-write-qd ]] && [[ "${test_numjobs[$i]:-1}" == "$target_numjobs" ]] && [[ "${test_values[$i]:-}" == "pass" ]]; then
+                local value=$(echo "${test_results[$i]}" | tr -d ',' | grep -oP '^[0-9.]+')
+                if [[ -n "$value" ]] && (( $(echo "$value > $best_rand_write_value" | bc -l 2>/dev/null || echo 0) )); then
+                    best_rand_write_value=$value
+                    best_rand_write_idx=$i
+                fi
+            fi
+        done
+        if [[ $best_rand_write_idx -ge 0 ]]; then
+            local rand_write_qd=$(echo "${test_names[$best_rand_write_idx]}" | grep -oP 'qd\K[0-9]+')
+            printf "  %-22s %20s   (QD=%-3s)\n" "Random Write IOPS:" "${test_results[$best_rand_write_idx]}" "$rand_write_qd"
+        fi
+
+        # Find best (lowest) latency (filter by target numjobs)
+        local best_latency_idx=-1
+        local best_latency_value=999999999
+        for i in "${!test_names[@]}"; do
+            # Filter: latency tests with matching numjobs
+            if [[ "${test_names[$i]}" =~ ^rand-read-lat- ]] && [[ "${test_numjobs[$i]:-1}" == "$target_numjobs" ]] && [[ "${test_values[$i]:-}" == "pass" ]]; then
+                value=$(echo "${test_results[$i]}" | grep -oP '^[0-9.]+')
+                unit=$(echo "${test_results[$i]}" | grep -oP '(µs|ms)')
+                # Normalize to µs for comparison (lower is better)
+                if [[ "$unit" == "ms" ]]; then
+                    value=$(awk "BEGIN {printf \"%.2f\", $value * 1000}")
+                fi
+                if [[ -n "$value" ]] && (( $(echo "$value < $best_latency_value" | bc -l 2>/dev/null || echo 0) )); then
+                    best_latency_value=$value
+                    best_latency_idx=$i
+                fi
+            fi
+        done
+        if [[ $best_latency_idx -ge 0 ]]; then
+            local latency_qd=$(echo "${test_names[$best_latency_idx]}" | grep -oP 'qd\K[0-9]+')
+            printf "  %-22s %20s   (QD=%-3s)\n" "Lowest Latency:" "${test_results[$best_latency_idx]}" "$latency_qd"
+        fi
+    done  # End of numjobs loop
+
+    echo
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+# Run a single FIO test with spinner and result display
+fio_run_test() {
+    local label="$1"
+    local device="$2"
+    local test_name="$3"
+    local rw_mode="$4"
+    local block_size="$5"
+    local iodepth="$6"
+    local runtime="$7"
+    local metric_type="$8"
+    local test_num="${9:-0}"
+    local total_tests="${10:-0}"
+    local numjobs="${11:-1}"
+
+    # Validate device is not in use before starting test
+    if command -v lsof &>/dev/null; then
+        if lsof "$device" &>/dev/null; then
+            printf "%-30s " "${label}"
+            echo -e "${COLOR_RED}✗${COLOR_RESET} Device in use"
+            log "ERROR" "Device $device is in use, cannot run test $test_name"
+            return 1
+        fi
+    fi
+
+    # Note: Progress indicator removed from label to maintain alignment
+    # Progress is now shown in a separate progress bar at bottom of screen
+
+    printf "%-30s " "${label}"
+    start_spinner
+
+    # Create temporary file for JSON output
+    local json_output
+    json_output=$(mktemp)
+
+    # Build FIO command with appropriate parameters
+    # Note: --size parameter is required for device paths that FIO cannot auto-query (e.g., iSCSI symlinks)
+    local fio_cmd="fio --name=${test_name} --ioengine=libaio --direct=1 --rw=${rw_mode} --bs=${block_size} --iodepth=${iodepth} --runtime=${runtime} --time_based --size=10G --group_reporting --filename=${device} --output-format=json"
+
+    # Add numjobs parameter if > 1
+    if [[ "$numjobs" -gt 1 ]]; then
+        fio_cmd+=" --numjobs=${numjobs}"
+    fi
+
+    # Add mixed workload specific parameters
+    if [[ "$metric_type" == "mixed" ]]; then
+        fio_cmd+=" --rwmixread=70"
+    fi
+
+    # Run FIO and capture output
+    # Run in background to allow signal handling
+    $fio_cmd > "$json_output" 2>&1 &
+    local fio_pid=$!
+
+    # Store PID in parent scope for cleanup
+    current_fio_pid=$fio_pid
+
+    # Wait for FIO to complete with interruptible polling
+    # Check interrupt flag every 0.1s - trap will set flag when CTRL+C pressed
+    local fio_exit=0
+    while kill -0 $fio_pid 2>/dev/null && [[ "${benchmark_interrupted:-false}" == "false" ]]; do
+        sleep 0.1
+    done
+    wait $fio_pid 2>/dev/null || fio_exit=$?
+
+    # Clear PID after completion
+    current_fio_pid=""
+
+    stop_spinner
+
+    if [[ $fio_exit -ne 0 ]]; then
+        echo -e "\r$(printf "%-30s " "${label}")${COLOR_RED}✗${COLOR_RESET} Failed"
+
+        # Store failure for summary (arrays are global)
+        test_names+=("${test_name}")
+        test_results+=("Failed")
+        test_values+=("fail")
+        test_numjobs+=("${numjobs}")
+
+        rm -f "$json_output"
+        return 1
+    fi
+
+    # Parse results based on metric type
+    local result_text
+    case "$metric_type" in
+        bandwidth)
+            result_text=$(fio_parse_bandwidth "$json_output" "$rw_mode")
+            ;;
+        iops)
+            result_text=$(fio_parse_iops "$json_output" "$rw_mode")
+            ;;
+        latency)
+            result_text=$(fio_parse_latency "$json_output" "$rw_mode")
+            ;;
+        mixed)
+            result_text=$(fio_parse_mixed "$json_output")
+            ;;
+    esac
+
+    # Display result
+    echo -e "\r$(printf "%-30s " "${label}")${COLOR_GREEN}✓${COLOR_RESET} ${result_text}"
+
+    # Store result for summary (arrays are global)
+    test_names+=("${test_name}")
+    test_results+=("${result_text}")
+    test_values+=("pass")
+    test_numjobs+=("${numjobs}")
+
+    # Cleanup
+    rm -f "$json_output"
+}
+
+# Parse bandwidth from FIO JSON output
+fio_parse_bandwidth() {
+    local json_file="$1"
+    local rw_mode="$2"
+
+    # Validate JSON structure
+    if ! grep -q '"jobs"' "$json_file" 2>/dev/null; then
+        log "ERROR" "Invalid JSON output from FIO - missing 'jobs' section"
+        echo "N/A (Invalid JSON)"
+        return 1
+    fi
+
+    # Extract the read or write section, then find bw_bytes
+    local bw_bytes
+    if [[ "$rw_mode" == "read" ]]; then
+        bw_bytes=$(grep -A 50 '"read" : {' "$json_file" | grep '"bw_bytes"' | head -1 | grep -oP ':\s*\K[0-9]+')
+    else
+        bw_bytes=$(grep -A 50 '"write" : {' "$json_file" | grep '"bw_bytes"' | head -1 | grep -oP ':\s*\K[0-9]+')
+    fi
+
+    if [[ -z "$bw_bytes" ]]; then
+        log "WARNING" "Could not parse bandwidth from JSON output"
+        echo "N/A"
+        return
+    fi
+
+    # Convert bytes/sec to MB/s
+    local bw_mbps
+    bw_mbps=$(awk "BEGIN {printf \"%.2f\", $bw_bytes/1024/1024}")
+
+    # If > 1000 MB/s, show in GB/s
+    if (( $(echo "$bw_mbps > 1000" | bc -l) )); then
+        local bw_gbps
+        bw_gbps=$(awk "BEGIN {printf \"%.2f\", $bw_mbps/1024}")
+        echo "${bw_gbps} GB/s"
+    else
+        echo "${bw_mbps} MB/s"
+    fi
+}
+
+# Parse IOPS from FIO JSON output
+fio_parse_iops() {
+    local json_file="$1"
+    local rw_mode="$2"
+
+    # Validate JSON structure
+    if ! grep -q '"jobs"' "$json_file" 2>/dev/null; then
+        log "ERROR" "Invalid JSON output from FIO - missing 'jobs' section"
+        echo "N/A (Invalid JSON)"
+        return 1
+    fi
+
+    # Extract the read or write section, then find iops (not iops_min/max/mean)
+    local iops
+    if [[ "$rw_mode" == "randread" ]]; then
+        iops=$(grep -A 50 '"read" : {' "$json_file" | grep '"iops"' | head -1 | grep -oP ':\s*\K[0-9.]+')
+    else
+        iops=$(grep -A 50 '"write" : {' "$json_file" | grep '"iops"' | head -1 | grep -oP ':\s*\K[0-9.]+')
+    fi
+
+    if [[ -z "$iops" ]]; then
+        log "WARNING" "Could not parse IOPS from JSON output"
+        echo "N/A"
+        return
+    fi
+
+    # Format with comma separator for thousands
+    local iops_int
+    iops_int=$(printf "%.0f" "$iops")
+    local formatted_iops
+    formatted_iops=$(echo "$iops_int" | sed ':a;s/\B[0-9]\{3\}\>/,&/;ta')
+    echo "${formatted_iops} IOPS"
+}
+
+# Parse latency from FIO JSON output
+fio_parse_latency() {
+    local json_file="$1"
+    local rw_mode="$2"
+
+    # Validate JSON structure
+    if ! grep -q '"jobs"' "$json_file" 2>/dev/null; then
+        log "ERROR" "Invalid JSON output from FIO - missing 'jobs' section"
+        echo "N/A (Invalid JSON)"
+        return 1
+    fi
+
+    # Extract the read or write section, find lat_ns section, then get mean
+    local lat_ns
+    if [[ "$rw_mode" == "randread" ]]; then
+        lat_ns=$(grep -A 100 '"read" : {' "$json_file" | grep -A 10 '"lat_ns"' | grep '"mean"' | head -1 | grep -oP ':\s*\K[0-9.]+')
+    else
+        lat_ns=$(grep -A 100 '"write" : {' "$json_file" | grep -A 10 '"lat_ns"' | grep '"mean"' | head -1 | grep -oP ':\s*\K[0-9.]+')
+    fi
+
+    if [[ -z "$lat_ns" ]]; then
+        log "WARNING" "Could not parse latency from JSON output"
+        echo "N/A"
+        return
+    fi
+
+    # Convert nanoseconds to microseconds or milliseconds
+    local lat_us
+    lat_us=$(awk "BEGIN {printf \"%.2f\", $lat_ns/1000}")
+
+    if (( $(echo "$lat_us > 1000" | bc -l) )); then
+        local lat_ms
+        lat_ms=$(awk "BEGIN {printf \"%.2f\", $lat_us/1000}")
+        echo "${lat_ms} ms"
+    else
+        echo "${lat_us} µs"
+    fi
+}
+
+# Parse mixed workload results from FIO JSON output
+fio_parse_mixed() {
+    local json_file="$1"
+
+    # Validate JSON structure
+    if ! grep -q '"jobs"' "$json_file" 2>/dev/null; then
+        log "ERROR" "Invalid JSON output from FIO - missing 'jobs' section"
+        echo "N/A (Invalid JSON)"
+        return 1
+    fi
+
+    # Extract read and write sections separately
+    local read_iops write_iops
+    read_iops=$(grep -A 50 '"read" : {' "$json_file" | grep '"iops"' | head -1 | grep -oP ':\s*\K[0-9.]+')
+    write_iops=$(grep -A 50 '"write" : {' "$json_file" | grep '"iops"' | head -1 | grep -oP ':\s*\K[0-9.]+')
+
+    if [[ -z "$read_iops" || -z "$write_iops" ]]; then
+        log "WARNING" "Could not parse mixed workload from JSON output"
+        echo "N/A"
+        return
+    fi
+
+    local read_iops_int write_iops_int
+    read_iops_int=$(printf "%.0f" "$read_iops")
+    write_iops_int=$(printf "%.0f" "$write_iops")
+
+    # Format with commas
+    read_iops_int=$(echo "$read_iops_int" | sed ':a;s/\B[0-9]\{3\}\>/,&/;ta')
+    write_iops_int=$(echo "$write_iops_int" | sed ':a;s/\B[0-9]\{3\}\>/,&/;ta')
+
+    echo "R: ${read_iops_int} / W: ${write_iops_int} IOPS"
+}
+
+# Perform health check on a storage
+run_health_check() {
+    local storage_name="$1"
+    local warnings=0
+    local errors=0
+    local checks_passed=0
+    local checks_total=0
+    local checks_skipped=0
+
+    # Helper function for check output
+    check_result() {
+        local name="$1"
+        local status="$2"
+        local message="$3"
+
+        printf "%-30s " "${name}:"
+        case "$status" in
+            OK)
+                echo -e "${COLOR_GREEN}✓${COLOR_RESET} $message"
+                ((checks_passed++))
+                ((checks_total++))
+                ;;
+            WARNING)
+                echo -e "${COLOR_YELLOW}⚠${COLOR_RESET} $message"
+                ((warnings++))
+                ((checks_total++))
+                ;;
+            CRITICAL)
+                echo -e "${COLOR_RED}✗${COLOR_RESET} $message"
+                ((errors++))
+                ((checks_total++))
+                ;;
+            SKIP)
+                echo -e "${COLOR_CYAN}-${COLOR_RESET} $message"
+                ((checks_skipped++))
+                ;;
+        esac
+    }
+
+    # Check 1: Plugin file installed
+    if [[ -f "$PLUGIN_FILE" ]]; then
+        local version
+        version=$(grep 'our $VERSION' "$PLUGIN_FILE" 2>/dev/null | grep -oP "[0-9.]+" || echo "unknown")
+        check_result "Plugin file" "OK" "Installed v$version"
+    else
+        check_result "Plugin file" "CRITICAL" "Not installed"
+    fi
+
+    # Check 2: Storage configured
+    if grep -q "^truenasplugin: ${storage_name}$" "$STORAGE_CFG" 2>/dev/null; then
+        check_result "Storage configuration" "OK" "Configured"
+    else
+        check_result "Storage configuration" "CRITICAL" "Not configured"
+        echo
+        error "Storage '$storage_name' not found in configuration"
+        return 2
+    fi
+
+    # Check 3: Storage status
+    printf "%-30s " "Storage status:"
+    start_spinner
+    local space_result
+    if pvesm status 2>/dev/null | grep -q "$storage_name.*active"; then
+        local total_kb used_kb percent
+        read -r total_kb used_kb percent < <(pvesm status 2>/dev/null | grep "$storage_name" | awk '{print $4, $5, $7}')
+        # Sanitize values (remove any whitespace/newlines)
+        total_kb=$(echo "$total_kb" | tr -d '\n ')
+        used_kb=$(echo "$used_kb" | tr -d '\n ')
+        percent=$(echo "$percent" | tr -d '\n ')
+        # Convert KB to GB
+        local used_gb=$(awk "BEGIN {printf \"%.2f\", $used_kb/1024/1024}")
+        local total_gb=$(awk "BEGIN {printf \"%.2f\", $total_kb/1024/1024}")
+        space_result="${COLOR_GREEN}✓${COLOR_RESET} Active (${used_gb}GB / ${total_gb}GB used, ${percent})"
+        ((checks_passed++))
+    else
+        space_result="${COLOR_YELLOW}⚠${COLOR_RESET} Inactive or not accessible"
+        ((warnings++))
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Storage status:")${space_result}"
+    ((checks_total++))
+
+    # Check 4: Content type
+    local content
+    content=$(get_storage_config_value "$storage_name" "content")
+    if [[ "$content" == "images" ]]; then
+        check_result "Content type" "OK" "images"
+    elif [[ -n "$content" ]]; then
+        check_result "Content type" "WARNING" "$content (should be 'images')"
+    else
+        check_result "Content type" "WARNING" "Not configured"
+    fi
+
+    # Check 5: TrueNAS API reachability
+    local api_host
+    api_host=$(get_storage_config_value "$storage_name" "api_host")
+    local api_port
+    api_port=$(get_storage_config_value "$storage_name" "api_port")
+    api_port=${api_port:-443}
+
+    if [[ -n "$api_host" ]]; then
+        printf "%-30s " "TrueNAS API:"
+        start_spinner
+        local api_result
+        if timeout 5 bash -c ">/dev/tcp/$api_host/$api_port" 2>/dev/null; then
+            api_result="${COLOR_GREEN}✓${COLOR_RESET} Reachable on $api_host:$api_port"
+            ((checks_passed++))
+        else
+            api_result="${COLOR_RED}✗${COLOR_RESET} Cannot reach $api_host:$api_port"
+            ((errors++))
+        fi
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "TrueNAS API:")${api_result}"
+        ((checks_total++))
+    else
+        check_result "TrueNAS API" "CRITICAL" "API host not configured"
+    fi
+
+    # Check 6: Dataset configuration
+    local dataset
+    dataset=$(get_storage_config_value "$storage_name" "dataset")
+    if [[ -n "$dataset" ]]; then
+        check_result "Dataset" "OK" "$dataset"
+    else
+        check_result "Dataset" "CRITICAL" "Not configured"
+    fi
+
+    # Check 6.5: Dataset type validation (must be FILESYSTEM, not VOLUME)
+    local api_key
+    api_key=$(get_storage_config_value "$storage_name" "api_key")
+    local api_insecure
+    api_insecure=$(get_storage_config_value "$storage_name" "api_insecure")
+
+    if [[ -n "$dataset" ]] && [[ -n "$api_host" ]] && [[ -n "$api_key" ]]; then
+        printf "%-30s " "Dataset type:"
+        start_spinner
+
+        local curl_opts="-s"
+        [[ "$api_insecure" == "1" ]] && curl_opts="$curl_opts -k"
+
+        # Make API call to fetch all datasets
+        local dataset_info
+        dataset_info=$(curl $curl_opts -H "Authorization: Bearer $api_key" \
+            "https://$api_host/api/v2.0/pool/dataset" 2>/dev/null)
+        local api_status=$?
+
+        stop_spinner
+
+        if [[ $api_status -ne 0 ]] || [[ -z "$dataset_info" ]]; then
+            # API call failed - warn but don't fail critically
+            local dataset_result="${COLOR_YELLOW}⚠${COLOR_RESET} Cannot validate (API error)"
+            echo -e "\r$(printf "%-30s " "Dataset type:")${dataset_result}"
+            ((warnings++))
+            ((checks_total++))
+        else
+            # Parse JSON to find our dataset and extract its type
+            # We need to find the entry with matching "id" and get its "type" field
+            local ds_type
+            ds_type=$(echo "$dataset_info" | grep -B2 -A10 "\"id\": *\"$dataset\"" | \
+                grep '"type"' | head -1 | sed -E 's/.*"type": *"([^"]+)".*/\1/')
+
+            local dataset_result
+            if [[ "$ds_type" == "FILESYSTEM" ]]; then
+                dataset_result="${COLOR_GREEN}✓${COLOR_RESET} FILESYSTEM (correct)"
+                ((checks_passed++))
+            elif [[ "$ds_type" == "VOLUME" ]]; then
+                dataset_result="${COLOR_RED}✗${COLOR_RESET} VOLUME (must be FILESYSTEM - zvols cannot have child zvols)"
+                ((errors++))
+            elif [[ -n "$ds_type" ]]; then
+                dataset_result="${COLOR_YELLOW}⚠${COLOR_RESET} Unknown type: $ds_type"
+                ((warnings++))
+            else
+                dataset_result="${COLOR_RED}✗${COLOR_RESET} Dataset not found on TrueNAS"
+                ((errors++))
+            fi
+
+            echo -e "\r$(printf "%-30s " "Dataset type:")${dataset_result}"
+            ((checks_total++))
+        fi
+    else
+        check_result "Dataset type" "SKIP" "Missing dataset or API config"
+    fi
+
+    # Detect transport mode
+    local transport_mode
+    transport_mode=$(get_storage_config_value "$storage_name" "transport_mode")
+    transport_mode=${transport_mode:-iscsi}  # Default to iscsi if not specified
+
+    # Check 7: Transport-specific target/subsystem configuration
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        # Check for nvme-cli
+        if check_nvme_cli; then
+            check_result "nvme-cli" "OK" "Installed"
+        else
+            check_result "nvme-cli" "CRITICAL" "Not installed (required for NVMe/TCP)"
+        fi
+
+        # Check subsystem NQN
+        local subsystem_nqn
+        subsystem_nqn=$(get_storage_config_value "$storage_name" "subsystem_nqn")
+        if [[ -n "$subsystem_nqn" ]]; then
+            check_result "Subsystem NQN" "OK" "$subsystem_nqn"
+        else
+            check_result "Subsystem NQN" "CRITICAL" "Not configured"
+        fi
+
+        # Check host NQN
+        local hostnqn
+        hostnqn=$(get_storage_config_value "$storage_name" "hostnqn")
+        if [[ -n "$hostnqn" ]]; then
+            check_result "Host NQN" "OK" "$hostnqn"
+        elif [[ -f /etc/nvme/hostnqn ]]; then
+            local system_hostnqn
+            system_hostnqn=$(cat /etc/nvme/hostnqn 2>/dev/null | tr -d '\n')
+            check_result "Host NQN" "OK" "Using system: $system_hostnqn"
+        else
+            check_result "Host NQN" "WARNING" "Not configured (will use system default)"
+        fi
+    else
+        # iSCSI mode - check target IQN
+        local target_iqn
+        target_iqn=$(get_storage_config_value "$storage_name" "target_iqn")
+        if [[ -n "$target_iqn" ]]; then
+            check_result "Target IQN" "OK" "$target_iqn"
+        else
+            check_result "Target IQN" "CRITICAL" "Not configured"
+        fi
+    fi
+
+    # Check 8: Discovery portal
+    local discovery_portal
+    discovery_portal=$(get_storage_config_value "$storage_name" "discovery_portal")
+    if [[ -n "$discovery_portal" ]]; then
+        check_result "Discovery portal" "OK" "$discovery_portal"
+    else
+        check_result "Discovery portal" "CRITICAL" "Not configured"
+    fi
+
+    # Check 9: Sessions/Connections (transport-specific)
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        if [[ -n "$subsystem_nqn" ]]; then
+            printf "%-30s " "NVMe connections:"
+            start_spinner
+            local nvme_result
+            if check_nvme_cli && nvme list-subsys 2>/dev/null | grep -q "$subsystem_nqn"; then
+                local path_count live_count
+                path_count=$(nvme list-subsys 2>/dev/null | grep -A50 "$subsystem_nqn" | grep -c " tcp " || echo "0")
+                live_count=$(nvme list-subsys 2>/dev/null | grep -A50 "$subsystem_nqn" | grep -c " live$" || echo "0")
+                # Sanitize values (remove any whitespace/newlines)
+                path_count=$(echo "$path_count" | head -1 | tr -d '\n ')
+                live_count=$(echo "$live_count" | head -1 | tr -d '\n ')
+                nvme_result="${COLOR_GREEN}✓${COLOR_RESET} Connected (${path_count} path(s), ${live_count} live)"
+                ((checks_passed++))
+            else
+                nvme_result="${COLOR_YELLOW}⚠${COLOR_RESET} Not connected"
+                ((warnings++))
+            fi
+            stop_spinner
+            echo -e "\r\033[K$(printf "%-30s " "NVMe connections:")${nvme_result}"
+            ((checks_total++))
+        else
+            check_result "NVMe connections" "SKIP" "Cannot check (no subsystem NQN)"
+        fi
+    else
+        # iSCSI sessions check
+        if [[ -n "$target_iqn" ]]; then
+            printf "%-30s " "iSCSI sessions:"
+            start_spinner
+            local session_count
+            session_count=$(iscsiadm -m session 2>/dev/null | grep -c "$target_iqn" || echo "0")
+            session_count=$(echo "$session_count" | head -1 | tr -d '\n ')
+
+            # Check node.startup configuration for all portals
+            local auto_startup_count=0
+            local total_nodes=0
+            if command -v iscsiadm &> /dev/null; then
+                while IFS= read -r line; do
+                    # Format is: portal,tpgt iqn
+                    local portal
+                    portal=$(echo "$line" | awk '{print $1}')
+                    local iqn
+                    iqn=$(echo "$line" | awk '{print $2}')
+                    if [[ "$iqn" == "$target_iqn" ]] && [[ -n "$portal" ]]; then
+                        ((total_nodes++))
+                        local startup_val
+                        startup_val=$(iscsiadm -m node --targetname "$target_iqn" -p "$portal" -o show 2>/dev/null | grep "^node.startup" | awk '{print $NF}' | head -1)
+                        if [[ "$startup_val" == "automatic" ]]; then
+                            ((auto_startup_count++))
+                        fi
+                    fi
+                done < <(iscsiadm -m node 2>/dev/null | grep "$target_iqn")
+            fi
+
+            local iscsi_result
+            if [[ "$session_count" -gt 0 ]]; then
+                iscsi_result="${COLOR_GREEN}✓${COLOR_RESET} $session_count active session(s)"
+                ((checks_passed++))
+            elif [[ "$auto_startup_count" -gt 0 ]]; then
+                # No active sessions but auto-startup is configured - this is OK
+                iscsi_result="${COLOR_GREEN}✓${COLOR_RESET} Configured (auto-reconnect: ${auto_startup_count}/${total_nodes} portals)"
+                ((checks_passed++))
+            elif [[ "$total_nodes" -gt 0 ]]; then
+                # Nodes exist but no auto-startup configured
+                iscsi_result="${COLOR_YELLOW}⚠${COLOR_RESET} Not configured for auto-startup"
+                ((warnings++))
+            else
+                # No nodes configured at all
+                iscsi_result="${COLOR_YELLOW}⚠${COLOR_RESET} No sessions or nodes configured"
+                ((warnings++))
+            fi
+            stop_spinner
+            echo -e "\r$(printf "%-30s " "iSCSI sessions:")${iscsi_result}"
+            ((checks_total++))
+        else
+            check_result "iSCSI sessions" "SKIP" "Cannot check (no target IQN)"
+        fi
+    fi
+
+    # Check 10: Multipath configuration (transport-specific)
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        # Check native NVMe multipath
+        local portals
+        portals=$(get_storage_config_value "$storage_name" "portals")
+        if [[ -n "$portals" ]]; then
+            if [[ -f /sys/module/nvme_core/parameters/multipath ]]; then
+                local nvme_mp
+                nvme_mp=$(cat /sys/module/nvme_core/parameters/multipath 2>/dev/null)
+                if [[ "$nvme_mp" == "Y" ]]; then
+                    check_result "Native multipath" "OK" "Enabled (kernel)"
+                else
+                    check_result "Native multipath" "WARNING" "Disabled in kernel"
+                fi
+            else
+                check_result "Native multipath" "WARNING" "Cannot detect (nvme_core not loaded)"
+            fi
+        else
+            check_result "Native multipath" "SKIP" "No additional portals configured"
+        fi
+    else
+        # iSCSI multipath check
+        local use_multipath
+        use_multipath=$(get_storage_config_value "$storage_name" "use_multipath")
+        if [[ "$use_multipath" == "1" ]]; then
+            if command -v multipath &> /dev/null; then
+                local mpath_count
+                mpath_count=$(multipath -ll 2>/dev/null | grep -c "dm-" 2>/dev/null || echo "0")
+                mpath_count=$(echo "$mpath_count" | head -1 | tr -d '\n ')
+                if [[ "$mpath_count" -gt 0 ]]; then
+                    check_result "Multipath" "OK" "$mpath_count device(s)"
+                else
+                    check_result "Multipath" "WARNING" "Enabled but no devices"
+                fi
+            else
+                check_result "Multipath" "WARNING" "Enabled but multipath-tools not installed"
+            fi
+        else
+            check_result "Multipath" "SKIP" "Not enabled"
+        fi
+    fi
+
+    # Check 11: Orphaned resources (iSCSI only)
+    if [[ "$transport_mode" == "iscsi" ]]; then
+        local api_host
+        api_host=$(get_storage_config_value "$storage_name" "api_host")
+        local api_key
+        api_key=$(get_storage_config_value "$storage_name" "api_key")
+        local api_insecure
+        api_insecure=$(get_storage_config_value "$storage_name" "api_insecure")
+
+        if [[ -n "$api_host" ]] && [[ -n "$api_key" ]] && [[ -n "$dataset" ]]; then
+            printf "%-30s " "Orphaned resources:"
+            start_spinner
+            local orphan_result
+            local orphan_count
+            orphan_count=$(detect_orphaned_resources "$storage_name" "$transport_mode" "$api_host" "$api_key" "$dataset" "$api_insecure" 2>/dev/null)
+
+            if [[ $? -eq 0 ]] && [[ -n "$orphan_count" ]]; then
+                if [[ "$orphan_count" -eq 0 ]]; then
+                    orphan_result="${COLOR_GREEN}✓${COLOR_RESET} None found"
+                    ((checks_passed++))
+                else
+                    orphan_result="${COLOR_YELLOW}⚠${COLOR_RESET} Found $orphan_count orphan(s) (use Diagnostics > Cleanup orphans)"
+                    ((warnings++))
+                fi
+            else
+                orphan_result="${COLOR_YELLOW}⚠${COLOR_RESET} Check skipped (API error)"
+                ((warnings++))
+            fi
+            stop_spinner
+            echo -e "\r$(printf "%-30s " "Orphaned resources:")${orphan_result}"
+            ((checks_total++))
+        else
+            check_result "Orphaned resources" "SKIP" "Cannot check (missing API config)"
+        fi
+    else
+        # NVMe/TCP mode - skip orphan check (not yet supported)
+        check_result "Orphaned resources" "SKIP" "Not available for NVMe/TCP"
+    fi
+
+    # Check 12: PVE daemon status
+    if systemctl is-active --quiet pvedaemon; then
+        check_result "PVE daemon" "OK" "Running"
+    else
+        check_result "PVE daemon" "CRITICAL" "Not running"
+    fi
+
+    # Check 13: Weight volume presence (iSCSI only)
+    if [[ "$transport_mode" == "iscsi" ]]; then
+        local weight_zvol="${dataset}/pve-plugin-weight"
+        local weight_encoded=$(echo "$weight_zvol" | sed 's/\//%2F/g')
+        local weight_check_failed=0
+
+        # Check if weight zvol exists via API
+        local zvol_response=$(curl -sk -H "Authorization: Bearer $api_key" \
+            "https://$api_host/api/v2.0/pool/dataset/id/$weight_encoded" 2>/dev/null)
+
+        if ! echo "$zvol_response" | grep -q '"id"'; then
+            check_result "Weight volume presence" "WARNING" "Weight zvol missing"
+            weight_check_failed=1
+        fi
+
+        # Check if weight extent exists (only if zvol exists)
+        if [[ $weight_check_failed -eq 0 ]]; then
+            local extent_response=$(curl -sk -H "Authorization: Bearer $api_key" \
+                "https://$api_host/api/v2.0/iscsi/extent" 2>/dev/null)
+
+            if ! echo "$extent_response" | grep -q '"name": "pve-plugin-weight"'; then
+                check_result "Weight volume presence" "WARNING" "Weight extent missing"
+                weight_check_failed=1
+            fi
+        fi
+
+        # If both exist, report OK
+        if [[ $weight_check_failed -eq 0 ]]; then
+            check_result "Weight volume presence" "OK" "Present and configured"
+        fi
+    else
+        # NVMe/TCP mode - skip weight check (not applicable)
+        check_result "Weight volume presence" "SKIP" "Not applicable for NVMe/TCP"
+    fi
+
+    # Summary
+    echo
+    info "Health Summary:"
+    if [[ $checks_skipped -gt 0 ]]; then
+        echo "  Checks passed: $checks_passed/$checks_total ($checks_skipped not applicable)"
+    else
+        echo "  Checks passed: $checks_passed/$checks_total"
+    fi
+
+    if [[ $errors -gt 0 ]]; then
+        error "Status: CRITICAL ($errors error(s), $warnings warning(s))"
+        return 2
+    elif [[ $warnings -gt 0 ]]; then
+        warning "Status: WARNING ($warnings warning(s))"
+        return 1
+    else
+        success "Status: HEALTHY"
+        return 0
+    fi
+}
+
+# Menu: Install specific version
+menu_install_specific_version() {
+    clear_screen
+    print_banner
+    echo
+
+    info "Fetching releases from GitHub..."
+    local releases
+    releases=$(get_all_releases) || {
+        error "Failed to fetch releases"
+        read -rp "Press Enter to continue..."
+        return 1
+    }
+
+    # Parse versions and prerelease status into arrays
+    local -a version_array=()
+    local -a prerelease_array=()
+
+    # Split releases JSON into individual release objects
+    # Accumulate lines between release objects and process complete blocks
+    local release_count=0
+    local current_block=""
+    local tag_name=""
+    local is_prerelease=""
+    local version=""
+
+    while IFS= read -r line; do
+        # Start of a new release object (when we see "url" field at object start)
+        # Use [[ =~ ]] instead of grep -q to avoid set -e issues
+        if [[ "$line" =~ ^[[:space:]]*\"url\":[[:space:]]*\"https://api.github.com ]]; then
+            # Process previous block if it exists
+            if [[ -n "$current_block" ]] && [[ $release_count -lt 20 ]]; then
+                tag_name=$(echo "$current_block" | grep -Po '"tag_name":[[:space:]]*"\K[^"]+' 2>/dev/null || echo "")
+                is_prerelease=$(echo "$current_block" | grep -Po '"prerelease":[[:space:]]*\K(true|false)' 2>/dev/null || echo "false")
+
+                if [[ -n "$tag_name" ]]; then
+                    version="${tag_name#v}"
+                    version_array+=("$version")
+                    prerelease_array+=("$is_prerelease")
+                    release_count=$((release_count + 1))
+                fi
+            fi
+            # Start new block
+            current_block="$line"
+        elif [[ -n "$current_block" ]]; then
+            # Continue accumulating current block
+            current_block+=$'\n'"$line"
+            # Process block when we see "published_at" (end of metadata we need)
+            if [[ "$line" =~ \"published_at\" ]]; then
+                if [[ $release_count -lt 20 ]]; then
+                    tag_name=$(echo "$current_block" | grep -Po '"tag_name":[[:space:]]*"\K[^"]+' 2>/dev/null || echo "")
+                    is_prerelease=$(echo "$current_block" | grep -Po '"prerelease":[[:space:]]*\K(true|false)' 2>/dev/null || echo "false")
+
+                    if [[ -n "$tag_name" ]]; then
+                        version="${tag_name#v}"
+                        version_array+=("$version")
+                        prerelease_array+=("$is_prerelease")
+                        release_count=$((release_count + 1))
+                    fi
+                fi
+                current_block=""
+            fi
+        fi
+    done <<< "$releases"
+
+    if [[ ${#version_array[@]} -eq 0 ]]; then
+        error "No versions found"
+        read -rp "Press Enter to continue..."
+        return 1
+    fi
+
+    # Build menu items with version info and pre-release indicators
+    local -a menu_items=()
+    local menu_version=""
+    local menu_is_prerelease=""
+    local menu_indicator=""
+
+    for i in "${!version_array[@]}"; do
+        menu_version="${version_array[$i]}"
+        menu_is_prerelease="${prerelease_array[$i]}"
+        menu_indicator=""
+
+        if [[ "$menu_is_prerelease" == "true" ]]; then
+            menu_indicator=" ${c3}(Pre-Release)${c0}"
+        fi
+
+        menu_items+=("v${menu_version}${menu_indicator}")
+    done
+
+    show_menu "Select version to install" "${menu_items[@]}"
+
+    local choice
+    choice=$(read_choice "${#version_array[@]}")
+
+    if [[ "$choice" -eq 0 ]]; then
+        return 0
+    fi
+
+    # Get selected version (adjust for 1-indexed menu)
+    local selected_version="${version_array[$((choice-1))]}"
+
+    # Check if this is a cluster node and prompt for installation scope
+    local install_cluster_wide=false
+    if is_cluster_node && [[ "$NON_INTERACTIVE" != "true" ]]; then
+        echo
+        info "Cluster detected"
+        echo "  1) Install on local node only"
+        echo "  2) Install on all cluster nodes"
+        echo
+        local scope_choice
+        while true; do
+            read -rp "Enter choice [1-2]: " scope_choice
+            if [[ "$scope_choice" == "1" ]]; then
+                install_cluster_wide=false
+                break
+            elif [[ "$scope_choice" == "2" ]]; then
+                install_cluster_wide=true
+                break
+            else
+                error "Invalid choice. Please enter 1 or 2"
+            fi
+        done
+    fi
+
+    # Perform installation based on scope
+    local install_success=false
+    if [[ "$install_cluster_wide" == "true" ]]; then
+        if perform_cluster_wide_installation "$selected_version"; then
+            install_success=true
+        fi
+    else
+        if perform_installation "$selected_version"; then
+            install_success=true
+        fi
+    fi
+
+    # Post-installation actions
+    if [[ "$install_success" == "true" ]]; then
+        # Only prompt to configure storage for local installations
+        # (cluster-wide shows next steps automatically)
+        if [[ "$install_cluster_wide" == "false" ]] && [[ "$NON_INTERACTIVE" != "true" ]]; then
+            echo
+            read -rp "Would you like to configure storage now? (y/N): " response
+            if [[ "$response" =~ ^[Yy] ]]; then
+                menu_configure_storage
+            else
+                info "You can configure storage later from the main menu"
+            fi
+        fi
+        read -rp "Press Enter to continue..."
+        return 0  # Return success
+    else
+        read -rp "Press Enter to continue..."
+        return 1  # Return failure
+    fi
+}
+
+# ============================================================================
+# CONFIGURATION WIZARD
+# ============================================================================
+
+# List all TrueNAS plugin storage names
+list_truenas_storages() {
+    if [[ ! -f "$STORAGE_CFG" ]]; then
+        return 1
+    fi
+
+    grep "^truenasplugin:" "$STORAGE_CFG" 2>/dev/null | awk '{print $2}'
+}
+
+# Get all configuration values for a storage
+# Returns associative array-like output: "key=value" per line
+get_all_storage_config_values() {
+    local storage_name="$1"
+
+    if [[ ! -f "$STORAGE_CFG" ]]; then
+        return 1
+    fi
+
+    # Extract the entire configuration block for this storage
+    awk "/^truenasplugin: ${storage_name}\$/{flag=1; next} /^[a-z].*:/{flag=0} flag" "$STORAGE_CFG" | \
+    grep -v "^\s*$" | \
+    sed 's/^\s*//' | \
+    awk '{print $1 "=" $2}'
+}
+
+# Validate IP address format
+validate_ip() {
+    local ip="$1"
+    if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        local IFS='.'
+        local -a octets=($ip)
+        for octet in "${octets[@]}"; do
+            if ((octet > 255)); then
+                return 1
+            fi
+        done
+        return 0
+    fi
+    return 1
+}
+
+# Validate storage name format
+validate_storage_name() {
+    local name="$1"
+    # Storage name should be alphanumeric with hyphens/underscores, no spaces
+    if [[ $name =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Check if storage name already exists
+storage_name_exists() {
+    local name="$1"
+    if [[ -f "$STORAGE_CFG" ]]; then
+        grep -q "^truenasplugin: ${name}$" "$STORAGE_CFG"
+    else
+        return 1
+    fi
+}
+
+# Validate NQN format (must start with nqn.YYYY-MM.)
+validate_nqn() {
+    local nqn="$1"
+    if [[ $nqn =~ ^nqn\.[0-9]{4}-[0-9]{2}\. ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Check if nvme-cli is installed
+check_nvme_cli() {
+    if command -v nvme &> /dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+# Get or generate host NQN
+get_hostnqn() {
+    local hostnqn=""
+
+    # Check if hostnqn file exists
+    if [[ -f /etc/nvme/hostnqn ]]; then
+        hostnqn=$(cat /etc/nvme/hostnqn 2>/dev/null | tr -d '\n')
+        if [[ -n "$hostnqn" ]]; then
+            info "Found existing host NQN: $hostnqn" >&2
+            read -rp "Use this host NQN? (Y/n): " use_existing
+            if [[ ! "$use_existing" =~ ^[Nn] ]]; then
+                echo "$hostnqn"
+                return 0
+            fi
+        fi
+    fi
+
+    # Generate new hostnqn
+    warning "No host NQN found or user declined existing one"
+    read -rp "Generate new host NQN? (Y/n): " gen_new
+    if [[ ! "$gen_new" =~ ^[Nn] ]]; then
+        if check_nvme_cli; then
+            mkdir -p /etc/nvme
+            if nvme gen-hostnqn > /etc/nvme/hostnqn 2>/dev/null; then
+                hostnqn=$(cat /etc/nvme/hostnqn 2>/dev/null | tr -d '\n')
+                if [[ -z "$hostnqn" ]]; then
+                    error "Generated hostnqn file is empty"
+                    return 1
+                fi
+                success "Generated new host NQN: $hostnqn"
+                echo "$hostnqn"
+                return 0
+            else
+                error "Failed to generate host NQN"
+                return 1
+            fi
+        else
+            error "nvme-cli not available to generate host NQN"
+            return 1
+        fi
+    fi
+
+    # Manual entry with validation
+    while true; do
+        read -rp "Enter host NQN manually (or press Enter to skip): " hostnqn
+        if [[ -z "$hostnqn" ]]; then
+            warning "No host NQN configured"
+            return 1
+        fi
+        if ! validate_nqn "$hostnqn"; then
+            error "Invalid NQN format. Must start with nqn.YYYY-MM."
+            continue
+        fi
+        break
+    done
+    echo "$hostnqn"
+    return 0
+}
+
+# Check NVMe native multipath status
+check_nvme_multipath() {
+    if [[ -f /sys/module/nvme_core/parameters/multipath ]]; then
+        local nvme_mp
+        nvme_mp=$(cat /sys/module/nvme_core/parameters/multipath 2>/dev/null)
+        if [[ "$nvme_mp" == "Y" ]]; then
+            info "Native NVMe multipath: ENABLED"
+            return 0
+        else
+            warning "Native NVMe multipath: DISABLED (may reduce redundancy)"
+            info "To enable: echo 'options nvme_core multipath=Y' > /etc/modprobe.d/nvme.conf"
+            info "Then reboot or reload nvme_core module"
+            return 1
+        fi
+    else
+        warning "Cannot detect NVMe multipath status (nvme_core module not loaded)"
+        return 1
+    fi
+}
+
+# Test TrueNAS API connectivity
+test_truenas_api() {
+    local ip="$1"
+    local apikey="$2"
+
+    local url="https://${ip}/api/v2.0/system/info"
+    local tool
+    tool=$(get_download_tool)
+
+    printf "  Testing connection to TrueNAS at %s..." "$ip"
+    start_spinner
+
+    local response
+    case "$tool" in
+        curl)
+            response=$(curl -sk -H "Authorization: Bearer $apikey" "$url" 2>/dev/null)
+            ;;
+        wget)
+            response=$(wget --no-check-certificate --quiet -O - --header="Authorization: Bearer $apikey" "$url" 2>/dev/null)
+            ;;
+        *)
+            stop_spinner
+            echo ""
+            return 1
+            ;;
+    esac
+
+    stop_spinner
+    echo ""
+    if [[ -n "$response" ]] && echo "$response" | grep -q '"version"'; then
+        local version
+        version=$(echo "$response" | grep -Po '"version":\s*"\K[^"]+' 2>/dev/null)
+        success "Connected to TrueNAS successfully (version: $version)"
+        return 0
+    else
+        error "Failed to connect to TrueNAS API"
+        return 1
+    fi
+}
+
+# Verify dataset exists
+verify_dataset() {
+    local ip="$1"
+    local apikey="$2"
+    local dataset="$3"
+
+    local url="https://${ip}/api/v2.0/pool/dataset?id=${dataset}"
+    local tool
+    tool=$(get_download_tool)
+
+    printf "  Verifying dataset '%s'..." "$dataset"
+    start_spinner
+
+    local response
+    local http_code
+    case "$tool" in
+        curl)
+            response=$(curl -sk -w "\n%{http_code}" -H "Authorization: Bearer $apikey" "$url" 2>/dev/null)
+            http_code=$(echo "$response" | tail -n1)
+            response=$(echo "$response" | head -n-1)
+            ;;
+        wget)
+            response=$(wget --no-check-certificate --quiet -O - --header="Authorization: Bearer $apikey" "$url" 2>/dev/null)
+            http_code="200"
+            ;;
+        *)
+            stop_spinner
+            echo ""
+            return 1
+            ;;
+    esac
+
+    stop_spinner
+    echo ""
+
+    if [[ "$http_code" != "200" ]]; then
+        warning "Dataset '$dataset' not found or not accessible"
+        return 1
+    fi
+
+    if [[ -n "$response" ]] && echo "$response" | grep -q "\"id\": \"${dataset}\""; then
+        success "Dataset '$dataset' verified"
+        return 0
+    else
+        warning "Dataset '$dataset' not found or not accessible"
+        return 1
+    fi
+}
+
+# Discover available TrueNAS portals from network interfaces
+discover_truenas_portals() {
+    local ip="$1"
+    local apikey="$2"
+    local primary_ip="$3"
+
+    local url="https://${ip}/api/v2.0/interface"
+    local tool
+    tool=$(get_download_tool)
+
+    local response
+    case "$tool" in
+        curl)
+            response=$(curl -sk -H "Authorization: Bearer $apikey" "$url" 2>/dev/null)
+            ;;
+        wget)
+            response=$(wget --no-check-certificate --quiet -O - --header="Authorization: Bearer $apikey" "$url" 2>/dev/null)
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    if [[ -z "$response" ]]; then
+        return 1
+    fi
+
+    # Extract IP addresses from interfaces, excluding the primary IP
+    # Parse JSON to find all "address" fields with IPv4 addresses
+    local portals
+    portals=$(echo "$response" | grep -Po '"address":\s*"\K[0-9.]+' | grep -v "^127\." | grep -v "^${primary_ip}$" | sort -u)
+
+    if [[ -z "$portals" ]]; then
+        return 1
+    fi
+
+    echo "$portals"
+    return 0
+}
+
+# Backup storage.cfg
+backup_storage_cfg() {
+    if [[ ! -f "$STORAGE_CFG" ]]; then
+        log "INFO" "No storage.cfg to backup"
+        return 0
+    fi
+
+    mkdir -p "$BACKUP_DIR"
+
+    local timestamp
+    timestamp=$(date '+%Y%m%d_%H%M%S')
+    local backup_file="${BACKUP_DIR}/storage.cfg.backup.${timestamp}"
+
+    cp "$STORAGE_CFG" "$backup_file" || {
+        error "Failed to create storage.cfg backup"
+        return 1
+    }
+
+    success "Storage config backed up: $backup_file"
+    log "INFO" "Storage config backed up: $backup_file"
+    return 0
+}
+
+# Generate storage configuration block
+generate_storage_config() {
+    local name="$1"
+    local ip="$2"
+    local apikey="$3"
+    local dataset="$4"
+    local target_or_nqn="$5"  # target_iqn for iSCSI, subsystem_nqn for NVMe
+    local portal="${6:-}"
+    local blocksize="${7:-16K}"
+    local sparse="${8:-1}"
+    local use_multipath="${9:-}"
+    local portals="${10:-}"
+    local transport_mode="${11:-iscsi}"  # Default to iscsi for backward compatibility
+    local hostnqn="${12:-}"
+
+    cat <<EOF
+truenasplugin: ${name}
+	api_host ${ip}
+	api_key ${apikey}
+	dataset ${dataset}
+EOF
+
+    # Add transport mode if not default iSCSI
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        echo "	transport_mode nvme-tcp"
+        echo "	subsystem_nqn ${target_or_nqn}"
+    else
+        echo "	target_iqn ${target_or_nqn}"
+    fi
+
+    echo "	api_insecure 1"
+    echo "	shared 1"
+
+    if [[ -n "$portal" ]]; then
+        echo "	discovery_portal ${portal}"
+    fi
+
+    if [[ -n "$blocksize" ]]; then
+        echo "	zvol_blocksize ${blocksize}"
+    fi
+
+    if [[ -n "$sparse" ]]; then
+        echo "	tn_sparse ${sparse}"
+    fi
+
+    # Only add use_multipath for iSCSI (NVMe uses native multipath)
+    if [[ -n "$use_multipath" ]] && [[ "$transport_mode" == "iscsi" ]]; then
+        echo "	use_multipath ${use_multipath}"
+    fi
+
+    if [[ -n "$portals" ]]; then
+        echo "	portals ${portals}"
+    fi
+
+    # Add hostnqn for NVMe if provided
+    if [[ -n "$hostnqn" ]] && [[ "$transport_mode" == "nvme-tcp" ]]; then
+        echo "	hostnqn ${hostnqn}"
+    fi
+
+    # Always add content type
+    echo "	content images"
+}
+
+# Add storage configuration to storage.cfg
+add_storage_config() {
+    local config="$1"
+
+    # Backup first
+    backup_storage_cfg || {
+        error "Failed to backup storage.cfg"
+        return 1
+    }
+
+    # Append configuration
+    echo "" >> "$STORAGE_CFG"
+    echo "$config" >> "$STORAGE_CFG"
+
+    success "Storage configuration added to $STORAGE_CFG"
+    log "INFO" "Storage configuration added"
+    return 0
+}
+
+# Update existing storage configuration in storage.cfg
+update_storage_config() {
+    local storage_name="$1"
+    local new_config="$2"
+
+    if [[ ! -f "$STORAGE_CFG" ]]; then
+        error "Storage configuration file not found: $STORAGE_CFG"
+        return 1
+    fi
+
+    # Backup first
+    backup_storage_cfg || {
+        error "Failed to backup storage.cfg"
+        return 1
+    }
+
+    # Create temporary file
+    local temp_file="${STORAGE_CFG}.tmp.$$"
+
+    # Remove old storage block and write everything except that storage
+    awk -v storage="truenasplugin: ${storage_name}" '
+        $0 ~ "^" storage "$" { skip=1; next }
+        /^[a-z].*:/ { skip=0 }
+        !skip { print }
+    ' "$STORAGE_CFG" > "$temp_file"
+
+    # Append new configuration
+    echo "" >> "$temp_file"
+    echo "$new_config" >> "$temp_file"
+
+    # Replace original file
+    if mv "$temp_file" "$STORAGE_CFG"; then
+        success "Storage configuration updated in $STORAGE_CFG"
+        log "INFO" "Storage '$storage_name' configuration updated"
+        return 0
+    else
+        error "Failed to update storage configuration"
+        rm -f "$temp_file"
+        return 1
+    fi
+}
+
+# Edit existing storage configuration
+menu_edit_storage() {
+    local storage_name="$1"
+
+    print_header "Edit Storage Configuration: $storage_name"
+
+    info "Loading existing configuration for '$storage_name'..."
+    echo
+
+    # Load all existing configuration values
+    declare -A config_values
+    while IFS='=' read -r key value; do
+        config_values["$key"]="$value"
+    done < <(get_all_storage_config_values "$storage_name")
+
+    # Display immutable fields (read-only)
+    info "Current Configuration (read-only fields):"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # Transport mode (immutable)
+    local transport_mode="${config_values[transport_mode]:-iscsi}"
+    echo "  Transport mode:     $transport_mode ${c3}(cannot be changed)${c0}"
+
+    # Dataset (immutable - changing would orphan volumes)
+    local dataset="${config_values[dataset]}"
+    echo "  Dataset:            $dataset ${c3}(cannot be changed)${c0}"
+
+    # Block size (immutable - cannot change after volumes created)
+    local blocksize="${config_values[zvol_blocksize]:-16K}"
+    echo "  Block size:         $blocksize ${c3}(cannot be changed)${c0}"
+
+    # Transport-specific immutable fields
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        local subsystem_nqn="${config_values[subsystem_nqn]}"
+        echo "  Subsystem NQN:      $subsystem_nqn ${c3}(cannot be changed)${c0}"
+    else
+        local target_iqn="${config_values[target_iqn]}"
+        echo "  Target IQN:         $target_iqn ${c3}(cannot be changed)${c0}"
+    fi
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo
+
+    warning "Note: Fields marked as 'cannot be changed' are immutable to prevent orphaning existing volumes"
+    echo
+
+    # Prompt for mutable fields with current values as defaults
+    info "Editable Configuration:"
+    echo
+
+    # TrueNAS API settings
+    local current_api_host="${config_values[api_host]}"
+    local truenas_ip
+    read -rp "TrueNAS IP address [$current_api_host]: " truenas_ip
+    truenas_ip="${truenas_ip:-$current_api_host}"
+
+    if [[ -z "$truenas_ip" ]]; then
+        error "TrueNAS IP address cannot be empty"
+        return 1
+    fi
+
+    if ! validate_ip "$truenas_ip"; then
+        error "Invalid IP address format"
+        return 1
+    fi
+
+    # API Key
+    local current_api_key="${config_values[api_key]}"
+    info "Current API key: ${current_api_key:0:20}... (hidden)"
+    local api_key
+    read -rp "New TrueNAS API key (press Enter to keep current): " api_key
+    api_key="${api_key:-$current_api_key}"
+
+    if [[ -z "$api_key" ]]; then
+        error "API key cannot be empty"
+        return 1
+    fi
+
+    # Test connectivity
+    if ! test_truenas_api "$truenas_ip" "$api_key"; then
+        error "Failed to connect to TrueNAS. Please check IP and API key."
+        read -rp "Continue anyway? (y/N): " choice
+        [[ "$choice" =~ ^[Yy] ]] || return 1
+    fi
+
+    # Portal configuration
+    local current_portal="${config_values[discovery_portal]}"
+    local default_port
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        default_port="4420"
+    else
+        default_port="3260"
+    fi
+
+    local portal
+    read -rp "Portal IP:port [$current_portal]: " portal
+    portal="${portal:-$current_portal}"
+
+    if [[ -z "$portal" ]]; then
+        portal="${truenas_ip}:${default_port}"
+    elif [[ ! "$portal" =~ : ]]; then
+        portal="${portal}:${default_port}"
+    fi
+
+    # Sparse volumes
+    local current_sparse="${config_values[tn_sparse]:-1}"
+    local sparse
+    read -rp "Enable sparse volumes? (0/1) [$current_sparse]: " sparse
+    sparse="${sparse:-$current_sparse}"
+
+    # Multipath configuration
+    echo
+    info "Multipath Configuration:"
+    local current_use_multipath="${config_values[use_multipath]:-0}"
+    local current_portals="${config_values[portals]:-}"
+
+    if [[ "$transport_mode" == "iscsi" ]]; then
+        echo "  Current multipath setting: $current_use_multipath"
+        if [[ -n "$current_portals" ]]; then
+            echo "  Current portals: $current_portals"
+        fi
+        echo
+
+        local use_multipath
+        read -rp "Enable multipath I/O? (0/1) [$current_use_multipath]: " use_multipath
+        use_multipath="${use_multipath:-$current_use_multipath}"
+
+        local portals="$current_portals"
+        if [[ "$use_multipath" == "1" ]]; then
+            read -rp "Additional portals (comma-separated IP:port) [$current_portals]: " portals
+            portals="${portals:-$current_portals}"
+        else
+            portals=""
+        fi
+    else
+        # NVMe/TCP - only portals matter
+        echo "  Current portals: ${current_portals:-none}"
+        echo
+        local portals
+        read -rp "Portals for native multipath (comma-separated IP:port) [$current_portals]: " portals
+        portals="${portals:-$current_portals}"
+        use_multipath=""  # Not used for NVMe
+    fi
+
+    # Host NQN for NVMe (optional, can be changed)
+    local hostnqn="${config_values[hostnqn]:-}"
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        echo
+        info "Current host NQN: ${hostnqn:-system default}"
+        read -rp "Update host NQN? (y/N): " update_hostnqn
+        if [[ "$update_hostnqn" =~ ^[Yy] ]]; then
+            read -rp "New host NQN: " hostnqn
+        fi
+    fi
+
+    # Generate updated configuration
+    echo
+    info "Updated Configuration Summary:"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    local config
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        local subsystem_nqn="${config_values[subsystem_nqn]}"
+        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$subsystem_nqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "$hostnqn")
+    else
+        local target_iqn="${config_values[target_iqn]}"
+        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$target_iqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "")
+    fi
+    echo "$config"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo
+
+    read -rp "Apply these changes to $STORAGE_CFG? (Y/n): " confirm
+    if [[ "$confirm" =~ ^[Nn] ]]; then
+        warning "Configuration changes cancelled"
+        return 1
+    fi
+
+    # Update configuration (remove old, add new)
+    if update_storage_config "$storage_name" "$config"; then
+        echo
+        success "Storage configuration updated successfully!"
+        info "Storage '$storage_name' has been reconfigured"
+        echo
+        info "Next steps:"
+        echo "  1. Restart pvedaemon and pveproxy if needed"
+        echo "  2. Check storage status: pvesm status"
+        echo "  3. Verify connectivity with existing volumes"
+        echo
+        read -rp "Press Enter to continue..."
+    else
+        error "Failed to update configuration"
+        return 1
+    fi
+
+    return 0
+}
+
+# Configuration wizard
+menu_configure_storage() {
+    print_header "Storage Configuration Wizard"
+
+    info "This wizard will help you configure TrueNAS storage for Proxmox"
+    echo
+
+    # Check for existing storage entries
+    local existing_storages
+    existing_storages=$(list_truenas_storages 2>/dev/null || true)
+
+    local storage_name=""
+
+    if [[ -n "$existing_storages" ]]; then
+        # Count existing storages
+        local storage_count
+        storage_count=$(echo "$existing_storages" | wc -l)
+
+        # Present menu (don't show storage list yet)
+        info "Found $storage_count existing TrueNAS storage configuration(s)"
+        echo
+        info "What would you like to do?"
+        echo "  1) Edit an existing storage"
+        echo "  2) Add a new storage"
+        echo "  3) Delete a storage"
+        echo "  0) Cancel"
+        echo
+
+        local menu_choice
+        while true; do
+            read -rp "Select option [0-3]: " menu_choice
+            if [[ "$menu_choice" =~ ^[0-3]$ ]]; then
+                break
+            else
+                error "Invalid choice. Please enter 0, 1, 2, or 3"
+            fi
+        done
+
+        case "$menu_choice" in
+            0)
+                info "Configuration cancelled"
+                return 0
+                ;;
+            1)
+                # Edit mode - NOW show the storage list
+                echo
+                info "Available storage configurations:"
+                local idx=1
+                local -a storage_array=()
+                while IFS= read -r storage; do
+                    echo "  $idx) $storage"
+                    storage_array+=("$storage")
+                    ((idx++))
+                done <<< "$existing_storages"
+                echo
+
+                local storage_idx
+                while true; do
+                    read -rp "Select storage to edit [1-${#storage_array[@]}] or 0 to cancel: " storage_idx
+                    if [[ "$storage_idx" == "0" ]]; then
+                        info "Configuration cancelled"
+                        return 0
+                    elif [[ "$storage_idx" =~ ^[0-9]+$ ]] && [[ "$storage_idx" -ge 1 ]] && [[ "$storage_idx" -le "${#storage_array[@]}" ]]; then
+                        storage_name="${storage_array[$((storage_idx-1))]}"
+                        # Call edit function and return
+                        menu_edit_storage "$storage_name"
+                        return $?
+                    else
+                        error "Invalid selection. Please enter a number between 1 and ${#storage_array[@]}"
+                    fi
+                done
+                ;;
+            2)
+                # Add new storage mode - continue with existing workflow below
+                ;;
+            3)
+                # Delete mode - show storage list and confirm deletion
+                echo
+                info "Available storage configurations:"
+                local idx=1
+                local -a storage_array=()
+                while IFS= read -r storage; do
+                    echo "  $idx) $storage"
+                    storage_array+=("$storage")
+                    ((idx++))
+                done <<< "$existing_storages"
+                echo
+
+                local storage_idx
+                while true; do
+                    read -rp "Select storage to delete [1-${#storage_array[@]}] or 0 to cancel: " storage_idx
+                    if [[ "$storage_idx" == "0" ]]; then
+                        info "Deletion cancelled"
+                        return 0
+                    elif [[ "$storage_idx" =~ ^[0-9]+$ ]] && [[ "$storage_idx" -ge 1 ]] && [[ "$storage_idx" -le "${#storage_array[@]}" ]]; then
+                        storage_name="${storage_array[$((storage_idx-1))]}"
+                        break
+                    else
+                        error "Invalid selection. Please enter a number between 1 and ${#storage_array[@]}"
+                    fi
+                done
+
+                # Warning and confirmation
+                echo
+                warning "WARNING: Deleting storage configuration '$storage_name'"
+                warning "This will remove the storage from Proxmox configuration."
+                warning "VMs using disks on this storage will lose access until reconfigured."
+                echo
+
+                local confirm
+                read -rp "Type storage name '$storage_name' to confirm deletion: " confirm
+                if [[ "$confirm" != "$storage_name" ]]; then
+                    warning "Confirmation failed. Deletion cancelled."
+                    return 1
+                fi
+
+                # Read transport_mode BEFORE deletion (config will be gone after)
+                local transport_mode
+                transport_mode=$(get_storage_config_value "$storage_name" "transport_mode" 2>/dev/null || echo "iscsi")
+
+                # Perform deletion
+                if remove_storage_config "$storage_name"; then
+                    success "Storage '$storage_name' has been deleted"
+
+                    # Check if this was an iSCSI storage and offer orphan cleanup
+                    if [[ "$transport_mode" != "nvme-tcp" ]]; then
+                        echo
+                        read -rp "Would you like to cleanup orphaned resources on TrueNAS? (y/N): " cleanup_response
+                        if [[ "$cleanup_response" =~ ^[Yy] ]]; then
+                            info "Note: Storage no longer exists in config. Manual cleanup may be needed."
+                        fi
+                    fi
+                else
+                    error "Failed to delete storage configuration"
+                    return 1
+                fi
+
+                return 0
+                ;;
+        esac
+    fi
+
+    # Continue with "Add New Storage" workflow
+    # Prompt for storage name
+    local storage_name
+    while true; do
+        read -rp "Storage name (e.g., truenas-main): " storage_name
+        if [[ -z "$storage_name" ]]; then
+            error "Storage name cannot be empty"
+            continue
+        fi
+        if ! validate_storage_name "$storage_name"; then
+            error "Invalid storage name. Use only letters, numbers, hyphens, and underscores"
+            continue
+        fi
+        if storage_name_exists "$storage_name"; then
+            error "Storage name '$storage_name' already exists in $STORAGE_CFG"
+            read -rp "Choose a different name? (Y/n): " choice
+            [[ ! "$choice" =~ ^[Nn] ]] && continue || return 1
+        fi
+        break
+    done
+
+    # TrueNAS IP
+    local truenas_ip
+    while true; do
+        read -rp "TrueNAS IP address: " truenas_ip
+        if validate_ip "$truenas_ip"; then
+            break
+        else
+            error "Invalid IP address format"
+        fi
+    done
+
+    # API Key
+    local api_key
+    read -rp "TrueNAS API key: " api_key
+    if [[ -z "$api_key" ]]; then
+        error "API key cannot be empty"
+        return 1
+    fi
+
+    # Test connectivity
+    if ! test_truenas_api "$truenas_ip" "$api_key"; then
+        error "Failed to connect to TrueNAS. Please check IP and API key."
+        read -rp "Continue anyway? (y/N): " choice
+        [[ "$choice" =~ ^[Yy] ]] || return 1
+    fi
+
+    # Dataset
+    local dataset
+    while true; do
+        read -rp "ZFS dataset path (e.g., tank/proxmox): " dataset
+        if [[ -z "$dataset" ]]; then
+            error "Dataset cannot be empty"
+            continue
+        fi
+
+        # Verify dataset if API connection worked
+        if ! verify_dataset "$truenas_ip" "$api_key" "$dataset"; then
+            echo
+            warning "Dataset verification failed. The dataset may not exist or may not be accessible."
+            read -rp "Continue anyway? (y/N): " continue_choice
+            if [[ "$continue_choice" =~ ^[Yy] ]]; then
+                warning "Proceeding with unverified dataset '$dataset'"
+                break
+            else
+                echo
+                info "Please enter a different dataset name"
+                continue
+            fi
+        fi
+        break
+    done
+
+    # Transport mode selection
+    echo
+    info "Select transport protocol:"
+    echo "  1) iSCSI (traditional, widely compatible)"
+    echo "  2) NVMe/TCP (modern, lower latency)"
+    read -rp "Transport mode (1-2) [1]: " transport_choice
+    transport_choice=${transport_choice:-1}
+
+    local transport_mode
+    case "$transport_choice" in
+        1) transport_mode="iscsi" ;;
+        2) transport_mode="nvme-tcp" ;;
+        *)
+            error "Invalid choice, defaulting to iSCSI"
+            transport_mode="iscsi"
+            ;;
+    esac
+
+    # Transport-specific configuration
+    local target=""
+    local subsystem_nqn=""
+    local hostnqn=""
+
+    if [[ "$transport_mode" == "iscsi" ]]; then
+        # iSCSI Target
+        read -rp "iSCSI target (e.g., iqn.2025-01.com.truenas:target0): " target
+        if [[ -z "$target" ]]; then
+            error "iSCSI target cannot be empty"
+            return 1
+        fi
+    else
+        # NVMe/TCP configuration
+        # Check nvme-cli
+        if ! check_nvme_cli; then
+            warning "nvme-cli package is not installed"
+            info "NVMe/TCP requires nvme-cli for management"
+            read -rp "Install nvme-cli now? (Y/n): " install_nvme
+            if [[ ! "$install_nvme" =~ ^[Nn] ]]; then
+                info "Installing nvme-cli..."
+                if ! apt-get update; then
+                    error "Failed to update package lists (check network/repositories)"
+                    return 1
+                fi
+                if ! apt-get install -y nvme-cli; then
+                    error "Failed to install nvme-cli package"
+                    return 1
+                fi
+                if ! check_nvme_cli; then
+                    error "nvme-cli installed but 'nvme' command not found in PATH"
+                    info "Try running: hash -r  # to refresh PATH"
+                    return 1
+                fi
+                success "nvme-cli installed successfully"
+            else
+                warning "Proceeding without nvme-cli (some features may not work)"
+            fi
+        fi
+
+        # Subsystem NQN
+        while true; do
+            read -rp "NVMe subsystem NQN (e.g., nqn.2005-10.org.freenas.ctl:proxmox): " subsystem_nqn
+            if [[ -z "$subsystem_nqn" ]]; then
+                error "Subsystem NQN cannot be empty"
+                continue
+            fi
+            if ! validate_nqn "$subsystem_nqn"; then
+                error "Invalid NQN format. Must start with nqn.YYYY-MM."
+                continue
+            fi
+            break
+        done
+
+        # Host NQN
+        hostnqn=$(get_hostnqn)
+        if [[ -z "$hostnqn" ]]; then
+            warning "No host NQN configured (plugin will use system default)"
+        fi
+
+        # Check native multipath
+        echo
+        check_nvme_multipath || true
+    fi
+
+    # Portal (optional) - set default port based on transport
+    local portal
+    local default_port
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        default_port="4420"
+    else
+        default_port="3260"
+    fi
+
+    read -rp "Portal IP (optional, press Enter to use TrueNAS IP): " portal
+    if [[ -z "$portal" ]]; then
+        portal="${truenas_ip}:${default_port}"
+    elif [[ ! "$portal" =~ : ]]; then
+        # Add default port if not specified
+        portal="${portal}:${default_port}"
+    fi
+
+    # Blocksize (optional)
+    local blocksize
+    read -rp "Block size [16K]: " blocksize
+    blocksize="${blocksize:-16K}"
+
+    # Sparse (optional)
+    local sparse
+    read -rp "Enable sparse volumes? (0/1) [1]: " sparse
+    sparse="${sparse:-1}"
+
+    # Multipath configuration
+    echo
+    info "Advanced Options:"
+    local use_multipath=""
+    local portals=""
+    read -rp "Enable multipath I/O for redundancy/load balancing? (y/N): " enable_mp
+
+    if [[ "$enable_mp" =~ ^[Yy] ]]; then
+        if [[ "$transport_mode" == "iscsi" ]]; then
+            # Check for multipath-tools package (iSCSI only)
+            if ! command -v multipath &> /dev/null; then
+                warning "multipath-tools package is not installed"
+                info "Multipath requires: apt-get install multipath-tools"
+                read -rp "Continue configuring multipath anyway? (y/N): " continue_mp
+                if [[ ! "$continue_mp" =~ ^[Yy] ]]; then
+                    info "Multipath disabled"
+                else
+                    use_multipath="1"
+                fi
+            else
+                use_multipath="1"
+            fi
+        else
+            # NVMe/TCP uses native multipath
+            info "NVMe/TCP uses native kernel multipath (no dm-multipath required)"
+            use_multipath=""  # Don't set use_multipath flag for NVMe
+        fi
+
+        # If multipath is enabled (or for NVMe), discover and select additional portals
+        if [[ "$use_multipath" == "1" ]] || [[ "$transport_mode" == "nvme-tcp" ]]; then
+            echo
+            info "Discovering available portals from TrueNAS..."
+            local discovered_portals
+            discovered_portals=$(discover_truenas_portals "$truenas_ip" "$api_key" "$truenas_ip")
+
+            if [[ -n "$discovered_portals" ]]; then
+                success "Found available portal IPs:"
+                local portal_array=()
+                local idx=1
+                while IFS= read -r ip; do
+                    echo "  $idx) $ip"
+                    portal_array+=("$ip")
+                    ((idx++))
+                done <<< "$discovered_portals"
+
+                echo
+                info "Select additional portals for multipath (space-separated numbers, e.g., '1 2')"
+                info "Note: Portals should be on different subnets for proper multipath operation"
+                read -rp "Portal numbers (or press Enter to skip): " portal_choices
+
+                if [[ -n "$portal_choices" ]]; then
+                    local selected_portals=()
+                    local invalid_choices=()
+                    for choice in $portal_choices; do
+                        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -lt "$idx" ]]; then
+                            selected_portals+=("${portal_array[$((choice-1))]}:${default_port}")
+                        elif [[ "$choice" =~ ^[0-9]+$ ]]; then
+                            invalid_choices+=("$choice")
+                        fi
+                    done
+
+                    if [[ ${#invalid_choices[@]} -gt 0 ]]; then
+                        warning "Invalid selections ignored: ${invalid_choices[*]}"
+                    fi
+
+                    if [[ ${#selected_portals[@]} -gt 0 ]]; then
+                        portals=$(IFS=,; echo "${selected_portals[*]}")
+                        success "Selected portals: $portals"
+                    else
+                        warning "No valid portals selected"
+                    fi
+                fi
+            else
+                warning "Could not discover portals automatically"
+                info "You can enter portals manually"
+            fi
+
+            # Fallback to manual entry
+            if [[ -z "$portals" ]]; then
+                echo
+                info "Enter additional portals manually (comma-separated IP:port)"
+                if [[ "$transport_mode" == "nvme-tcp" ]]; then
+                    info "Example: 192.168.10.101:4420,192.168.10.102:4420"
+                else
+                    info "Example: 192.168.10.101:3260,192.168.10.102:3260"
+                fi
+                read -rp "Additional portals (or press Enter to skip): " portals
+
+                # Validate manual portal entry format
+                if [[ -n "$portals" ]]; then
+                    local portal_valid=true
+                    IFS=',' read -ra portal_list <<< "$portals"
+                    for p in "${portal_list[@]}"; do
+                        if [[ ! "$p" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}:[0-9]+$ ]]; then
+                            warning "Invalid portal format: $p"
+                            portal_valid=false
+                        fi
+                    done
+                    if [[ "$portal_valid" == "false" ]]; then
+                        warning "Clearing invalid portal entries"
+                        portals=""
+                    fi
+                fi
+
+                if [[ -z "$portals" ]]; then
+                    if [[ "$transport_mode" == "iscsi" && "$use_multipath" == "1" ]]; then
+                        warning "No additional portals configured - multipath will not function"
+                        warning "You must configure multiple portals for multipath to work"
+                    elif [[ "$transport_mode" == "nvme-tcp" ]]; then
+                        info "Using single portal (you can add more later for native multipath redundancy)"
+                    fi
+                fi
+            fi
+        fi
+    else
+        use_multipath="0"
+    fi
+
+    # Generate configuration
+    echo
+    info "Configuration summary:"
+    info "Transport mode: ${transport_mode}"
+    echo "─────────────────────────────────────────────────────────"
+    local config
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$subsystem_nqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "$hostnqn")
+    else
+        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$target" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "")
+    fi
+    echo "$config"
+    echo "─────────────────────────────────────────────────────────"
+    echo
+
+    read -rp "Add this configuration to $STORAGE_CFG? (Y/n): " confirm
+    if [[ "$confirm" =~ ^[Nn] ]]; then
+        warning "Configuration cancelled"
+        return 1
+    fi
+
+    # Add configuration
+    if add_storage_config "$config"; then
+        echo
+        success "Storage configured successfully!"
+        info "You can now use '$storage_name' storage in Proxmox"
+        echo
+        info "Next steps:"
+        echo "  1. Test the storage by creating a VM disk:"
+        echo "     qm create 999 --name test-vm && qm set 999 --scsi0 ${storage_name}:10"
+        echo "  2. Check storage status: pvesm status"
+        echo "  3. View storage details: pvesm list ${storage_name}"
+
+        # Add multipath-specific next steps if enabled
+        if [[ "$use_multipath" == "1" ]]; then
+            echo "  4. Verify multipath configuration: multipath -ll"
+            echo "  5. Check multipath service status: systemctl status multipathd"
+            if ! command -v multipath &> /dev/null; then
+                echo "  6. Install multipath-tools: apt-get install multipath-tools"
+            fi
+        fi
+    else
+        error "Failed to add configuration"
+        return 1
+    fi
+
+    read -rp "Press Enter to continue..."
+}
+
+# ============================================================================
+# ROLLBACK FUNCTIONALITY
+# ============================================================================
+
+# Restore from backup
+restore_plugin_from_backup() {
+    local backup_file="$1"
+
+    if [[ ! -f "$backup_file" ]]; then
+        error "Backup file not found: $backup_file"
+        return 1
+    fi
+
+    info "Restoring plugin from backup..."
+
+    # Validate backup before restoring
+    if ! validate_plugin "$backup_file"; then
+        error "Backup file validation failed"
+        return 1
+    fi
+
+    # Create a backup of current version before rollback
+    backup_plugin || warning "Could not backup current version"
+
+    # Restore the backup
+    cp "$backup_file" "$PLUGIN_FILE" || {
+        error "Failed to restore backup"
+        return 1
+    }
+
+    # Set correct permissions
+    chown root:root "$PLUGIN_FILE"
+    chmod 644 "$PLUGIN_FILE"
+
+    success "Plugin restored from backup"
+    log "INFO" "Plugin restored from: $backup_file"
+
+    # Restart services
+    restart_pve_services || warning "Services may need manual restart"
+
+    return 0
+}
+
+# Menu: Rollback
+menu_rollback() {
+    print_header "Rollback to Previous Version"
+
+    info "Searching for available backups..."
+    local backups
+    backups=$(list_backups 2>/dev/null || true)
+
+    if [[ -z "$backups" ]]; then
+        warning "No backups found"
+        info "Backups are stored in: $BACKUP_DIR"
+        read -rp "Press Enter to continue..."
+        return 1
+    fi
+
+    echo
+    echo "Available backups:"
+    echo "─────────────────────────────────────────────────────────"
+
+    local -a backup_array
+    local index=1
+    while IFS= read -r backup; do
+        # Extract version and timestamp from filename
+        local filename
+        filename=$(basename "$backup")
+        # Format: TrueNASPlugin.pm.backup.VERSION.TIMESTAMP
+        # Remove prefix to get VERSION.TIMESTAMP
+        local version_timestamp
+        version_timestamp=$(echo "$filename" | sed 's/TrueNASPlugin\.pm\.backup\.//')
+        # Split on last underscore (timestamp starts with YYYYMMDD_)
+        local version
+        version=$(echo "$version_timestamp" | sed 's/\.[0-9]*_[0-9]*$//')
+        local timestamp
+        timestamp=$(echo "$version_timestamp" | sed 's/.*\.\([0-9]*_[0-9]*\)$/\1/')
+
+        # Format timestamp for display
+        local display_time
+        if [[ "$timestamp" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})_([0-9]{2})([0-9]{2})([0-9]{2})$ ]]; then
+            display_time="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}"
+        else
+            display_time="$timestamp"
+        fi
+
+        echo "  $index) Version $version - $display_time"
+        backup_array+=("$backup")
+        ((index++))
+    done <<< "$backups"
+
+    echo "  0) Cancel"
+    echo "─────────────────────────────────────────────────────────"
+    echo
+
+    local choice
+    choice=$(read_choice $((index - 1)))
+
+    if [[ "$choice" -eq 0 ]]; then
+        info "Rollback cancelled"
+        return 0
+    fi
+
+    local selected_backup="${backup_array[$((choice - 1))]}"
+
+    echo
+    warning "This will replace the current plugin with the selected backup"
+    read -rp "Continue with rollback? (y/N): " confirm
+
+    if [[ ! "$confirm" =~ ^[Yy] ]]; then
+        info "Rollback cancelled"
+        read -rp "Press Enter to continue..."
+        return 0
+    fi
+
+    if restore_plugin_from_backup "$selected_backup"; then
+        success "Rollback completed successfully"
+
+        # Show cluster warning if applicable
+        if is_cluster_node; then
+            show_cluster_warning
+        fi
+    else
+        error "Rollback failed"
+    fi
+
+    read -rp "Press Enter to continue..."
+}
+
+# ============================================================================
+# BACKUP MANAGEMENT
+# ============================================================================
+
+# View all backups with detailed information
+view_all_backups() {
+    print_header "Backup Files"
+
+    local backups
+    backups=$(list_backups 2>/dev/null || true)
+
+    if [[ -z "$backups" ]]; then
+        warning "No backups found"
+        info "Backups are stored in: $BACKUP_DIR"
+        return 1
+    fi
+
+    local stats
+    stats=$(scan_backups)
+    IFS=':' read -r count total_size oldest_age newest_age <<< "$stats"
+
+    echo
+    echo "Total: $count backup(s) - $(format_size "$total_size")"
+    echo "─────────────────────────────────────────────────────────────────────────────"
+    printf "%-6s %-15s %-20s %-12s %s\n" "No." "Version" "Created" "Size" "Age"
+    echo "─────────────────────────────────────────────────────────────────────────────"
+
+    local index=1
+    while IFS= read -r backup; do
+        local filename
+        filename=$(basename "$backup")
+
+        # Extract version and timestamp
+        local version_timestamp
+        version_timestamp=$(echo "$filename" | sed 's/TrueNASPlugin\.pm\.backup\.//')
+        local version
+        version=$(echo "$version_timestamp" | sed 's/\.[0-9]*_[0-9]*$//')
+        local timestamp
+        timestamp=$(echo "$version_timestamp" | sed 's/.*\.\([0-9]*_[0-9]*\)$/\1/')
+
+        # Format timestamp for display
+        local display_time
+        if [[ "$timestamp" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})_([0-9]{2})([0-9]{2})([0-9]{2})$ ]]; then
+            display_time="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${BASH_REMATCH[4]}:${BASH_REMATCH[5]}"
+        else
+            display_time="$timestamp"
+        fi
+
+        # Get file size
+        local size
+        size=$(stat -c %s "$backup" 2>/dev/null || stat -f %z "$backup" 2>/dev/null)
+
+        # Get age
+        local age
+        age=$(backup_age_days "$backup")
+
+        printf "%-6s %-15s %-20s %-12s %s\n" \
+            "$index)" \
+            "$version" \
+            "$display_time" \
+            "$(format_size "$size")" \
+            "$(format_age "$age")"
+
+        ((index++))
+    done <<< "$backups"
+
+    echo "─────────────────────────────────────────────────────────────────────────────"
+    echo
+}
+
+# Delete old backups by age threshold
+delete_old_backups() {
+    print_header "Delete Old Backups"
+
+    local backups
+    backups=$(list_backups 2>/dev/null || true)
+
+    if [[ -z "$backups" ]]; then
+        warning "No backups found"
+        return 1
+    fi
+
+    echo
+    read -rp "Delete backups older than how many days? (default: 30): " age_threshold
+    age_threshold=${age_threshold:-30}
+
+    # Validate input
+    if ! [[ "$age_threshold" =~ ^[0-9]+$ ]]; then
+        error "Invalid input. Please enter a number."
+        return 1
+    fi
+
+    # Find backups older than threshold
+    local old_backups=()
+    while IFS= read -r backup; do
+        local age
+        age=$(backup_age_days "$backup")
+        if [[ "$age" -gt "$age_threshold" ]]; then
+            old_backups+=("$backup")
+        fi
+    done <<< "$backups"
+
+    if [[ "${#old_backups[@]}" -eq 0 ]]; then
+        info "No backups older than $age_threshold days found"
+        return 0
+    fi
+
+    echo
+    warning "Found ${#old_backups[@]} backup(s) older than $age_threshold days:"
+    echo
+    for backup in "${old_backups[@]}"; do
+        local age
+        age=$(backup_age_days "$backup")
+        echo "  • $(basename "$backup") - $(format_age "$age")"
+    done
+    echo
+
+    read -rp "Delete these backups? (y/N): " confirm
+    if [[ ! "$confirm" =~ ^[Yy] ]]; then
+        info "Deletion cancelled"
+        return 0
+    fi
+
+    # Delete old backups
+    local deleted=0
+    local failed=0
+    for backup in "${old_backups[@]}"; do
+        if rm -f "$backup" 2>/dev/null; then
+            ((deleted++))
+            log "INFO" "Deleted old backup: $backup"
+        else
+            ((failed++))
+            warning "Failed to delete: $(basename "$backup")"
+        fi
+    done
+
+    if [[ "$deleted" -gt 0 ]]; then
+        success "Deleted $deleted backup(s)"
+    fi
+
+    if [[ "$failed" -gt 0 ]]; then
+        warning "Failed to delete $failed backup(s)"
+    fi
+}
+
+# Keep only latest N backups
+keep_latest_backups() {
+    print_header "Keep Latest N Backups"
+
+    local backups
+    backups=$(list_backups 2>/dev/null || true)
+
+    if [[ -z "$backups" ]]; then
+        warning "No backups found"
+        return 1
+    fi
+
+    local total_count
+    total_count=$(echo "$backups" | wc -l)
+
+    echo
+    echo "Current backup count: $total_count"
+    read -rp "How many backups would you like to keep? (default: 5): " keep_count
+    keep_count=${keep_count:-5}
+
+    # Validate input
+    if ! [[ "$keep_count" =~ ^[0-9]+$ ]]; then
+        error "Invalid input. Please enter a number."
+        return 1
+    fi
+
+    if [[ "$keep_count" -ge "$total_count" ]]; then
+        info "No backups need to be deleted (keeping $keep_count, have $total_count)"
+        return 0
+    fi
+
+    local delete_count=$((total_count - keep_count))
+
+    echo
+    warning "This will delete $delete_count backup(s), keeping only the $keep_count most recent"
+    read -rp "Continue? (y/N): " confirm
+
+    if [[ ! "$confirm" =~ ^[Yy] ]]; then
+        info "Deletion cancelled"
+        return 0
+    fi
+
+    # Get backups to delete (oldest ones)
+    local -a backups_to_delete
+    mapfile -t backups_to_delete < <(echo "$backups" | tail -n "$delete_count")
+
+    # Delete backups
+    local deleted=0
+    local failed=0
+    for backup in "${backups_to_delete[@]}"; do
+        if rm -f "$backup" 2>/dev/null; then
+            ((deleted++))
+            log "INFO" "Deleted backup: $backup"
+        else
+            ((failed++))
+            warning "Failed to delete: $(basename "$backup")"
+        fi
+    done
+
+    if [[ "$deleted" -gt 0 ]]; then
+        success "Deleted $deleted backup(s), kept $keep_count most recent"
+    fi
+
+    if [[ "$failed" -gt 0 ]]; then
+        warning "Failed to delete $failed backup(s)"
+    fi
+}
+
+# Delete all backups with strong confirmation
+delete_all_backups() {
+    print_header "Delete All Backups"
+
+    local backups
+    backups=$(list_backups 2>/dev/null || true)
+
+    if [[ -z "$backups" ]]; then
+        warning "No backups found"
+        return 1
+    fi
+
+    local total_count
+    total_count=$(echo "$backups" | wc -l)
+
+    echo
+    warning "This will permanently delete ALL $total_count backup(s)!"
+    warning "This action cannot be undone!"
+    echo
+    echo "Type 'DELETE ALL' to confirm:"
+    read -r confirm
+
+    if [[ "$confirm" != "DELETE ALL" ]]; then
+        info "Deletion cancelled"
+        return 0
+    fi
+
+    # Delete all backups
+    local deleted=0
+    local failed=0
+    while IFS= read -r backup; do
+        if rm -f "$backup" 2>/dev/null; then
+            ((deleted++))
+            log "INFO" "Deleted backup: $backup"
+        else
+            ((failed++))
+            warning "Failed to delete: $(basename "$backup")"
+        fi
+    done <<< "$backups"
+
+    if [[ "$deleted" -gt 0 ]]; then
+        success "Deleted all $deleted backup(s)"
+    fi
+
+    if [[ "$failed" -gt 0 ]]; then
+        warning "Failed to delete $failed backup(s)"
+    fi
+}
+
+# Backup management submenu
+menu_manage_backups() {
+    while true; do
+        print_header "Manage Backups"
+
+        local stats
+        stats=$(scan_backups)
+        IFS=':' read -r count total_size oldest_age newest_age <<< "$stats"
+
+        if [[ "$count" -eq 0 ]]; then
+            warning "No backups found"
+            info "Backups are stored in: $BACKUP_DIR"
+            read -rp "Press Enter to return to main menu..."
+            return 0
+        fi
+
+        # Show backup statistics
+        echo
+        echo "Backup Statistics:"
+        echo "─────────────────────────────────────────────────────────"
+        echo "  Total backups: $count"
+        echo "  Total size: $(format_size "$total_size")"
+        echo "  Oldest backup: $(format_age "$oldest_age")"
+        echo "  Newest backup: $(format_age "$newest_age")"
+        echo "─────────────────────────────────────────────────────────"
+        echo
+
+        show_menu "Backup Management" \
+            "View all backups" \
+            "Delete old backups (by age)" \
+            "Keep only latest N backups" \
+            "Delete all backups"
+
+        local choice
+        choice=$(read_choice 4)
+
+        case $choice in
+            0)
+                return 0
+                ;;
+            1)
+                view_all_backups
+                read -rp "Press Enter to continue..."
+                ;;
+            2)
+                delete_old_backups
+                read -rp "Press Enter to continue..."
+                ;;
+            3)
+                keep_latest_backups
+                read -rp "Press Enter to continue..."
+                ;;
+            4)
+                delete_all_backups
+                read -rp "Press Enter to continue..."
+                ;;
+        esac
+    done
+}
+
+# ============================================================================
+# UNINSTALLATION
+# ============================================================================
+
+# Remove storage configuration
+remove_storage_config() {
+    local storage_name="$1"
+
+    if [[ ! -f "$STORAGE_CFG" ]]; then
+        info "No storage.cfg file found"
+        return 0
+    fi
+
+    # Backup first
+    backup_storage_cfg || {
+        error "Failed to backup storage.cfg"
+        return 1
+    }
+
+    info "Removing storage '$storage_name' from configuration..."
+
+    # Create temporary file
+    local temp_file="${STORAGE_CFG}.tmp"
+
+    # Remove the storage block (truenasplugin: line and all indented lines after it)
+    awk -v storage="truenasplugin: ${storage_name}" '
+        $0 ~ "^" storage "$" { skip=1; next }
+        /^[^ \t]/ { skip=0 }
+        !skip { print }
+    ' "$STORAGE_CFG" > "$temp_file"
+
+    mv "$temp_file" "$STORAGE_CFG"
+    success "Storage configuration removed"
+    return 0
+}
+
+# List all TrueNAS storage entries
+list_truenas_storage() {
+    if [[ ! -f "$STORAGE_CFG" ]]; then
+        return 1
+    fi
+
+    grep "^truenas:" "$STORAGE_CFG" | sed 's/^truenas: //' || return 1
+}
+
+# Uninstall plugin
+uninstall_plugin() {
+    local remove_config="${1:-false}"
+
+    print_header "Uninstalling TrueNAS Plugin"
+
+    # Backup before removing
+    backup_plugin || warning "Could not create backup before uninstallation"
+
+    # Remove plugin file
+    if [[ -f "$PLUGIN_FILE" ]]; then
+        rm "$PLUGIN_FILE" || {
+            error "Failed to remove plugin file"
+            return 1
+        }
+        success "Plugin file removed"
+    else
+        info "Plugin file not found (already removed)"
+    fi
+
+    # Handle storage configuration
+    if [[ "$remove_config" == "true" ]]; then
+        local storages
+        storages=$(list_truenas_storage)
+
+        if [[ -n "$storages" ]]; then
+            echo
+            info "Found TrueNAS storage configurations:"
+            echo "$storages" | while read -r storage; do
+                echo "  • $storage"
+            done
+            echo
+
+            read -rp "Remove all TrueNAS storage configurations? (y/N): " confirm
+            if [[ "$confirm" =~ ^[Yy] ]]; then
+                echo "$storages" | while read -r storage; do
+                    remove_storage_config "$storage"
+                done
+            fi
+        fi
+    fi
+
+    # Restart services
+    restart_pve_services || warning "Services may need manual restart"
+
+    echo
+    success "TrueNAS Plugin uninstalled successfully"
+    echo
+    info "Important notes:"
+    echo "  • Plugin backup saved in: $BACKUP_DIR"
+    echo "  • Data on TrueNAS is NOT affected"
+    echo "  • iSCSI extents and targets remain on TrueNAS"
+    echo "  • You can reinstall the plugin at any time"
+
+    if [[ "$remove_config" != "true" ]]; then
+        echo
+        info "Storage configuration remains in $STORAGE_CFG"
+        info "Remove manually if no longer needed"
+    fi
+
+    return 0
+}
+
+# Menu: Uninstall
+menu_uninstall() {
+    print_header "Uninstall TrueNAS Plugin"
+
+    warning "This will remove the TrueNAS plugin from Proxmox"
+    echo
+    info "Important information:"
+    echo "  • VMs using TrueNAS storage will lose disk access"
+    echo "  • Data on TrueNAS will NOT be deleted"
+    echo "  • A backup will be created before removal"
+    echo "  • You can rollback using the backup if needed"
+    echo
+
+    read -rp "Are you sure you want to uninstall? (y/N): " confirm
+    if [[ ! "$confirm" =~ ^[Yy] ]]; then
+        info "Uninstallation cancelled"
+        return 0
+    fi
+
+    echo
+    read -rp "Also remove storage configuration from $STORAGE_CFG? (y/N): " remove_config_choice
+
+    local remove_config=false
+    [[ "$remove_config_choice" =~ ^[Yy] ]] && remove_config=true
+
+    if uninstall_plugin "$remove_config"; then
+        success "Uninstallation complete"
+    else
+        error "Uninstallation failed"
+    fi
+}
+
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
+
+main() {
+    # Parse arguments
+    parse_arguments "$@"
+
+    # Detect if stdin is not a TTY (piped from curl/wget) and redirect to terminal
+    if [[ ! -t 0 ]] && [[ "$NON_INTERACTIVE" != "true" ]]; then
+        # Try to reconnect stdin to the controlling terminal
+        if [[ -c /dev/tty ]] && ( : </dev/tty ) 2>/dev/null; then
+            # Test if /dev/tty is actually connected to a terminal
+            if [[ -t /dev/tty ]] 2>/dev/null || ( [[ -c /dev/tty ]] && tty -s </dev/tty 2>/dev/null ); then
+                # Successfully can use /dev/tty for interactive input
+                exec 0</dev/tty
+                log "INFO" "Redirected stdin from pipe to /dev/tty for interactive mode"
+            else
+                # /dev/tty exists but is not usable for interactive input
+                echo
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo "  TrueNAS Plugin Installer - Interactive Mode Not Available"
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo
+                echo "This installer was run in a non-interactive context (e.g., via SSH"
+                echo "without a pseudo-terminal) and cannot access your terminal for prompts."
+                echo
+                echo "Please choose one of these methods instead:"
+                echo
+                echo "  ${COLOR_GREEN}1. SSH to Proxmox, then run installer (Recommended)${COLOR_RESET}"
+                echo "     ssh root@your-proxmox-host"
+                echo "     bash <(curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh)"
+                echo
+                echo "  ${COLOR_GREEN}2. Download and Run${COLOR_RESET}"
+                echo "     wget https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh"
+                echo "     chmod +x install.sh"
+                echo "     ./install.sh"
+                echo
+                echo "  ${COLOR_YELLOW}3. Non-Interactive (For Automation)${COLOR_RESET}"
+                echo "     curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh | bash -s -- --non-interactive"
+                echo
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo
+                exit $EXIT_ERROR
+            fi
+        else
+            # Cannot redirect - show helpful error
+            echo
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "  TrueNAS Plugin Installer - Interactive Mode Not Available"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo
+            echo "This installer was piped from curl/wget but cannot access your"
+            echo "terminal for interactive prompts."
+            echo
+            echo "Please choose one of these methods instead:"
+            echo
+            echo "  ${COLOR_GREEN}1. SSH to Proxmox, then run installer (Recommended)${COLOR_RESET}"
+            echo "     ssh root@your-proxmox-host"
+            echo "     bash <(curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh)"
+            echo
+            echo "  ${COLOR_GREEN}2. Download and Run${COLOR_RESET}"
+            echo "     wget https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh"
+            echo "     chmod +x install.sh"
+            echo "     ./install.sh"
+            echo
+            echo "  ${COLOR_YELLOW}3. Non-Interactive (For Automation)${COLOR_RESET}"
+            echo "     curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh | bash -s -- --non-interactive"
+            echo
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo
+            exit $EXIT_ERROR
+        fi
+    fi
+
+    # Initialize logging
+    init_logging
+
+    # Clean up any orphaned processes from previous runs
+    # This prevents accumulation of zombie spinners
+    pkill -f "bash.*install\.sh.*while" 2>/dev/null || true
+    pkill -f "sleep 0\.1" 2>/dev/null || true
+
+    # Perform checks (with banner for non-interactive mode only)
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        print_banner
+    fi
+
+    info "Checking system requirements..."
+    check_root
+    check_dependencies
+    success "System requirements satisfied"
+
+    # Main menu loop - re-detect state after certain operations
+    while true; do
+        # Get current installation state
+        local install_state
+        install_state=$(get_install_state)
+
+        if [[ "$install_state" == "not_installed" ]]; then
+            if [[ "$NON_INTERACTIVE" == "true" ]]; then
+                # Non-interactive mode: install latest version
+                info "Non-interactive mode: Installing latest version..."
+                perform_installation "latest"
+                exit $?
+            else
+                # Interactive mode: show menu (menu will handle banner and screen clearing)
+                menu_not_installed
+            fi
+        else
+            # Plugin is installed
+            local current_version="${install_state#installed:}"
+
+            if [[ "$NON_INTERACTIVE" == "true" ]]; then
+                # Non-interactive mode: check for updates and install if available
+                info "Non-interactive mode: Checking for updates..."
+                if latest_version=$(check_for_updates "$current_version" 2>/dev/null); then
+                    info "Update available: v${latest_version}"
+                    perform_installation "latest"
+                    exit $?
+                else
+                    success "Already on latest version"
+                    exit 0
+                fi
+            else
+                # Interactive mode: show menu (menu will handle banner and screen clearing)
+                menu_installed "$current_version"
+                # If menu returns, loop back to re-detect state
+            fi
+        fi
+    done
+
+    log "INFO" "Installer completed successfully"
+}
+
+# Run main function
+main "$@"

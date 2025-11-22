@@ -64,95 +64,19 @@ sub get_metrics {
 **Priority**: High
 **Effort**: Low
 **Impact**: Medium
+**Status**: Implemented in installer (v1.1.0+)
 
 **Description**: Quick health validation without running the full test suite. Useful for automated monitoring and rapid diagnostics.
 
-**Tool to Add**: `tools/health-check.sh`
-```bash
-#!/bin/bash
-# Quick health check for TrueNAS plugin
-# Exit codes: 0=healthy, 1=warning, 2=critical
+**Implementation**: Health check functionality is now integrated into the interactive installer (`install.sh`). Access via menu option "Run health check" or programmatically using the `run_health_check()` function.
 
-STORAGE="${1:-tnscale}"
-WARNINGS=0
-ERRORS=0
+**Features**:
+- 13 comprehensive checks covering plugin, storage, API, and connectivity
+- Transport-aware (supports both iSCSI and NVMe/TCP modes)
+- Color-coded output with clear status indicators
+- Exit codes: 0=healthy, 1=warning, 2=critical
 
-echo "=== TrueNAS Plugin Health Check ==="
-echo "Storage: $STORAGE"
-echo ""
-
-# Check 1: Plugin file installed
-echo -n "Plugin file: "
-if [ -f /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm ]; then
-    VERSION=$(grep 'our $VERSION' /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm | grep -oP "'[0-9.]+'")
-    echo "OK ($VERSION)"
-else
-    echo "CRITICAL - Not installed"
-    ((ERRORS++))
-fi
-
-# Check 2: Storage configured
-echo -n "Storage config: "
-if grep -q "^truenasplugin: $STORAGE" /etc/pve/storage.cfg; then
-    echo "OK"
-else
-    echo "CRITICAL - Not configured"
-    ((ERRORS++))
-fi
-
-# Check 3: Storage active
-echo -n "Storage status: "
-if pvesm status | grep -q "$STORAGE.*active"; then
-    echo "OK (active)"
-else
-    echo "WARNING - Inactive"
-    ((WARNINGS++))
-fi
-
-# Check 4: TrueNAS API reachable
-echo -n "TrueNAS API: "
-API_HOST=$(grep -A5 "^truenasplugin: $STORAGE" /etc/pve/storage.cfg | grep api_host | awk '{print $2}')
-if [ -n "$API_HOST" ]; then
-    if timeout 5 bash -c "</dev/tcp/$API_HOST/443" 2>/dev/null; then
-        echo "OK (reachable)"
-    else
-        echo "CRITICAL - Unreachable"
-        ((ERRORS++))
-    fi
-else
-    echo "WARNING - API host not configured"
-    ((WARNINGS++))
-fi
-
-# Check 5: iSCSI connectivity
-echo -n "iSCSI sessions: "
-SESSION_COUNT=$(iscsiadm -m session 2>/dev/null | wc -l)
-if [ "$SESSION_COUNT" -gt 0 ]; then
-    echo "OK ($SESSION_COUNT active)"
-else
-    echo "WARNING - No active sessions"
-    ((WARNINGS++))
-fi
-
-# Check 6: Orphaned resources (if available)
-echo -n "Orphaned resources: "
-# (Would call actual orphan detection if implemented)
-echo "SKIP (not implemented)"
-
-# Summary
-echo ""
-echo "=== Health Summary ==="
-if [ $ERRORS -gt 0 ]; then
-    echo "Status: CRITICAL ($ERRORS errors, $WARNINGS warnings)"
-    exit 2
-elif [ $WARNINGS -gt 0 ]; then
-    echo "Status: WARNING ($WARNINGS warnings)"
-    exit 1
-else
-    echo "Status: HEALTHY"
-    exit 0
-fi
-```
+See [Health Check Tool](Tools.md#health-check-tool) for detailed documentation.
 
 **Integration**:
 - Nagios/Icinga check plugin

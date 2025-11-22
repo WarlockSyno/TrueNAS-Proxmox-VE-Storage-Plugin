@@ -1,10 +1,12 @@
 <h1 align="center">TrueNAS Proxmox VE Storage Plugin</h1>
 
-<p align="center">A high-performance storage plugin for Proxmox VE that integrates TrueNAS SCALE via iSCSI, featuring live snapshots, ZFS integration, and cluster compatibility.</p>
+<p align="center">A high-performance storage plugin for Proxmox VE that integrates TrueNAS SCALE via iSCSI or NVMe/TCP, featuring live snapshots, ZFS integration, and cluster compatibility.</p>
 
 ## Features
 
+- **Dual Transport Support** - iSCSI (traditional) or NVMe/TCP (lower latency) block storage
 - **iSCSI Block Storage** - Direct integration with TrueNAS SCALE via iSCSI targets
+- **NVMe/TCP Support** - Modern NVMe over TCP for reduced latency and CPU overhead (TrueNAS SCALE 25.10+)
 - **ZFS Snapshots** - Instant, space-efficient snapshots via TrueNAS ZFS
 - **Live Snapshots** - Full VM state snapshots including RAM (vmstate)
 - **Cluster Compatible** - Full support for Proxmox VE clusters with shared storage
@@ -49,11 +51,47 @@
 
 ## Quick Start
 
-### Proxmox VE Setup
+### Installation
 
-#### 1. Install Plugin
+**Recommended: Interactive Installer (One Command)**
+
+Download and run the installer interactively:
+
 ```bash
-# Copy the plugin file
+bash <(curl -sSL https://raw.githubusercontent.com/WarlockSyno/truenasplugin/alpha/install.sh)
+```
+
+Or download first, then run:
+```bash
+wget https://raw.githubusercontent.com/WarlockSyno/truenasplugin/alpha/install.sh
+chmod +x install.sh
+./install.sh
+```
+
+**For Non-Interactive/Automated Installation:**
+```bash
+curl -sSL https://raw.githubusercontent.com/WarlockSyno/truenasplugin/alpha/install.sh | bash -s -- --non-interactive
+```
+
+The installer provides:
+- ✅ Interactive menu-driven setup
+- ✅ Automatic version detection and updates
+- ✅ Built-in configuration wizard (supports iSCSI and NVMe/TCP)
+- ✅ Health check validation with consistent 30-character label formatting
+- ✅ Plugin function testing with graceful interrupt handling (Ctrl+C)
+- ✅ Backup and rollback support
+- ✅ Cluster-wide installation (install/update on all nodes simultaneously)
+- ✅ Cluster node compatibility
+
+**Alternative: Manual Installation**
+
+If you prefer manual installation:
+
+```bash
+# Download the plugin
+wget https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/TrueNASPlugin.pm
+
+# Copy to plugin directory
 cp TrueNASPlugin.pm /usr/share/perl5/PVE/Storage/Custom/
 
 # Set permissions
@@ -63,7 +101,9 @@ chmod 644 /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
 systemctl restart pvedaemon pveproxy
 ```
 
-#### 2. Configure Storage
+### Configuration
+
+#### Configure Storage
 Add to `/etc/pve/storage.cfg`:
 
 ```ini
@@ -82,6 +122,31 @@ Replace:
 - `192.168.1.100` with your TrueNAS IP
 - `1-your-truenas-api-key-here` with your TrueNAS API key
 - `tank/proxmox` with your ZFS dataset path
+
+#### NVMe/TCP Configuration (Alternative)
+
+For lower latency and reduced CPU overhead, use NVMe/TCP instead of iSCSI:
+
+```ini
+truenasplugin: truenas-nvme
+    api_host 192.168.1.100
+    api_key 1-your-truenas-api-key-here
+    transport_mode nvme-tcp
+    subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
+    dataset tank/proxmox
+    discovery_portal 192.168.1.100:4420
+    api_transport ws
+    content images
+    shared 1
+```
+
+**NVMe/TCP Requirements**:
+- TrueNAS SCALE 25.10.0 or later
+- Proxmox VE 9.x or later
+- Install `nvme-cli` on Proxmox: `apt-get install nvme-cli`
+- Enable **NVMe-oF Target** service in TrueNAS
+
+**See [wiki/NVMe-Setup.md](wiki/NVMe-Setup.md) for complete NVMe/TCP setup guide.**
 
 ### TrueNAS SCALE Setup
 
@@ -166,6 +231,18 @@ pvesm list truenas-storage
 pvesm status
 ```
 
+### Advanced Installation Options
+
+The installer supports additional features:
+- **Version management** - Install, update, or rollback to specific versions
+- **Configuration wizard** - Interactive guided setup with validation
+- **Health checks** - 12-point system validation supporting both iSCSI and NVMe/TCP with consistent 30-character label formatting
+- **Plugin testing** - Integrated 8-test validation of core plugin operations with graceful interrupt handling and health-check style output
+- **Cluster support** - Automatic cluster detection and warnings
+- **Backup management** - Automatic backups with rollback capability
+
+For detailed installation instructions and troubleshooting, see the [Installation Guide](wiki/Installation.md).
+
 ## Documentation
 
 Comprehensive documentation is available in the [Wiki](wiki/):
@@ -205,6 +282,6 @@ This project is provided as-is for use with Proxmox VE and TrueNAS SCALE.
 
 ---
 
-**Version**: 1.0.6
-**Last Updated**: October 16, 2025
+**Version**: 1.1.7
+**Last Updated**: November 22, 2025
 **Compatibility**: Proxmox VE 8.x+, TrueNAS SCALE 22.x+
