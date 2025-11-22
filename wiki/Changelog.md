@@ -1,5 +1,20 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.1.7 (November 22, 2025)
+
+### 🔧 **Installer Improvements**
+
+#### **Blocksize Default Case Fix**
+- **Changed default blocksize from lowercase `16k` to uppercase `16K`** in installer
+  - **Problem**: Installer used lowercase blocksize defaults which could cause issues with older plugin versions
+  - **Locations fixed**:
+    - `generate_storage_config()` function default parameter
+    - `display_edit_config()` function default fallback
+    - Interactive storage configuration prompt and default
+  - **Impact**: New installations will use properly formatted uppercase blocksize values
+
+---
+
 ## Version 1.1.6 (November 14, 2025)
 
 ### 🐛 **Critical Bug Fixes**

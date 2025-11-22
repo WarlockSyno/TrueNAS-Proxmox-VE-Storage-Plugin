@@ -5631,7 +5631,7 @@ generate_storage_config() {
     local dataset="$4"
     local target_or_nqn="$5"  # target_iqn for iSCSI, subsystem_nqn for NVMe
     local portal="${6:-}"
-    local blocksize="${7:-16k}"
+    local blocksize="${7:-16K}"
     local sparse="${8:-1}"
     local use_multipath="${9:-}"
     local portals="${10:-}"
@@ -5775,7 +5775,7 @@ menu_edit_storage() {
     echo "  Dataset:            $dataset ${c3}(cannot be changed)${c0}"
 
     # Block size (immutable - cannot change after volumes created)
-    local blocksize="${config_values[zvol_blocksize]:-16k}"
+    local blocksize="${config_values[zvol_blocksize]:-16K}"
     echo "  Block size:         $blocksize ${c3}(cannot be changed)${c0}"
 
     # Transport-specific immutable fields
@@ -6261,8 +6261,8 @@ menu_configure_storage() {
 
     # Blocksize (optional)
     local blocksize
-    read -rp "Block size [16k]: " blocksize
-    blocksize="${blocksize:-16k}"
+    read -rp "Block size [16K]: " blocksize
+    blocksize="${blocksize:-16K}"
 
     # Sparse (optional)
     local sparse
