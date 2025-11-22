@@ -659,6 +659,27 @@ get_installed_version() {
     echo "$version"
 }
 
+# Get pre-release status for installed version
+# Returns: "true" if pre-release, "false" otherwise
+get_installed_prerelease_status() {
+    local version="$1"
+
+    if [[ -z "$version" ]]; then
+        echo "false"
+        return 0
+    fi
+
+    # Fetch release data from GitHub for this version
+    local release_data
+    release_data=$(github_api_call "/releases/tags/v${version}" 2>/dev/null) || {
+        # If API call fails, assume not a pre-release
+        echo "false"
+        return 0
+    }
+
+    get_release_prerelease_status "$release_data"
+}
+
 # Check if plugin is installed
 is_plugin_installed() {
     [[ -f "$PLUGIN_FILE" ]]
@@ -904,6 +925,15 @@ get_release_version() {
     echo "$release_data" | grep -Po '"tag_name":\s*"\K[^"]+' | sed 's/^v//'
 }
 
+# Check if release is a pre-release
+# Returns: "true" if pre-release, "false" otherwise
+get_release_prerelease_status() {
+    local release_data="$1"
+    local prerelease
+    prerelease=$(echo "$release_data" | grep -Po '"prerelease":\s*\K(true|false)' | head -1)
+    echo "${prerelease:-false}"
+}
+
 # Get download URL for plugin file from release
 get_plugin_download_url() {
     local release_data="$1"
@@ -965,6 +995,7 @@ compare_versions() {
 }
 
 # Check if update is available
+# Returns: "version:prerelease" (e.g., "1.1.3:true") if update available, empty otherwise
 check_for_updates() {
     local current_version="$1"
     local latest_release
@@ -973,14 +1004,17 @@ check_for_updates() {
     local latest_version
     latest_version=$(get_release_version "$latest_release")
 
-    log "INFO" "Current version: $current_version, Latest version: $latest_version"
+    local is_prerelease
+    is_prerelease=$(get_release_prerelease_status "$latest_release")
+
+    log "INFO" "Current version: $current_version, Latest version: $latest_version, Pre-release: $is_prerelease"
 
     compare_versions "$current_version" "$latest_version"
     local result=$?
 
     if [[ $result -eq 2 ]]; then
         # Current version is older
-        echo "$latest_version"
+        echo "${latest_version}:${is_prerelease}"
         return 0
     else
         # Current version is same or newer
@@ -1475,6 +1509,21 @@ perform_cluster_wide_installation() {
     install_version=$(get_release_version "$release_data")
     info "Installing version: $install_version"
 
+    # Check if this is a pre-release and warn user
+    local is_prerelease
+    is_prerelease=$(get_release_prerelease_status "$release_data")
+    if [[ "$is_prerelease" == "true" ]]; then
+        echo
+        warning "⚠️  This is a PRE-RELEASE version"
+        info "Pre-release versions may contain bugs and are not recommended for production use"
+        echo
+        read -rp "Do you want to continue with cluster-wide installation? (y/N): " confirm
+        if [[ ! "$confirm" =~ ^[Yy] ]]; then
+            info "Installation cancelled"
+            return 1
+        fi
+    fi
+
     local download_url
     download_url=$(get_plugin_download_url "$release_data")
 
@@ -1485,6 +1534,11 @@ perform_cluster_wide_installation() {
         return 1
     fi
 
+    # Initialize arrays for tracking installation results
+    declare -a successful_nodes=()
+    declare -a failed_nodes=()
+    declare -a failure_reasons=()
+
     # Install on local node first if requested
     if [[ "$include_local" == "true" ]]; then
         echo
@@ -1493,8 +1547,10 @@ perform_cluster_wide_installation() {
         if install_plugin_file "$temp_file"; then
             if restart_pve_services; then
                 success "Local node installation completed"
+                successful_nodes+=("$current_node")
             else
                 warning "Local node installed but services may need manual restart"
+                successful_nodes+=("$current_node (services need restart)")
             fi
         else
             error "Local node installation failed"
@@ -1509,10 +1565,6 @@ perform_cluster_wide_installation() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo
 
-    declare -a successful_nodes=()
-    declare -a failed_nodes=()
-    declare -a failure_reasons=()
-
     local total_nodes=${#remote_nodes[@]}
     local current=0
 
@@ -1522,19 +1574,21 @@ perform_cluster_wide_installation() {
         local node_ip="${node_info##*:}"
 
         printf "[%d/%d] %s (%s): " "$current" "$total_nodes" "$node_name" "$node_ip"
+        start_spinner
 
         local error_msg
         error_msg=$(install_plugin_on_remote_node "$node_ip" "$temp_file" "$install_version" 2>&1)
         local result=$?
 
+        stop_spinner
         if [[ $result -eq 0 ]]; then
-            echo "${c3}✓ Success${c0}"
+            printf "\r[%d/%d] %s (%s): ${c3}✓ Success${c0}\n" "$current" "$total_nodes" "$node_name" "$node_ip"
             successful_nodes+=("$node_name")
         elif [[ $result -eq 2 ]]; then
-            echo "${c4}⚠ Success (restart needed)${c0}"
+            printf "\r[%d/%d] %s (%s): ${c4}⚠ Success (restart needed)${c0}\n" "$current" "$total_nodes" "$node_name" "$node_ip"
             successful_nodes+=("$node_name (services need restart)")
         else
-            echo "${c5}✗ Failed${c0}"
+            printf "\r[%d/%d] %s (%s): ${c5}✗ Failed${c0}\n" "$current" "$total_nodes" "$node_name" "$node_ip"
             failed_nodes+=("$node_name")
             failure_reasons+=("${error_msg:-Unknown error}")
         fi
@@ -1653,6 +1707,21 @@ perform_installation() {
     install_version=$(get_release_version "$release_data")
     info "Installing version: $install_version"
 
+    # Check if this is a pre-release and warn user
+    local is_prerelease
+    is_prerelease=$(get_release_prerelease_status "$release_data")
+    if [[ "$is_prerelease" == "true" ]] && [[ "$NON_INTERACTIVE" != "true" ]]; then
+        echo
+        warning "⚠️  This is a PRE-RELEASE version"
+        info "Pre-release versions may contain bugs and are not recommended for production use"
+        echo
+        read -rp "Do you want to continue? (y/N): " confirm
+        if [[ ! "$confirm" =~ ^[Yy] ]]; then
+            info "Installation cancelled"
+            return 1
+        fi
+    fi
+
     # Get download URL
     local download_url
     download_url=$(get_plugin_download_url "$release_data")
@@ -1750,7 +1819,11 @@ read_choice() {
             echo "$choice"
             return 0
         else
-            error "Invalid choice. Please enter a number between 0 and $max"
+            # Move cursor up, clear to end of screen, show error, then re-prompt
+            printf "\033[1A\033[J"
+            echo ""
+            echo "  ${c5}✗${c0} Invalid choice. Please enter a number between 0 and $max"
+            echo ""
         fi
     done
 }
@@ -1942,15 +2015,38 @@ menu_installed() {
     local current_version="$1"
 
     while true; do
+        # Refresh current version in case it was updated
+        local latest_installed_version
+        latest_installed_version=$(get_installed_version)
+        if [[ -n "$latest_installed_version" ]]; then
+            current_version="$latest_installed_version"
+        fi
+
         # Clear screen and show banner
         clear_screen
         print_banner
 
+        # Check if current version is a pre-release
+        local current_prerelease_tag=""
+        local current_is_prerelease
+        current_is_prerelease=$(get_installed_prerelease_status "$current_version" 2>/dev/null)
+        if [[ "$current_is_prerelease" == "true" ]]; then
+            current_prerelease_tag=" ${c3}(Pre-Release)${c0}"
+        fi
+
         # Check for updates
         local update_notice=""
-        local latest_version
-        if latest_version=$(check_for_updates "$current_version" 2>/dev/null); then
-            update_notice=" (Update available: v${latest_version})"
+        local update_info
+        if update_info=$(check_for_updates "$current_version" 2>/dev/null); then
+            local latest_version="${update_info%%:*}"
+            local latest_prerelease="${update_info##*:}"
+            local prerelease_tag=""
+
+            if [[ "$latest_prerelease" == "true" ]]; then
+                prerelease_tag=" ${c3}(Pre-Release)${c0}"
+            fi
+
+            update_notice=" (Update available: v${latest_version}${prerelease_tag})"
         fi
 
         # Check if backup cleanup should be offered
@@ -1971,7 +2067,7 @@ menu_installed() {
         menu_items+=("Uninstall plugin")
         max_choice=$((max_choice + 1))
 
-        show_menu "TrueNAS Plugin v${current_version} - Installed${update_notice}" "${menu_items[@]}"
+        show_menu "TrueNAS Plugin v${current_version}${current_prerelease_tag} - Installed${update_notice}" "${menu_items[@]}"
 
         local choice
         choice=$(read_choice "$max_choice")
@@ -2036,7 +2132,29 @@ menu_diagnostics() {
             "Run FIO storage benchmark"
 
         local choice
-        choice=$(read_choice 4)
+        local raw_choice
+
+        # Read choice allowing both numeric and special inputs
+        while true; do
+            read -rp "Enter choice [0-4]: " raw_choice
+
+            # Check for special extended benchmark mode
+            if [[ "$raw_choice" == "4+" ]]; then
+                EXTENDED_BENCHMARK=true
+                choice=4
+                break
+            elif [[ "$raw_choice" =~ ^[0-9]+$ ]] && [[ "$raw_choice" -ge 0 ]] && [[ "$raw_choice" -le 4 ]]; then
+                EXTENDED_BENCHMARK=false
+                choice="$raw_choice"
+                break
+            else
+                # Move cursor up, clear to end of screen, show error, then re-prompt
+                printf "\\033[1A\\033[J"
+                echo ""
+                echo "  ${c5}✗${c0} Invalid choice. Please enter a number between 0 and 4"
+                echo ""
+            fi
+        done
 
         case $choice in
             0)
@@ -2058,7 +2176,7 @@ menu_diagnostics() {
                 read -rp "Press Enter to return to diagnostics menu..."
                 ;;
             4)
-                # Run FIO benchmark
+                # Run FIO benchmark (normal or extended based on EXTENDED_BENCHMARK flag)
                 menu_fio_benchmark
                 read -rp "Press Enter to return to diagnostics menu..."
                 ;;
@@ -2136,21 +2254,52 @@ menu_plugin_test() {
         return 1
     fi
 
-    info "Available TrueNAS storage:"
-    while IFS= read -r storage; do
-        echo "  • $storage"
-    done <<< "$storages"
-    echo
+    # Prompt for storage selection with retry loop
+    local storage_name=""
+    local storage_error=""
+    local first_try=true
 
-    # Prompt for storage selection
-    local storage_name
-    read -rp "Enter storage name to test: " storage_name
+    while true; do
+        # On retry, clear screen and reshow banner
+        if [[ "$first_try" == "false" ]]; then
+            clear_screen
+            print_banner
+            echo
+            info "Plugin Function Test"
+            echo
+            info "Detecting TrueNAS storage configurations..."
+            echo
+        fi
+        first_try=false
 
-    # Validate storage exists
-    if ! echo "$storages" | grep -q "^${storage_name}$"; then
-        error "Storage '$storage_name' not found in configuration"
-        return 1
-    fi
+        # Show error if validation failed
+        if [[ -n "$storage_error" ]]; then
+            error "$storage_error"
+            echo
+            storage_error=""
+        fi
+
+        info "Available TrueNAS storage:"
+        while IFS= read -r storage; do
+            echo "  • $storage"
+        done <<< "$storages"
+        echo
+
+        read -rp "Enter storage name to test (or press Enter for first): " storage_name
+
+        if [[ -z "$storage_name" ]]; then
+            storage_name=$(echo "$storages" | head -1)
+            info "Using: $storage_name"
+            break
+        fi
+
+        # Validate storage exists
+        if echo "$storages" | grep -q "^${storage_name}$"; then
+            break
+        else
+            storage_error="Storage '$storage_name' not found in configuration"
+        fi
+    done
 
     # Clear screen and show header for test execution
     clear_screen
@@ -2175,12 +2324,23 @@ menu_fio_benchmark() {
     print_banner
     echo
 
-    # Show description and warnings
+    # Show description and warnings (adjust based on extended mode)
     info "FIO Storage Benchmark Suite"
     echo
+
+    # Adjust warnings based on extended benchmark mode
+    local test_count=30
+    local runtime="25-30 minutes"
+    if [[ "${EXTENDED_BENCHMARK:-false}" == "true" ]]; then
+        test_count=90
+        runtime="75-90 minutes"
+        info "${c3}Extended Mode Activated:${c0} Running with numjobs variations (1, 4, 8)"
+        echo
+    fi
+
     warning "This benchmark will perform the following operations:"
     echo "  • Allocate a 10GB test volume directly on storage"
-    echo "  • Run 30 comprehensive I/O tests at multiple queue depths"
+    echo "  • Run $test_count comprehensive I/O tests at multiple queue depths"
     echo "  • Test sequential/random read/write bandwidth and IOPS"
     echo "  • Test latency and mixed workload performance"
     echo "  • Automatically cleanup test volume after completion"
@@ -2188,8 +2348,11 @@ menu_fio_benchmark() {
 
     warning "Important considerations:"
     echo "  • Storage must have at least 10GB free space"
-    echo "  • Benchmarks will run for 25-30 minutes total (30 tests)"
+    echo "  • Benchmarks will run for $runtime total ($test_count tests)"
     echo "  • Each test type runs at 5 queue depths (QD=1, 16, 32, 64, 128)"
+    if [[ "${EXTENDED_BENCHMARK:-false}" == "true" ]]; then
+        echo "  • Each queue depth tested with 3 numjobs values (1, 4, 8)"
+    fi
     echo "  • Tests will generate heavy I/O load on the storage system"
     echo "  • FIO must be installed on this system (will prompt if missing)"
     echo "  • All test data will be cleaned up after completion"
@@ -2291,8 +2454,8 @@ menu_fio_benchmark() {
     info "Running benchmark on storage: $storage_name"
     echo
 
-    # Run the benchmark suite
-    run_fio_benchmark "$storage_name" || true
+    # Run the benchmark suite (pass extended flag)
+    run_fio_benchmark "$storage_name" "${EXTENDED_BENCHMARK:-false}" || true
 
     return 0
 }
@@ -2559,6 +2722,107 @@ test_snapshot_operations() {
 
     # Save snapshot name for clone test
     echo "$clone_snapshot" > /tmp/clone_snapshot_name
+
+    return 0
+}
+
+# Test 4b: Multi-disk Snapshot Operations (tests snapshot consistency with multiple disks)
+test_multidisk_snapshot_operations() {
+    # This test creates a VM with multiple disks on the same storage and verifies
+    # that snapshot creation properly validates all disks (fixes silent failures)
+    local storage_name="$1"
+    local multidisk_vm_id=$((TEST_VM_BASE + 100))
+    local snapshot_name="multidisk-snap-$(date +%s)"
+
+    printf "%-30s " "Create multi-disk VM:"
+    start_spinner
+
+    # Create VM with 2 disks on the same storage
+    if ! test_api_call POST "/nodes/$NODE_NAME/qemu" \
+        --vmid "$multidisk_vm_id" \
+        --name "test-multidisk-vm" \
+        --memory 512 \
+        --cores 1 \
+        --scsihw "virtio-scsi-pci" >/dev/null 2>&1; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Create multi-disk VM:")${c1}✗${c0} Failed"
+        return 1
+    fi
+
+    # Add first disk
+    if ! test_api_call PUT "/nodes/$NODE_NAME/qemu/$multidisk_vm_id/config" \
+        --scsi0 "${storage_name}:5" >/dev/null 2>&1; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Create multi-disk VM:")${c1}✗${c0} Failed to add disk 0"
+        return 1
+    fi
+
+    # Add second disk
+    if ! test_api_call PUT "/nodes/$NODE_NAME/qemu/$multidisk_vm_id/config" \
+        --scsi1 "${storage_name}:5" >/dev/null 2>&1; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Create multi-disk VM:")${c1}✗${c0} Failed to add disk 1"
+        return 1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Create multi-disk VM:")${c2}✓${c0} VM created with 2 disks"
+
+    printf "%-30s " "Snapshot multi-disk VM:"
+    start_spinner
+
+    # Create snapshot - both disks must succeed or fail atomically
+    output=$(test_api_call POST "/nodes/$NODE_NAME/qemu/$multidisk_vm_id/snapshot" \
+        --snapname "$snapshot_name" \
+        --description "Multi-disk snapshot test" 2>&1)
+
+    if [ $? -ne 0 ]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Snapshot multi-disk VM:")${c1}✗${c0} Snapshot creation failed"
+        return 1
+    fi
+
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 60 >/dev/null 2>&1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Snapshot multi-disk VM:")${c2}✓${c0} Snapshot created"
+
+    printf "%-30s " "Delete multi-disk snapshot:"
+    start_spinner
+
+    # Verify deletion works correctly on both disks
+    output=$(test_api_call DELETE "/nodes/$NODE_NAME/qemu/$multidisk_vm_id/snapshot/$snapshot_name" 2>&1)
+    if [ $? -ne 0 ]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Delete multi-disk snapshot:")${c1}✗${c0} Failed"
+        return 1
+    fi
+
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 60 >/dev/null 2>&1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Delete multi-disk snapshot:")${c2}✓${c0} Deleted successfully"
+
+    printf "%-30s " "Cleanup multi-disk VM:"
+    start_spinner
+
+    # Delete the test VM
+    output=$(test_api_call DELETE "/nodes/$NODE_NAME/qemu/$multidisk_vm_id" 2>&1)
+    if [ $? -ne 0 ]; then
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "Cleanup multi-disk VM:")${c1}⚠${c0} Could not delete VM"
+        return 1
+    fi
+
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        test_wait_for_task "$task_upid" 60 >/dev/null 2>&1
+    fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Cleanup multi-disk VM:")${c2}✓${c0} VM cleaned up"
 
     return 0
 }
@@ -2949,6 +3213,14 @@ run_plugin_test() {
     # Test 4: Snapshot Operations
     ((tests_total++))
     if test_snapshot_operations; then
+        ((tests_passed++))
+    else
+        ((tests_failed++))
+    fi
+
+    # Test 4b: Multi-disk Snapshot Operations
+    ((tests_total++))
+    if test_multidisk_snapshot_operations "$storage_name"; then
         ((tests_passed++))
     else
         ((tests_failed++))
@@ -3443,6 +3715,7 @@ detect_orphaned_resources() {
 # FIO benchmark orchestration function
 run_fio_benchmark() {
     local storage_name="$1"
+    local extended="${2:-false}"
     local allocated_volume=""
     local test_device=""
     local cleanup_done=false
@@ -3711,11 +3984,16 @@ run_fio_benchmark() {
     echo -e "\r$(printf "%-30s " "Validating device is unused:")${COLOR_GREEN}✓${COLOR_RESET} Device is safe to test"
 
     echo
-    info "Starting FIO benchmarks (30 tests, 25-30 minutes total)..."
+    # Adjust message based on extended mode
+    if [[ "$extended" == "true" ]]; then
+        info "Starting FIO benchmarks (90 tests, 75-90 minutes total)..."
+    else
+        info "Starting FIO benchmarks (30 tests, 25-30 minutes total)..."
+    fi
     echo
 
-    # Run benchmark tests
-    fio_run_benchmark_suite "$test_device" "$transport_mode"
+    # Run benchmark tests (pass extended flag)
+    fio_run_benchmark_suite "$test_device" "$transport_mode" "$extended"
 
     # EXIT trap will handle cleanup automatically
     return 0
@@ -3825,134 +4103,180 @@ fio_detect_device_path() {
 fio_run_benchmark_suite() {
     local device="$1"
     local transport_mode="$2"
+    local extended="${3:-false}"
 
     # Define queue depths to test - same for both transport modes
     info "Transport mode: ${transport_mode} (testing QD=1, 16, 32, 64, 128)"
+    if [[ "$extended" == "true" ]]; then
+        info "Extended mode: Testing each QD with numjobs=1, 4, 8"
+    fi
     echo
 
     local test_num=1
     local total_tests=30
+    if [[ "$extended" == "true" ]]; then
+        total_tests=90
+    fi
 
     # Arrays to store results for summary (global scope for access in fio_run_test)
     # Clear arrays from any previous runs
     test_names=()
     test_results=()
     test_values=()
+    test_numjobs=()
     declare -ga test_names
     declare -ga test_results
     declare -ga test_values
+    declare -ga test_numjobs
 
-    # Sequential Read Bandwidth - 5 queue depths
-    info "Sequential Read Bandwidth Tests: [1-5/30]"
-    fio_run_test "Queue Depth = 1:" "$device" \
-        "seq-read-qd1" "read" "1M" "1" "20" "bandwidth" "$test_num" "$total_tests"
-    ((test_num++))
-    fio_run_test "Queue Depth = 16:" "$device" \
-        "seq-read-qd16" "read" "1M" "16" "20" "bandwidth" "$test_num" "$total_tests"
-    ((test_num++))
-    fio_run_test "Queue Depth = 32:" "$device" \
-        "seq-read-qd32" "read" "1M" "32" "20" "bandwidth" "$test_num" "$total_tests"
-    ((test_num++))
-    fio_run_test "Queue Depth = 64:" "$device" \
-        "seq-read-qd64" "read" "1M" "64" "20" "bandwidth" "$test_num" "$total_tests"
-    ((test_num++))
-    fio_run_test "Queue Depth = 128:" "$device" \
-        "seq-read-qd128" "read" "1M" "128" "20" "bandwidth" "$test_num" "$total_tests"
-    ((test_num++))
+    # Determine numjobs values to test
+    local -a numjobs_values=(1)
+    if [[ "$extended" == "true" ]]; then
+        numjobs_values=(1 4 8)
+    fi
+
+    # Sequential Read Bandwidth - 5 queue depths × numjobs values
+    local test_range_end=$((test_num + 5 * ${#numjobs_values[@]} - 1))
+    info "Sequential Read Bandwidth Tests: [${test_num}-${test_range_end}/${total_tests}]"
+    for numjobs in "${numjobs_values[@]}"; do
+        local job_suffix=""
+        [[ "$extended" == "true" ]] && job_suffix=" (jobs=${numjobs})"
+        fio_run_test "Queue Depth = 1${job_suffix}:" "$device" \
+            "seq-read-qd1-jobs${numjobs}" "read" "1M" "1" "20" "bandwidth" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 16${job_suffix}:" "$device" \
+            "seq-read-qd16-jobs${numjobs}" "read" "1M" "16" "20" "bandwidth" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 32${job_suffix}:" "$device" \
+            "seq-read-qd32-jobs${numjobs}" "read" "1M" "32" "20" "bandwidth" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 64${job_suffix}:" "$device" \
+            "seq-read-qd64-jobs${numjobs}" "read" "1M" "64" "20" "bandwidth" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 128${job_suffix}:" "$device" \
+            "seq-read-qd128-jobs${numjobs}" "read" "1M" "128" "20" "bandwidth" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+    done
     echo
 
-    # Sequential Write Bandwidth - 5 queue depths
-    info "Sequential Write Bandwidth Tests: [6-10/30]"
-    fio_run_test "Queue Depth = 1:" "$device" \
-        "seq-write-qd1" "write" "1M" "1" "20" "bandwidth" "$test_num" "$total_tests"
-    ((test_num++))
-    fio_run_test "Queue Depth = 16:" "$device" \
-        "seq-write-qd16" "write" "1M" "16" "20" "bandwidth" "$test_num" "$total_tests"
-    ((test_num++))
-    fio_run_test "Queue Depth = 32:" "$device" \
-        "seq-write-qd32" "write" "1M" "32" "20" "bandwidth" "$test_num" "$total_tests"
-    ((test_num++))
-    fio_run_test "Queue Depth = 64:" "$device" \
-        "seq-write-qd64" "write" "1M" "64" "20" "bandwidth" "$test_num" "$total_tests"
-    ((test_num++))
-    fio_run_test "Queue Depth = 128:" "$device" \
-        "seq-write-qd128" "write" "1M" "128" "20" "bandwidth" "$test_num" "$total_tests"
-    ((test_num++))
+    # Sequential Write Bandwidth - 5 queue depths × numjobs values
+    test_range_end=$((test_num + 5 * ${#numjobs_values[@]} - 1))
+    info "Sequential Write Bandwidth Tests: [${test_num}-${test_range_end}/${total_tests}]"
+    for numjobs in "${numjobs_values[@]}"; do
+        local job_suffix=""
+        [[ "$extended" == "true" ]] && job_suffix=" (jobs=${numjobs})"
+        fio_run_test "Queue Depth = 1${job_suffix}:" "$device" \
+            "seq-write-qd1-jobs${numjobs}" "write" "1M" "1" "20" "bandwidth" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 16${job_suffix}:" "$device" \
+            "seq-write-qd16-jobs${numjobs}" "write" "1M" "16" "20" "bandwidth" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 32${job_suffix}:" "$device" \
+            "seq-write-qd32-jobs${numjobs}" "write" "1M" "32" "20" "bandwidth" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 64${job_suffix}:" "$device" \
+            "seq-write-qd64-jobs${numjobs}" "write" "1M" "64" "20" "bandwidth" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 128${job_suffix}:" "$device" \
+            "seq-write-qd128-jobs${numjobs}" "write" "1M" "128" "20" "bandwidth" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+    done
     echo
 
-    # Random Read IOPS - 5 queue depths
-    info "Random Read IOPS Tests: [11-15/30]"
-    fio_run_test "Queue Depth = 1:" "$device" \
-        "rand-read-qd1" "randread" "4K" "1" "30" "iops" "$test_num" "$total_tests"
-    ((test_num++))
-    fio_run_test "Queue Depth = 16:" "$device" \
-        "rand-read-qd16" "randread" "4K" "16" "30" "iops" "$test_num" "$total_tests"
-    ((test_num++))
-    fio_run_test "Queue Depth = 32:" "$device" \
-        "rand-read-qd32" "randread" "4K" "32" "30" "iops" "$test_num" "$total_tests"
-    ((test_num++))
-    fio_run_test "Queue Depth = 64:" "$device" \
-        "rand-read-qd64" "randread" "4K" "64" "30" "iops" "$test_num" "$total_tests"
-    ((test_num++))
-    fio_run_test "Queue Depth = 128:" "$device" \
-        "rand-read-qd128" "randread" "4K" "128" "30" "iops" "$test_num" "$total_tests"
-    ((test_num++))
+    # Random Read IOPS - 5 queue depths × numjobs values
+    test_range_end=$((test_num + 5 * ${#numjobs_values[@]} - 1))
+    info "Random Read IOPS Tests: [${test_num}-${test_range_end}/${total_tests}]"
+    for numjobs in "${numjobs_values[@]}"; do
+        local job_suffix=""
+        [[ "$extended" == "true" ]] && job_suffix=" (jobs=${numjobs})"
+        fio_run_test "Queue Depth = 1${job_suffix}:" "$device" \
+            "rand-read-qd1-jobs${numjobs}" "randread" "4K" "1" "30" "iops" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 16${job_suffix}:" "$device" \
+            "rand-read-qd16-jobs${numjobs}" "randread" "4K" "16" "30" "iops" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 32${job_suffix}:" "$device" \
+            "rand-read-qd32-jobs${numjobs}" "randread" "4K" "32" "30" "iops" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 64${job_suffix}:" "$device" \
+            "rand-read-qd64-jobs${numjobs}" "randread" "4K" "64" "30" "iops" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 128${job_suffix}:" "$device" \
+            "rand-read-qd128-jobs${numjobs}" "randread" "4K" "128" "30" "iops" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+    done
     echo
 
-    # Random Write IOPS - 5 queue depths
-    info "Random Write IOPS Tests: [16-20/30]"
-    fio_run_test "Queue Depth = 1:" "$device" \
-        "rand-write-qd1" "randwrite" "4K" "1" "30" "iops" "$test_num" "$total_tests"
-    ((test_num++))
-    fio_run_test "Queue Depth = 16:" "$device" \
-        "rand-write-qd16" "randwrite" "4K" "16" "30" "iops" "$test_num" "$total_tests"
-    ((test_num++))
-    fio_run_test "Queue Depth = 32:" "$device" \
-        "rand-write-qd32" "randwrite" "4K" "32" "30" "iops" "$test_num" "$total_tests"
-    ((test_num++))
-    fio_run_test "Queue Depth = 64:" "$device" \
-        "rand-write-qd64" "randwrite" "4K" "64" "30" "iops" "$test_num" "$total_tests"
-    ((test_num++))
-    fio_run_test "Queue Depth = 128:" "$device" \
-        "rand-write-qd128" "randwrite" "4K" "128" "30" "iops" "$test_num" "$total_tests"
-    ((test_num++))
+    # Random Write IOPS - 5 queue depths × numjobs values
+    test_range_end=$((test_num + 5 * ${#numjobs_values[@]} - 1))
+    info "Random Write IOPS Tests: [${test_num}-${test_range_end}/${total_tests}]"
+    for numjobs in "${numjobs_values[@]}"; do
+        local job_suffix=""
+        [[ "$extended" == "true" ]] && job_suffix=" (jobs=${numjobs})"
+        fio_run_test "Queue Depth = 1${job_suffix}:" "$device" \
+            "rand-write-qd1-jobs${numjobs}" "randwrite" "4K" "1" "30" "iops" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 16${job_suffix}:" "$device" \
+            "rand-write-qd16-jobs${numjobs}" "randwrite" "4K" "16" "30" "iops" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 32${job_suffix}:" "$device" \
+            "rand-write-qd32-jobs${numjobs}" "randwrite" "4K" "32" "30" "iops" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 64${job_suffix}:" "$device" \
+            "rand-write-qd64-jobs${numjobs}" "randwrite" "4K" "64" "30" "iops" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 128${job_suffix}:" "$device" \
+            "rand-write-qd128-jobs${numjobs}" "randwrite" "4K" "128" "30" "iops" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+    done
     echo
 
-    # Random Read Latency - 5 queue depths
-    info "Random Read Latency Tests: [21-25/30]"
-    fio_run_test "Queue Depth = 1:" "$device" \
-        "rand-read-lat-qd1" "randread" "4K" "1" "20" "latency" "$test_num" "$total_tests"
-    ((test_num++))
-    fio_run_test "Queue Depth = 16:" "$device" \
-        "rand-read-lat-qd16" "randread" "4K" "16" "20" "latency" "$test_num" "$total_tests"
-    ((test_num++))
-    fio_run_test "Queue Depth = 32:" "$device" \
-        "rand-read-lat-qd32" "randread" "4K" "32" "20" "latency" "$test_num" "$total_tests"
-    ((test_num++))
-    fio_run_test "Queue Depth = 64:" "$device" \
-        "rand-read-lat-qd64" "randread" "4K" "64" "20" "latency" "$test_num" "$total_tests"
-    ((test_num++))
-    fio_run_test "Queue Depth = 128:" "$device" \
-        "rand-read-lat-qd128" "randread" "4K" "128" "20" "latency" "$test_num" "$total_tests"
-    ((test_num++))
+    # Random Read Latency - 5 queue depths × numjobs values
+    test_range_end=$((test_num + 5 * ${#numjobs_values[@]} - 1))
+    info "Random Read Latency Tests: [${test_num}-${test_range_end}/${total_tests}]"
+    for numjobs in "${numjobs_values[@]}"; do
+        local job_suffix=""
+        [[ "$extended" == "true" ]] && job_suffix=" (jobs=${numjobs})"
+        fio_run_test "Queue Depth = 1${job_suffix}:" "$device" \
+            "rand-read-lat-qd1-jobs${numjobs}" "randread" "4K" "1" "20" "latency" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 16${job_suffix}:" "$device" \
+            "rand-read-lat-qd16-jobs${numjobs}" "randread" "4K" "16" "20" "latency" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 32${job_suffix}:" "$device" \
+            "rand-read-lat-qd32-jobs${numjobs}" "randread" "4K" "32" "20" "latency" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 64${job_suffix}:" "$device" \
+            "rand-read-lat-qd64-jobs${numjobs}" "randread" "4K" "64" "20" "latency" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 128${job_suffix}:" "$device" \
+            "rand-read-lat-qd128-jobs${numjobs}" "randread" "4K" "128" "20" "latency" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+    done
     echo
 
-    # Mixed 70/30 Workload - 5 queue depths
-    info "Mixed 70/30 Workload Tests: [26-30/30]"
-    fio_run_test "Queue Depth = 1:" "$device" \
-        "mixed-7030-qd1" "randrw" "4K" "1" "30" "mixed" "$test_num" "$total_tests"
-    ((test_num++))
-    fio_run_test "Queue Depth = 16:" "$device" \
-        "mixed-7030-qd16" "randrw" "4K" "16" "30" "mixed" "$test_num" "$total_tests"
-    ((test_num++))
-    fio_run_test "Queue Depth = 32:" "$device" \
-        "mixed-7030-qd32" "randrw" "4K" "32" "30" "mixed" "$test_num" "$total_tests"
-    ((test_num++))
-    fio_run_test "Queue Depth = 64:" "$device" \
-        "mixed-7030-qd64" "randrw" "4K" "64" "30" "mixed" "$test_num" "$total_tests"
-    ((test_num++))
-    fio_run_test "Queue Depth = 128:" "$device" \
-        "mixed-7030-qd128" "randrw" "4K" "128" "30" "mixed" "$test_num" "$total_tests"
+    # Mixed 70/30 Workload - 5 queue depths × numjobs values
+    test_range_end=$((test_num + 5 * ${#numjobs_values[@]} - 1))
+    info "Mixed 70/30 Workload Tests: [${test_num}-${test_range_end}/${total_tests}]"
+    for numjobs in "${numjobs_values[@]}"; do
+        local job_suffix=""
+        [[ "$extended" == "true" ]] && job_suffix=" (jobs=${numjobs})"
+        fio_run_test "Queue Depth = 1${job_suffix}:" "$device" \
+            "mixed-7030-qd1-jobs${numjobs}" "randrw" "4K" "1" "30" "mixed" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 16${job_suffix}:" "$device" \
+            "mixed-7030-qd16-jobs${numjobs}" "randrw" "4K" "16" "30" "mixed" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 32${job_suffix}:" "$device" \
+            "mixed-7030-qd32-jobs${numjobs}" "randrw" "4K" "32" "30" "mixed" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 64${job_suffix}:" "$device" \
+            "mixed-7030-qd64-jobs${numjobs}" "randrw" "4K" "64" "30" "mixed" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+        fio_run_test "Queue Depth = 128${job_suffix}:" "$device" \
+            "mixed-7030-qd128-jobs${numjobs}" "randrw" "4K" "128" "30" "mixed" "$test_num" "$total_tests" "$numjobs"
+        ((test_num++))
+    done
 
     # Display benchmark summary
     echo
@@ -3979,102 +4303,131 @@ fio_run_benchmark_suite() {
     echo
 
     # Show top performers in each category
-    info "Top Performers:"
-    echo
+    # In extended mode, show separate sections for each numjobs value
+    local -a numjobs_list=(1)
+    if [[ "$extended" == "true" ]]; then
+        numjobs_list=(1 4 8)
+    fi
 
     # Map test index to queue depth (0=QD1, 1=QD16, 2=QD32, 3=QD64, 4=QD128)
     local qd_map=(1 16 32 64 128)
 
-    # Find best sequential read bandwidth (test indices 0-4)
-    local best_seq_read_idx=0
-    local best_seq_read_value=0
-    local value unit
-    for i in 0 1 2 3 4; do
-        if [[ "${test_values[$i]:-}" == "pass" ]]; then
-            value=$(echo "${test_results[$i]}" | grep -oP '^[0-9.]+')
-            unit=$(echo "${test_results[$i]}" | grep -oP '(MB|GB)/s')
-            # Normalize to MB/s for comparison
-            if [[ "$unit" == "GB/s" ]]; then
-                value=$(awk "BEGIN {printf \"%.2f\", $value * 1024}")
-            fi
-            if (( $(echo "$value > $best_seq_read_value" | bc -l 2>/dev/null || echo 0) )); then
-                best_seq_read_value=$value
-                best_seq_read_idx=$i
-            fi
+    for target_numjobs in "${numjobs_list[@]}"; do
+        if [[ "$extended" == "true" ]]; then
+            echo
+            info "Top Performers (numjobs=${target_numjobs}):"
+        else
+            info "Top Performers:"
         fi
-    done
-    local seq_read_qd=${qd_map[$((best_seq_read_idx % 5))]}
-    printf "  %-22s %20s   (QD=%-3s)\n" "Sequential Read:" "${test_results[$best_seq_read_idx]}" "$seq_read_qd"
+        echo
 
-    # Find best sequential write bandwidth (test indices 5-9)
-    local best_seq_write_idx=5
-    local best_seq_write_value=0
-    for i in 5 6 7 8 9; do
-        if [[ "${test_values[$i]:-}" == "pass" ]]; then
-            value=$(echo "${test_results[$i]}" | grep -oP '^[0-9.]+')
-            unit=$(echo "${test_results[$i]}" | grep -oP '(MB|GB)/s')
-            # Normalize to MB/s for comparison
-            if [[ "$unit" == "GB/s" ]]; then
-                value=$(awk "BEGIN {printf \"%.2f\", $value * 1024}")
+        # Find best sequential read bandwidth (filter by target numjobs)
+        local best_seq_read_idx=-1
+        local best_seq_read_value=0
+        local value unit
+        for i in "${!test_names[@]}"; do
+            # Filter: sequential read tests with matching numjobs
+            if [[ "${test_names[$i]}" =~ ^seq-read- ]] && [[ "${test_numjobs[$i]:-1}" == "$target_numjobs" ]] && [[ "${test_values[$i]:-}" == "pass" ]]; then
+                value=$(echo "${test_results[$i]}" | grep -oP '^[0-9.]+')
+                unit=$(echo "${test_results[$i]}" | grep -oP '(MB|GB)/s')
+                # Normalize to MB/s for comparison
+                if [[ "$unit" == "GB/s" ]]; then
+                    value=$(awk "BEGIN {printf \"%.2f\", $value * 1024}")
+                fi
+                if (( $(echo "$value > $best_seq_read_value" | bc -l 2>/dev/null || echo 0) )); then
+                    best_seq_read_value=$value
+                    best_seq_read_idx=$i
+                fi
             fi
-            if (( $(echo "$value > $best_seq_write_value" | bc -l 2>/dev/null || echo 0) )); then
-                best_seq_write_value=$value
-                best_seq_write_idx=$i
-            fi
+        done
+        if [[ $best_seq_read_idx -ge 0 ]]; then
+            # Extract QD from test name (e.g., seq-read-qd64-jobs1 -> 64)
+            local seq_read_qd=$(echo "${test_names[$best_seq_read_idx]}" | grep -oP 'qd\K[0-9]+')
+            printf "  %-22s %20s   (QD=%-3s)\n" "Sequential Read:" "${test_results[$best_seq_read_idx]}" "$seq_read_qd"
         fi
-    done
-    local seq_write_qd=${qd_map[$((best_seq_write_idx % 5))]}
-    printf "  %-22s %20s   (QD=%-3s)\n" "Sequential Write:" "${test_results[$best_seq_write_idx]}" "$seq_write_qd"
 
-    # Find best random read IOPS (test indices 10-14)
-    local best_rand_read_idx=10
-    local best_rand_read_value=0
-    for i in 10 11 12 13 14; do
-        if [[ "${test_values[$i]:-}" == "pass" ]]; then
-            local value=$(echo "${test_results[$i]}" | tr -d ',' | grep -oP '^[0-9.]+')
-            if [[ -n "$value" ]] && (( $(echo "$value > $best_rand_read_value" | bc -l 2>/dev/null || echo 0) )); then
-                best_rand_read_value=$value
-                best_rand_read_idx=$i
+        # Find best sequential write bandwidth (filter by target numjobs)
+        local best_seq_write_idx=-1
+        local best_seq_write_value=0
+        for i in "${!test_names[@]}"; do
+            # Filter: sequential write tests with matching numjobs
+            if [[ "${test_names[$i]}" =~ ^seq-write- ]] && [[ "${test_numjobs[$i]:-1}" == "$target_numjobs" ]] && [[ "${test_values[$i]:-}" == "pass" ]]; then
+                value=$(echo "${test_results[$i]}" | grep -oP '^[0-9.]+')
+                unit=$(echo "${test_results[$i]}" | grep -oP '(MB|GB)/s')
+                # Normalize to MB/s for comparison
+                if [[ "$unit" == "GB/s" ]]; then
+                    value=$(awk "BEGIN {printf \"%.2f\", $value * 1024}")
+                fi
+                if (( $(echo "$value > $best_seq_write_value" | bc -l 2>/dev/null || echo 0) )); then
+                    best_seq_write_value=$value
+                    best_seq_write_idx=$i
+                fi
             fi
+        done
+        if [[ $best_seq_write_idx -ge 0 ]]; then
+            local seq_write_qd=$(echo "${test_names[$best_seq_write_idx]}" | grep -oP 'qd\K[0-9]+')
+            printf "  %-22s %20s   (QD=%-3s)\n" "Sequential Write:" "${test_results[$best_seq_write_idx]}" "$seq_write_qd"
         fi
-    done
-    local rand_read_qd=${qd_map[$((best_rand_read_idx % 5))]}
-    printf "  %-22s %20s   (QD=%-3s)\n" "Random Read IOPS:" "${test_results[$best_rand_read_idx]}" "$rand_read_qd"
 
-    # Find best random write IOPS (test indices 15-19)
-    local best_rand_write_idx=15
-    local best_rand_write_value=0
-    for i in 15 16 17 18 19; do
-        if [[ "${test_values[$i]:-}" == "pass" ]]; then
-            local value=$(echo "${test_results[$i]}" | tr -d ',' | grep -oP '^[0-9.]+')
-            if [[ -n "$value" ]] && (( $(echo "$value > $best_rand_write_value" | bc -l 2>/dev/null || echo 0) )); then
-                best_rand_write_value=$value
-                best_rand_write_idx=$i
+        # Find best random read IOPS (filter by target numjobs)
+        local best_rand_read_idx=-1
+        local best_rand_read_value=0
+        for i in "${!test_names[@]}"; do
+            # Filter: random read tests with matching numjobs
+            if [[ "${test_names[$i]}" =~ ^rand-read-qd ]] && [[ "${test_numjobs[$i]:-1}" == "$target_numjobs" ]] && [[ "${test_values[$i]:-}" == "pass" ]]; then
+                local value=$(echo "${test_results[$i]}" | tr -d ',' | grep -oP '^[0-9.]+')
+                if [[ -n "$value" ]] && (( $(echo "$value > $best_rand_read_value" | bc -l 2>/dev/null || echo 0) )); then
+                    best_rand_read_value=$value
+                    best_rand_read_idx=$i
+                fi
             fi
+        done
+        if [[ $best_rand_read_idx -ge 0 ]]; then
+            local rand_read_qd=$(echo "${test_names[$best_rand_read_idx]}" | grep -oP 'qd\K[0-9]+')
+            printf "  %-22s %20s   (QD=%-3s)\n" "Random Read IOPS:" "${test_results[$best_rand_read_idx]}" "$rand_read_qd"
         fi
-    done
-    local rand_write_qd=${qd_map[$((best_rand_write_idx % 5))]}
-    printf "  %-22s %20s   (QD=%-3s)\n" "Random Write IOPS:" "${test_results[$best_rand_write_idx]}" "$rand_write_qd"
 
-    # Find best (lowest) latency (test indices 20-24)
-    local best_latency_idx=20
-    local best_latency_value=999999999
-    for i in 20 21 22 23 24; do
-        if [[ "${test_values[$i]:-}" == "pass" ]]; then
-            value=$(echo "${test_results[$i]}" | grep -oP '^[0-9.]+')
-            unit=$(echo "${test_results[$i]}" | grep -oP '(µs|ms)')
-            # Normalize to µs for comparison (lower is better)
-            if [[ "$unit" == "ms" ]]; then
-                value=$(awk "BEGIN {printf \"%.2f\", $value * 1000}")
+        # Find best random write IOPS (filter by target numjobs)
+        local best_rand_write_idx=-1
+        local best_rand_write_value=0
+        for i in "${!test_names[@]}"; do
+            # Filter: random write tests with matching numjobs
+            if [[ "${test_names[$i]}" =~ ^rand-write-qd ]] && [[ "${test_numjobs[$i]:-1}" == "$target_numjobs" ]] && [[ "${test_values[$i]:-}" == "pass" ]]; then
+                local value=$(echo "${test_results[$i]}" | tr -d ',' | grep -oP '^[0-9.]+')
+                if [[ -n "$value" ]] && (( $(echo "$value > $best_rand_write_value" | bc -l 2>/dev/null || echo 0) )); then
+                    best_rand_write_value=$value
+                    best_rand_write_idx=$i
+                fi
             fi
-            if [[ -n "$value" ]] && (( $(echo "$value < $best_latency_value" | bc -l 2>/dev/null || echo 0) )); then
-                best_latency_value=$value
-                best_latency_idx=$i
-            fi
+        done
+        if [[ $best_rand_write_idx -ge 0 ]]; then
+            local rand_write_qd=$(echo "${test_names[$best_rand_write_idx]}" | grep -oP 'qd\K[0-9]+')
+            printf "  %-22s %20s   (QD=%-3s)\n" "Random Write IOPS:" "${test_results[$best_rand_write_idx]}" "$rand_write_qd"
         fi
-    done
-    local latency_qd=${qd_map[$((best_latency_idx % 5))]}
-    printf "  %-22s %20s   (QD=%-3s)\n" "Lowest Latency:" "${test_results[$best_latency_idx]}" "$latency_qd"
+
+        # Find best (lowest) latency (filter by target numjobs)
+        local best_latency_idx=-1
+        local best_latency_value=999999999
+        for i in "${!test_names[@]}"; do
+            # Filter: latency tests with matching numjobs
+            if [[ "${test_names[$i]}" =~ ^rand-read-lat- ]] && [[ "${test_numjobs[$i]:-1}" == "$target_numjobs" ]] && [[ "${test_values[$i]:-}" == "pass" ]]; then
+                value=$(echo "${test_results[$i]}" | grep -oP '^[0-9.]+')
+                unit=$(echo "${test_results[$i]}" | grep -oP '(µs|ms)')
+                # Normalize to µs for comparison (lower is better)
+                if [[ "$unit" == "ms" ]]; then
+                    value=$(awk "BEGIN {printf \"%.2f\", $value * 1000}")
+                fi
+                if [[ -n "$value" ]] && (( $(echo "$value < $best_latency_value" | bc -l 2>/dev/null || echo 0) )); then
+                    best_latency_value=$value
+                    best_latency_idx=$i
+                fi
+            fi
+        done
+        if [[ $best_latency_idx -ge 0 ]]; then
+            local latency_qd=$(echo "${test_names[$best_latency_idx]}" | grep -oP 'qd\K[0-9]+')
+            printf "  %-22s %20s   (QD=%-3s)\n" "Lowest Latency:" "${test_results[$best_latency_idx]}" "$latency_qd"
+        fi
+    done  # End of numjobs loop
 
     echo
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -4092,6 +4445,7 @@ fio_run_test() {
     local metric_type="$8"
     local test_num="${9:-0}"
     local total_tests="${10:-0}"
+    local numjobs="${11:-1}"
 
     # Validate device is not in use before starting test
     if command -v lsof &>/dev/null; then
@@ -4116,6 +4470,11 @@ fio_run_test() {
     # Build FIO command with appropriate parameters
     # Note: --size parameter is required for device paths that FIO cannot auto-query (e.g., iSCSI symlinks)
     local fio_cmd="fio --name=${test_name} --ioengine=libaio --direct=1 --rw=${rw_mode} --bs=${block_size} --iodepth=${iodepth} --runtime=${runtime} --time_based --size=10G --group_reporting --filename=${device} --output-format=json"
+
+    # Add numjobs parameter if > 1
+    if [[ "$numjobs" -gt 1 ]]; then
+        fio_cmd+=" --numjobs=${numjobs}"
+    fi
 
     # Add mixed workload specific parameters
     if [[ "$metric_type" == "mixed" ]]; then
@@ -4150,6 +4509,7 @@ fio_run_test() {
         test_names+=("${test_name}")
         test_results+=("Failed")
         test_values+=("fail")
+        test_numjobs+=("${numjobs}")
 
         rm -f "$json_output"
         return 1
@@ -4179,6 +4539,7 @@ fio_run_test() {
     test_names+=("${test_name}")
     test_results+=("${result_text}")
     test_values+=("pass")
+    test_numjobs+=("${numjobs}")
 
     # Cleanup
     rm -f "$json_output"
@@ -4457,6 +4818,62 @@ run_health_check() {
         check_result "Dataset" "CRITICAL" "Not configured"
     fi
 
+    # Check 6.5: Dataset type validation (must be FILESYSTEM, not VOLUME)
+    local api_key
+    api_key=$(get_storage_config_value "$storage_name" "api_key")
+    local api_insecure
+    api_insecure=$(get_storage_config_value "$storage_name" "api_insecure")
+
+    if [[ -n "$dataset" ]] && [[ -n "$api_host" ]] && [[ -n "$api_key" ]]; then
+        printf "%-30s " "Dataset type:"
+        start_spinner
+
+        local curl_opts="-s"
+        [[ "$api_insecure" == "1" ]] && curl_opts="$curl_opts -k"
+
+        # Make API call to fetch all datasets
+        local dataset_info
+        dataset_info=$(curl $curl_opts -H "Authorization: Bearer $api_key" \
+            "https://$api_host/api/v2.0/pool/dataset" 2>/dev/null)
+        local api_status=$?
+
+        stop_spinner
+
+        if [[ $api_status -ne 0 ]] || [[ -z "$dataset_info" ]]; then
+            # API call failed - warn but don't fail critically
+            local dataset_result="${COLOR_YELLOW}⚠${COLOR_RESET} Cannot validate (API error)"
+            echo -e "\r$(printf "%-30s " "Dataset type:")${dataset_result}"
+            ((warnings++))
+            ((checks_total++))
+        else
+            # Parse JSON to find our dataset and extract its type
+            # We need to find the entry with matching "id" and get its "type" field
+            local ds_type
+            ds_type=$(echo "$dataset_info" | grep -B2 -A10 "\"id\": *\"$dataset\"" | \
+                grep '"type"' | head -1 | sed -E 's/.*"type": *"([^"]+)".*/\1/')
+
+            local dataset_result
+            if [[ "$ds_type" == "FILESYSTEM" ]]; then
+                dataset_result="${COLOR_GREEN}✓${COLOR_RESET} FILESYSTEM (correct)"
+                ((checks_passed++))
+            elif [[ "$ds_type" == "VOLUME" ]]; then
+                dataset_result="${COLOR_RED}✗${COLOR_RESET} VOLUME (must be FILESYSTEM - zvols cannot have child zvols)"
+                ((errors++))
+            elif [[ -n "$ds_type" ]]; then
+                dataset_result="${COLOR_YELLOW}⚠${COLOR_RESET} Unknown type: $ds_type"
+                ((warnings++))
+            else
+                dataset_result="${COLOR_RED}✗${COLOR_RESET} Dataset not found on TrueNAS"
+                ((errors++))
+            fi
+
+            echo -e "\r$(printf "%-30s " "Dataset type:")${dataset_result}"
+            ((checks_total++))
+        fi
+    else
+        check_result "Dataset type" "SKIP" "Missing dataset or API config"
+    fi
+
     # Detect transport mode
     local transport_mode
     transport_mode=$(get_storage_config_value "$storage_name" "transport_mode")
@@ -4680,6 +5097,41 @@ run_health_check() {
         check_result "PVE daemon" "CRITICAL" "Not running"
     fi
 
+    # Check 13: Weight volume presence (iSCSI only)
+    if [[ "$transport_mode" == "iscsi" ]]; then
+        local weight_zvol="${dataset}/pve-plugin-weight"
+        local weight_encoded=$(echo "$weight_zvol" | sed 's/\//%2F/g')
+        local weight_check_failed=0
+
+        # Check if weight zvol exists via API
+        local zvol_response=$(curl -sk -H "Authorization: Bearer $api_key" \
+            "https://$api_host/api/v2.0/pool/dataset/id/$weight_encoded" 2>/dev/null)
+
+        if ! echo "$zvol_response" | grep -q '"id"'; then
+            check_result "Weight volume presence" "WARNING" "Weight zvol missing"
+            weight_check_failed=1
+        fi
+
+        # Check if weight extent exists (only if zvol exists)
+        if [[ $weight_check_failed -eq 0 ]]; then
+            local extent_response=$(curl -sk -H "Authorization: Bearer $api_key" \
+                "https://$api_host/api/v2.0/iscsi/extent" 2>/dev/null)
+
+            if ! echo "$extent_response" | grep -q '"name": "pve-plugin-weight"'; then
+                check_result "Weight volume presence" "WARNING" "Weight extent missing"
+                weight_check_failed=1
+            fi
+        fi
+
+        # If both exist, report OK
+        if [[ $weight_check_failed -eq 0 ]]; then
+            check_result "Weight volume presence" "OK" "Present and configured"
+        fi
+    else
+        # NVMe/TCP mode - skip weight check (not applicable)
+        check_result "Weight volume presence" "SKIP" "Not applicable for NVMe/TCP"
+    fi
+
     # Summary
     echo
     info "Health Summary:"
@@ -4715,11 +5167,56 @@ menu_install_specific_version() {
         return 1
     }
 
-    # Parse versions into array
+    # Parse versions and prerelease status into arrays
     local -a version_array=()
-    while IFS= read -r version; do
-        version_array+=("$version")
-    done < <(echo "$releases" | grep -Po '"tag_name":\s*"\K[^"]+' | sed 's/^v//' | head -20)
+    local -a prerelease_array=()
+
+    # Split releases JSON into individual release objects
+    # Accumulate lines between release objects and process complete blocks
+    local release_count=0
+    local current_block=""
+    local tag_name=""
+    local is_prerelease=""
+    local version=""
+
+    while IFS= read -r line; do
+        # Start of a new release object (when we see "url" field at object start)
+        # Use [[ =~ ]] instead of grep -q to avoid set -e issues
+        if [[ "$line" =~ ^[[:space:]]*\"url\":[[:space:]]*\"https://api.github.com ]]; then
+            # Process previous block if it exists
+            if [[ -n "$current_block" ]] && [[ $release_count -lt 20 ]]; then
+                tag_name=$(echo "$current_block" | grep -Po '"tag_name":[[:space:]]*"\K[^"]+' 2>/dev/null || echo "")
+                is_prerelease=$(echo "$current_block" | grep -Po '"prerelease":[[:space:]]*\K(true|false)' 2>/dev/null || echo "false")
+
+                if [[ -n "$tag_name" ]]; then
+                    version="${tag_name#v}"
+                    version_array+=("$version")
+                    prerelease_array+=("$is_prerelease")
+                    release_count=$((release_count + 1))
+                fi
+            fi
+            # Start new block
+            current_block="$line"
+        elif [[ -n "$current_block" ]]; then
+            # Continue accumulating current block
+            current_block+=$'\n'"$line"
+            # Process block when we see "published_at" (end of metadata we need)
+            if [[ "$line" =~ \"published_at\" ]]; then
+                if [[ $release_count -lt 20 ]]; then
+                    tag_name=$(echo "$current_block" | grep -Po '"tag_name":[[:space:]]*"\K[^"]+' 2>/dev/null || echo "")
+                    is_prerelease=$(echo "$current_block" | grep -Po '"prerelease":[[:space:]]*\K(true|false)' 2>/dev/null || echo "false")
+
+                    if [[ -n "$tag_name" ]]; then
+                        version="${tag_name#v}"
+                        version_array+=("$version")
+                        prerelease_array+=("$is_prerelease")
+                        release_count=$((release_count + 1))
+                    fi
+                fi
+                current_block=""
+            fi
+        fi
+    done <<< "$releases"
 
     if [[ ${#version_array[@]} -eq 0 ]]; then
         error "No versions found"
@@ -4727,11 +5224,22 @@ menu_install_specific_version() {
         return 1
     fi
 
-    # Build menu items with version info
+    # Build menu items with version info and pre-release indicators
     local -a menu_items=()
-    for version in "${version_array[@]}"; do
-        # Try to get release name and date (simplified version without parsing full JSON)
-        menu_items+=("v${version}")
+    local menu_version=""
+    local menu_is_prerelease=""
+    local menu_indicator=""
+
+    for i in "${!version_array[@]}"; do
+        menu_version="${version_array[$i]}"
+        menu_is_prerelease="${prerelease_array[$i]}"
+        menu_indicator=""
+
+        if [[ "$menu_is_prerelease" == "true" ]]; then
+            menu_indicator=" ${c3}(Pre-Release)${c0}"
+        fi
+
+        menu_items+=("v${menu_version}${menu_indicator}")
     done
 
     show_menu "Select version to install" "${menu_items[@]}"
@@ -4746,9 +5254,46 @@ menu_install_specific_version() {
     # Get selected version (adjust for 1-indexed menu)
     local selected_version="${version_array[$((choice-1))]}"
 
-    if perform_installation "$selected_version"; then
-        # Prompt to configure storage after successful installation
-        if [[ "$NON_INTERACTIVE" != "true" ]]; then
+    # Check if this is a cluster node and prompt for installation scope
+    local install_cluster_wide=false
+    if is_cluster_node && [[ "$NON_INTERACTIVE" != "true" ]]; then
+        echo
+        info "Cluster detected"
+        echo "  1) Install on local node only"
+        echo "  2) Install on all cluster nodes"
+        echo
+        local scope_choice
+        while true; do
+            read -rp "Enter choice [1-2]: " scope_choice
+            if [[ "$scope_choice" == "1" ]]; then
+                install_cluster_wide=false
+                break
+            elif [[ "$scope_choice" == "2" ]]; then
+                install_cluster_wide=true
+                break
+            else
+                error "Invalid choice. Please enter 1 or 2"
+            fi
+        done
+    fi
+
+    # Perform installation based on scope
+    local install_success=false
+    if [[ "$install_cluster_wide" == "true" ]]; then
+        if perform_cluster_wide_installation "$selected_version"; then
+            install_success=true
+        fi
+    else
+        if perform_installation "$selected_version"; then
+            install_success=true
+        fi
+    fi
+
+    # Post-installation actions
+    if [[ "$install_success" == "true" ]]; then
+        # Only prompt to configure storage for local installations
+        # (cluster-wide shows next steps automatically)
+        if [[ "$install_cluster_wide" == "false" ]] && [[ "$NON_INTERACTIVE" != "true" ]]; then
             echo
             read -rp "Would you like to configure storage now? (y/N): " response
             if [[ "$response" =~ ^[Yy] ]]; then
@@ -5086,7 +5631,7 @@ generate_storage_config() {
     local dataset="$4"
     local target_or_nqn="$5"  # target_iqn for iSCSI, subsystem_nqn for NVMe
     local portal="${6:-}"
-    local blocksize="${7:-16k}"
+    local blocksize="${7:-16K}"
     local sparse="${8:-1}"
     local use_multipath="${9:-}"
     local portals="${10:-}"
@@ -5230,7 +5775,7 @@ menu_edit_storage() {
     echo "  Dataset:            $dataset ${c3}(cannot be changed)${c0}"
 
     # Block size (immutable - cannot change after volumes created)
-    local blocksize="${config_values[zvol_blocksize]:-16k}"
+    local blocksize="${config_values[zvol_blocksize]:-16K}"
     echo "  Block size:         $blocksize ${c3}(cannot be changed)${c0}"
 
     # Transport-specific immutable fields
@@ -5716,8 +6261,8 @@ menu_configure_storage() {
 
     # Blocksize (optional)
     local blocksize
-    read -rp "Block size [16k]: " blocksize
-    blocksize="${blocksize:-16k}"
+    read -rp "Block size [16K]: " blocksize
+    blocksize="${blocksize:-16K}"
 
     # Sparse (optional)
     local sparse

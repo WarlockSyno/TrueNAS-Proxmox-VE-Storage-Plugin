@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '1.1.3';
+our $VERSION = '1.1.7';
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -784,26 +784,64 @@ sub _ws_read_exact {
 }
 sub _ws_recv_text {
     my $sock = shift;
-    my $hdr;
-    _ws_read_exact($sock, \$hdr, 2) or die "WS read hdr failed";
-    my ($b1, $b2) = unpack('CC', $hdr);
-    my $opcode = $b1 & 0x0f;
-    die "WS: unexpected opcode $opcode" if $opcode != 1; # text only
-    my $masked = ($b2 & 0x80) ? 1 : 0; # server MUST NOT mask
-    my $len    = ($b2 & 0x7f);
-    if ($len == 126) {
-        my $ext; _ws_read_exact($sock, \$ext, 2) or die "WS len16 read fail";
-        $len = unpack('n', $ext);
-    } elsif ($len == 127) {
-        my $ext; _ws_read_exact($sock, \$ext, 8) or die "WS len64 read fail";
-        $len = unpack('Q>', $ext);
+    my $message = ''; # Accumulator for fragmented messages
+
+    while (1) {
+        my $hdr;
+        _ws_read_exact($sock, \$hdr, 2) or die "WS read hdr failed";
+        my ($b1, $b2) = unpack('CC', $hdr);
+        my $fin    = ($b1 & 0x80) ? 1 : 0; # FIN bit
+        my $opcode = $b1 & 0x0f;
+        my $masked = ($b2 & 0x80) ? 1 : 0; # server MUST NOT mask
+        my $len    = ($b2 & 0x7f);
+
+        if ($len == 126) {
+            my $ext; _ws_read_exact($sock, \$ext, 2) or die "WS len16 read fail";
+            $len = unpack('n', $ext);
+        } elsif ($len == 127) {
+            my $ext; _ws_read_exact($sock, \$ext, 8) or die "WS len64 read fail";
+            $len = unpack('Q>', $ext);
+        }
+
+        my $mask_key = '';
+        if ($masked) { _ws_read_exact($sock, \$mask_key, 4) or die "WS unexpected mask"; }
+
+        my $payload = '';
+        if ($len > 0) {
+            _ws_read_exact($sock, \$payload, $len) or die "WS payload read fail";
+            if ($masked) { $payload = _xor_mask($payload, $mask_key); }
+        }
+
+        # Handle different frame types
+        if ($opcode == 0x01) {
+            # Text frame (start of message or unfragmented message)
+            $message = $payload;
+            return $message if $fin; # Complete unfragmented message
+            # Otherwise, continue reading continuation frames
+        } elsif ($opcode == 0x00) {
+            # Continuation frame
+            $message .= $payload;
+            return $message if $fin; # Complete fragmented message
+        } elsif ($opcode == 0x08) {
+            # Close frame
+            my $code = $len >= 2 ? unpack('n', substr($payload, 0, 2)) : 0;
+            my $reason = $len > 2 ? substr($payload, 2) : '';
+            die "WS closed by server (code: $code, reason: $reason)";
+        } elsif ($opcode == 0x09) {
+            # Ping frame - respond with pong
+            my $pong_hdr = pack('C', 0x8A); # FIN=1, opcode=0xA
+            my $pong_len;
+            if ($len <= 125)       { $pong_len = pack('C', $len); }
+            elsif ($len <= 0xFFFF) { $pong_len = pack('C n', 126, $len); }
+            else                   { $pong_len = pack('C Q>', 127, $len); }
+            $sock->syswrite($pong_hdr . $pong_len . $payload);
+            # Continue reading next frame
+        } elsif ($opcode == 0x0A) {
+            # Pong frame - ignore and continue
+        } else {
+            die "WS: unexpected opcode $opcode";
+        }
     }
-    my $mask_key = '';
-    if ($masked) { _ws_read_exact($sock, \$mask_key, 4) or die "WS unexpected mask"; }
-    my $payload = '';
-    _ws_read_exact($sock, \$payload, $len) or die "WS payload read fail";
-    if ($masked) { $payload = _xor_mask($payload, $mask_key); }
-    return $payload;
 }
 sub _ws_rpc {
     my ($conn, $obj) = @_;
@@ -1562,15 +1600,27 @@ sub volume_snapshot {
     my ($class, $scfg, $storeid, $volname, $snapname, $vmstate) = @_;
     my (undef, $zname) = $class->parse_volname($volname);
     my $full = $scfg->{dataset} . '/' . $zname; # pool/dataset/.../vm-<id>-disk-<n>
+    my $snap_full = $full . '@' . $snapname;    # full snapshot name for logging
+
+    syslog('info', "Creating ZFS snapshot: $snap_full");
 
     # Create ZFS snapshot for the disk
     # TrueNAS REST: POST /zfs/snapshot { "dataset": "<pool/ds/...>", "name": "<snap>", "recursive": false }
     # Snapshot will be <pool/ds/...>@<snapname>
     my $payload = { dataset => $full, name => $snapname, recursive => JSON::PP::false };
-    _api_call(
+    my $result = _api_call(
         $scfg, 'zfs.snapshot.create', [ $payload ],
         sub { _rest_call($scfg, 'POST', '/zfs/snapshot', $payload) },
     );
+
+    # Handle potential async job for snapshot creation
+    my $job_result = _handle_api_result_with_job_support($scfg, $result, "snapshot creation for $snap_full");
+    if (!$job_result->{success}) {
+        syslog('err', "Failed to create snapshot $snap_full: " . $job_result->{error});
+        die $job_result->{error};
+    }
+
+    syslog('info', "ZFS snapshot created successfully: $snap_full");
 
     # Note: vmstate ($vmstate parameter) is handled automatically by Proxmox:
     # - If vmstate_storage is 'shared': Proxmox creates vmstate volumes on this storage
@@ -3115,6 +3165,12 @@ sub free_image {
     my (undef, $zname, undef, undef, undef, undef, undef, $metadata) = $class->parse_volname($volname);
     my $full_ds = $scfg->{dataset} . '/' . $zname;
 
+    # Protect weight volume from deletion - it maintains target visibility
+    if ($zname eq 'pve-plugin-weight') {
+        die "Cannot delete weight volume '$volname' - it maintains target visibility and prevents storage outages.\n" .
+            "Weight volumes are critical infrastructure and must persist to keep iSCSI targets discoverable.\n";
+    }
+
     # Level 2: Verbose - parsed details
     _log($scfg, 2, 'debug', "free_image: zname=$zname, metadata=$metadata, full_ds=$full_ds");
 
@@ -3349,7 +3405,21 @@ sub _free_image_iscsi {
         eval { PVE::Tools::run_command(['udevadm','settle'], outfunc=>sub{}) };
     }
 
+    # Self-healing: Verify weight volume exists after deletion
+    # This prevents target undiscoverability when all VM volumes are deleted
+    # IMPORTANT: Must run BEFORE logout_on_free to avoid race condition where
+    # we logout before creating the weight volume, leaving it unmapped
+    eval {
+        _log($scfg, 2, 'debug', "Self-healing: Verifying weight volume after deletion");
+        _ensure_target_visible($scfg);
+    };
+    if ($@) {
+        # Non-fatal warning - weight verification failed but volume deletion succeeded
+        _log($scfg, 0, 'warning', "Self-healing: Weight volume verification failed: $@");
+    }
+
     # Optional: logout if no LUNs remain for this target on this node
+    # Runs AFTER self-healing so weight volume is created before we check LUN count
     if ($scfg->{logout_on_free}) {
         eval {
             if (_session_has_no_luns($scfg)) {
@@ -3882,28 +3952,9 @@ sub _ensure_target_visible {
 
     _log($scfg, 1, 'info', "Pre-flight: Target $target_name exists on TrueNAS (ID: $target_id)");
 
-    # Step 2: Check if target is discoverable via iscsiadm
-    my $target_discoverable = 0;
-    eval {
-        # Try discovery
-        my @discovery_output = _run_lines(['iscsiadm', '-m', 'discovery', '-t', 'sendtargets', '-p', $portal]);
-        for my $line (@discovery_output) {
-            if ($line =~ /\b\Q$iqn\E\b/) {
-                $target_discoverable = 1;
-                last;
-            }
-        }
-    };
-
-    if ($target_discoverable) {
-        _log($scfg, 1, 'info', "Pre-flight: Target $iqn is discoverable");
-        return 1; # Target is visible, nothing to do
-    }
-
-    _log($scfg, 1, 'info', "Pre-flight: Target $iqn is NOT discoverable - creating weight zvol");
-
-    # Step 3: Target exists but isn't discoverable - likely no extents
-    # Create weight zvol if it doesn't exist
+    # Step 2: Proactively ensure weight zvol exists (regardless of current discoverability)
+    # This prevents issues where weight gets deleted and target becomes undiscoverable
+    _log($scfg, 1, 'info', "Pre-flight: Ensuring weight volume exists for target reliability");
     my $weight_exists = 0;
     eval {
         my $ds = _tn_dataset_get($scfg, $weight_zname);
@@ -3988,7 +4039,7 @@ sub _ensure_target_visible {
 
     # Step 6: Verify target is now discoverable
     sleep 2; # Give TrueNAS time to update
-    $target_discoverable = 0;
+    my $target_discoverable = 0;
     eval {
         my @discovery_output = _run_lines(['iscsiadm', '-m', 'discovery', '-t', 'sendtargets', '-p', $portal]);
         for my $line (@discovery_output) {
@@ -4000,10 +4051,10 @@ sub _ensure_target_visible {
     };
 
     if ($target_discoverable) {
-        _log($scfg, 1, 'info', "Pre-flight: Target $iqn is now discoverable");
+        _log($scfg, 1, 'info', "Pre-flight: Target $iqn is discoverable - weight volume ensures persistence");
         return 1;
     } else {
-        _log($scfg, 0, 'warning', "Pre-flight: Target $iqn still not discoverable after weight zvol creation");
+        _log($scfg, 0, 'warning', "Pre-flight: Target $iqn not discoverable despite weight volume - may need manual intervention");
         # Don't die - let iSCSI login handle the error with better diagnostics
         return 0;
     }

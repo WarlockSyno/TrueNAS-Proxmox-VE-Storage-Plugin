@@ -1,5 +1,110 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.1.7 (November 22, 2025)
+
+### 🔧 **Installer Improvements**
+
+#### **Blocksize Default Case Fix**
+- **Changed default blocksize from lowercase `16k` to uppercase `16K`** in installer
+  - **Problem**: Installer used lowercase blocksize defaults which could cause issues with older plugin versions
+  - **Locations fixed**:
+    - `generate_storage_config()` function default parameter
+    - `display_edit_config()` function default fallback
+    - Interactive storage configuration prompt and default
+  - **Impact**: New installations will use properly formatted uppercase blocksize values
+
+---
+
+## Version 1.1.6 (November 14, 2025)
+
+### 🐛 **Critical Bug Fixes**
+
+#### **Weight Volume Protection and Self-Healing**
+- **Fixed weight zvol deletion vulnerability** - Plugin now prevents accidental deletion and automatically recreates weight volume
+  - **Problem**: Weight volume (`pve-plugin-weight`) could be manually deleted, causing iSCSI target to become undiscoverable
+  - **Root cause**: No safeguards prevented deletion of critical infrastructure volume that maintains target visibility
+  - **Impact**: If weight volume was deleted and all VM volumes removed, iSCSI target would disappear from discovery, causing storage outages
+  - **Solution implemented**:
+    - Added deletion guard that dies with error when attempting to delete weight volume (line 3169)
+    - Implemented self-healing operation that verifies weight volume after every volume deletion (lines 3408-3419)
+    - Self-healing automatically recreates weight volume if missing via `_ensure_target_visible()`
+    - Runs before `logout_on_free` to prevent race conditions
+    - Non-fatal warning if self-healing fails (doesn't block volume deletion)
+
+### 🔧 **Technical Details**
+- Modified `free_image()` function (lines 3169-3171, 3408-3419)
+  - Added weight volume deletion protection with explanatory error message
+  - Integrated self-healing verification after successful volume deletion
+  - Positioned self-healing before logout logic to ensure weight exists before session cleanup
+- Enhanced error messages explain weight volume purpose and importance
+
+### 📊 **Impact**
+- **Storage reliability**: Prevents storage outages caused by missing weight volumes
+- **Automatic recovery**: Self-healing recreates weight volume when needed, no manual intervention required
+- **Safety**: Weight volume cannot be accidentally deleted through normal plugin operations
+- **Graceful degradation**: Self-healing failures log warnings but don't block volume deletion operations
+
+### ✅ **Validation**
+- Tested weight volume deletion protection (properly rejects deletion attempts)
+- Verified self-healing recreates weight volume after all VM volumes deleted
+- Confirmed no race conditions between weight creation and session logout
+
+---
+
+## Version 1.1.5 (November 8, 2025)
+
+### 🐛 **Critical Bug Fix: Snapshot Error Handling**
+
+#### **Fixed silent snapshot creation failures on multi-disk VMs**
+- **Fixed `volume_snapshot()` function to properly validate API responses** - Plugin now ensures snapshot creation succeeds before reporting success to Proxmox
+  - **Problem**: Function ignored API call results and always returned success, causing VM lock states on multi-disk VMs
+  - **Impact**: When snapshot creation failed on TrueNAS, Proxmox thought it succeeded, resulting in orphaned snapshots and locked VMs
+  - **Root cause**: `volume_snapshot()` called `_api_call()` but ignored the return value completely
+  - **Solution implemented**:
+    - Captures the API call result
+    - Validates result using `_handle_api_result_with_job_support()` for proper async operation handling
+    - Dies with clear error message if snapshot creation fails (prevents silent failures)
+    - Logs all snapshot operations to syslog for audit trails
+    - Prevents VM lock states caused by inconsistent Proxmox/TrueNAS snapshot state
+
+### 🔍 **Audit Trail Improvements**
+- All snapshot operations now logged via syslog:
+  - `Creating ZFS snapshot: <full-snapshot-name>`
+  - `ZFS snapshot created successfully: <full-snapshot-name>`
+  - `Failed to create snapshot <name>: <error-message>`
+- Enables better troubleshooting of snapshot failures in production
+
+### 📋 **Testing**
+- Comprehensive multi-disk snapshot test integrated into plugin test suite
+- Validates atomic snapshot operations across iSCSI and NVMe storage
+- Snapshot creation/deletion verified on test environments
+
+---
+
+## Version 1.1.4 (November 8, 2025)
+
+### 🐛 **Bug Fixes**
+
+#### **WebSocket Message Fragmentation**
+- **Fixed truncated API responses with WebSocket transport** - Plugin now properly handles fragmented WebSocket messages
+  - **Error resolved**: Incomplete or truncated JSON responses causing API operation failures
+  - **Issue**: Large API responses (lengthy dataset lists, extensive configuration data) were truncated when split across multiple WebSocket frames
+  - **Root cause**: WebSocket receiver returned immediately after first frame without checking for continuation frames
+  - **Impact**: Operations with large responses failed with JSON parse errors or incomplete data
+  - **Solution**: Implemented proper WebSocket frame fragmentation handling
+    - Accumulates continuation frames (opcode 0x00) until FIN bit is set
+    - Supports both fragmented and unfragmented text frames
+    - Only returns complete messages after all fragments received
+    - Handles ping/pong and close frames during fragmented message reception
+
+### 🔧 **Technical Details**
+- Modified `_ws_recv_text()` function (lines 785-845)
+  - Added message accumulator for multi-frame messages
+  - Proper handling of continuation frames
+  - FIN bit checking to detect message completion
+
+---
+
 ## Version 1.1.3 (November 5, 2025)
 
 ### 🚀 **Major Performance Improvements**
