@@ -1753,17 +1753,43 @@ lsblk
 
 ### Enable Debug Logging
 
+The plugin has built-in debug logging with configurable verbosity levels:
+
+```ini
+# In /etc/pve/storage.cfg, add debug level to your storage entry:
+truenasplugin: truenas-storage
+    api_host 192.168.1.100
+    # ... other parameters ...
+    debug 1    # Light debug (function calls)
+    # OR
+    debug 2    # Verbose debug (full API trace with parameters/responses)
+```
+
+**Debug Levels**:
+- `0` (default): Errors only - always logged regardless of setting
+- `1`: Light debug - logs function entry points and major operations
+- `2`: Verbose debug - logs all API calls with full parameters and responses
+
+**Viewing Logs**:
 ```bash
-# Increase Proxmox log verbosity
-# Edit /etc/pve/datacenter.cfg
-# Add:
-# log: max=debug
+# Logs appear in daemon syslog facility
+# The process identifier varies by calling context:
+#   - pvesm commands → identifier 'pvesm'
+#   - pvestatd background checks → identifier 'pvestatd'
 
-# Restart services
+# Search all recent logs for plugin output
+journalctl SYSLOG_FACILITY=3 --since '10 minutes ago' | grep -E '(alloc_image|Pre-flight|_api_call|free_image)'
+
+# Follow pvesm command logs in real-time
+journalctl -f | grep -E '(pvesm|pvestatd).*alloc|Pre-flight|_api_call'
+
+# Or filter syslog directly
+grep -E '(alloc_image|Pre-flight|_api_call)' /var/log/syslog | tail -100
+```
+
+**Note**: After changing the debug level, restart Proxmox services:
+```bash
 systemctl restart pvedaemon pveproxy
-
-# Watch logs
-journalctl -u pvedaemon -f
 ```
 
 ## Getting Help
