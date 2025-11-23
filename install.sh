@@ -3438,7 +3438,8 @@ menu_cleanup_orphans() {
 
         # Check if zvol is under our dataset and exists
         if [[ "$extent_disk" == "$dataset/"* ]]; then
-            if ! echo "$zvols" | grep -q "\"id\": *\"${extent_disk}\""; then
+            # Use grep -c instead of grep -q to avoid pipefail issues
+            if [[ $(echo "$zvols" | grep -c "\"id\": *\"${extent_disk}\"" || echo "0") -eq 0 ]]; then
                 extent_orphans+=("$extent_id")
                 orphan_count=$((orphan_count + 1))
             fi
@@ -3456,7 +3457,12 @@ menu_cleanup_orphans() {
 
         [[ -z "$extent_ref" ]] && continue
 
-        if ! echo "$extents" | grep -q "\"id\": *${extent_ref}"; then
+        # Use grep -c instead of grep -q to avoid pipefail issues
+        if [[ $(echo "$extents" | grep -c "\"id\": *${extent_ref}" || echo "0") -eq 0 ]]; then
+            te_orphans+=("$te_id")
+            orphan_count=$((orphan_count + 1))
+        # Also check if this target-extent references an orphan extent (zvol missing)
+        elif [[ " ${extent_orphans[*]} " == *" ${extent_ref} "* ]]; then
             te_orphans+=("$te_id")
             orphan_count=$((orphan_count + 1))
         fi
@@ -3469,7 +3475,8 @@ menu_cleanup_orphans() {
 
     for zvol_id in $zvol_ids; do
         local zvol_disk="zvol/${zvol_id}"
-        if ! echo "$extents" | grep -q "\"disk\": *\"${zvol_disk}\""; then
+        # Use grep -c instead of grep -q to avoid pipefail issues
+        if [[ $(echo "$extents" | grep -c "\"disk\": *\"${zvol_disk}\"" || echo "0") -eq 0 ]]; then
             zvol_orphans+=("$zvol_id")
             orphan_count=$((orphan_count + 1))
         fi
@@ -3515,39 +3522,50 @@ menu_cleanup_orphans() {
 
     # Delete targetextents first (they reference extents)
     if [[ ${#te_orphans[@]} -gt 0 ]]; then
+        local response http_code
         for te_id in "${te_orphans[@]}"; do
             info "Deleting target-extent mapping ID: $te_id..."
-            if curl $curl_opts -H "Authorization: Bearer $api_key" -X DELETE "https://$api_host/api/v2.0/iscsi/targetextent/id/$te_id" > /dev/null 2>&1; then
+            response=$(curl $curl_opts -w '%{http_code}' -H "Authorization: Bearer $api_key" -X DELETE "https://$api_host/api/v2.0/iscsi/targetextent/id/$te_id" 2>&1)
+            http_code="${response: -3}"
+            response="${response:0:-3}"
+            if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
                 success "  Deleted target-extent $te_id"
             else
-                error "  Failed to delete target-extent $te_id"
+                error "  Failed to delete target-extent $te_id (HTTP $http_code): $response"
             fi
         done
     fi
 
     # Delete extents
     if [[ ${#extent_orphans[@]} -gt 0 ]]; then
+        local response http_code
         for extent_id in "${extent_orphans[@]}"; do
             info "Deleting extent ID: $extent_id..."
-            if curl $curl_opts -H "Authorization: Bearer $api_key" -X DELETE "https://$api_host/api/v2.0/iscsi/extent/id/$extent_id" > /dev/null 2>&1; then
+            response=$(curl $curl_opts -w '%{http_code}' -H "Authorization: Bearer $api_key" -X DELETE "https://$api_host/api/v2.0/iscsi/extent/id/$extent_id" 2>&1)
+            http_code="${response: -3}"
+            response="${response:0:-3}"
+            if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
                 success "  Deleted extent $extent_id"
             else
-                error "  Failed to delete extent $extent_id"
+                error "  Failed to delete extent $extent_id (HTTP $http_code): $response"
             fi
         done
     fi
 
     # Delete zvols
     if [[ ${#zvol_orphans[@]} -gt 0 ]]; then
+        local zvol_encoded response http_code
         for zvol_id in "${zvol_orphans[@]}"; do
             info "Deleting zvol: $zvol_id..."
             # URL encode the zvol path
-            local zvol_encoded
             zvol_encoded=$(echo "$zvol_id" | sed 's|/|%2F|g')
-            if curl $curl_opts -H "Authorization: Bearer $api_key" -X DELETE "https://$api_host/api/v2.0/pool/dataset/id/$zvol_encoded" > /dev/null 2>&1; then
+            response=$(curl $curl_opts -w '%{http_code}' -H "Authorization: Bearer $api_key" -X DELETE "https://$api_host/api/v2.0/pool/dataset/id/$zvol_encoded" 2>&1)
+            http_code="${response: -3}"
+            response="${response:0:-3}"
+            if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
                 success "  Deleted zvol $zvol_id"
             else
-                error "  Failed to delete zvol $zvol_id"
+                error "  Failed to delete zvol $zvol_id (HTTP $http_code): $response"
             fi
         done
     fi
