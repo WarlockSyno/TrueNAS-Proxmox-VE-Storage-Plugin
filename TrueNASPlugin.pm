@@ -237,9 +237,9 @@ sub _retry_with_backoff {
 
 # ======== Storage plugin identity ========
 # Storage API version - dynamically adapts to PVE version
-# Supports PVE 8.x (APIVER 11) and PVE 9.x (APIVER 12)
+# Supports PVE 8.x (APIVER 11) and PVE 9.x (APIVER 13)
 sub api {
-    my $tested_apiver = 12;  # Latest tested version (PVE 9.x)
+    my $tested_apiver = 13;  # Latest tested version (PVE 9.x)
 
     # Get current system API version (safely, as PVE::Storage may not be loaded yet)
     my $system_apiver = eval { require PVE::Storage; PVE::Storage::APIVER() } // 11;
