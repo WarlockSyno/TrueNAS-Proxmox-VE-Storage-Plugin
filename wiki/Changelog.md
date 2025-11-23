@@ -47,8 +47,8 @@ pvesm set <storage-id> --debug 1
 # Enable verbose debug logging
 pvesm set <storage-id> --debug 2
 
-# Filter TrueNAS logs
-journalctl -t truenasplugin | grep '\[TrueNAS\]'
+# Filter TrueNAS logs (works regardless of calling process)
+journalctl --since '10 minutes ago' | grep '\[TrueNAS\]'
 ```
 
 ### ✅ **Validation**
