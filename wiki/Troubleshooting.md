@@ -1753,7 +1753,7 @@ lsblk
 
 ### Enable Debug Logging
 
-The plugin has built-in debug logging with configurable verbosity levels:
+The plugin has built-in debug logging with configurable verbosity levels. All log messages are prefixed with `[TrueNAS]` for easy filtering.
 
 ```ini
 # In /etc/pve/storage.cfg, add debug level to your storage entry:
@@ -1766,28 +1766,64 @@ truenasplugin: truenas-storage
 ```
 
 **Debug Levels**:
-- `0` (default): Errors only - always logged regardless of setting
-- `1`: Light debug - logs function entry points and major operations
-- `2`: Verbose debug - logs all API calls with full parameters and responses
+| Level | Description | Typical Log Count* |
+|-------|-------------|-------------------|
+| `0` (default) | Errors only - always logged regardless of setting | 0 (unless errors occur) |
+| `1` | Light debug - function entry points and major operations | ~25-30 per operation |
+| `2` | Verbose debug - all API calls with full JSON parameters/responses | ~65-75 per operation |
+
+*Log counts based on a typical alloc/free cycle. Actual counts vary by operation complexity.
+
+**Log Message Format**:
+All plugin log messages include the `[TrueNAS]` prefix:
+```
+Nov 22 17:01:07 pve-node pvesm[12345]: [TrueNAS] alloc_image: vmid=100, name=vm-100-disk-0, size=10485760 KiB
+Nov 22 17:01:08 pve-node pvesm[12345]: [TrueNAS] Pre-flight: checking target visibility for iqn.2005-10.org.freenas.ctl:proxmox
+Nov 22 17:01:09 pve-node pvesm[12345]: [TrueNAS] _api_call: method=pool.dataset.create, transport=ws
+```
+
+**Syslog Identifier**:
+The syslog identifier inherits from the calling process, not from the plugin:
+- `pvesm` - When running pvesm commands manually
+- `pvesh` - When using pvesh API commands
+- `pvestatd` - When pvestatd performs background storage checks
+- `pvedaemon` - When the Proxmox daemon invokes storage operations
+
+The `[TrueNAS]` prefix ensures all plugin messages are easily searchable regardless of the calling process.
 
 **Viewing Logs**:
 ```bash
-# Logs appear in daemon syslog facility
-# The process identifier varies by calling context:
-#   - pvesm commands → identifier 'pvesm'
-#   - pvestatd background checks → identifier 'pvestatd'
+# Best method: Search for [TrueNAS] prefix (works regardless of calling process)
+journalctl --since '10 minutes ago' | grep '\[TrueNAS\]'
 
-# Search all recent logs for plugin output
-journalctl SYSLOG_FACILITY=3 --since '10 minutes ago' | grep -E '(alloc_image|Pre-flight|_api_call|free_image)'
+# Real-time monitoring
+journalctl -f | grep '\[TrueNAS\]'
 
-# Follow pvesm command logs in real-time
-journalctl -f | grep -E '(pvesm|pvestatd).*alloc|Pre-flight|_api_call'
+# Count log messages (useful for verifying debug level)
+journalctl --since '5 minutes ago' | grep -c '\[TrueNAS\]'
 
-# Or filter syslog directly
-grep -E '(alloc_image|Pre-flight|_api_call)' /var/log/syslog | tail -100
+# View logs from specific process (e.g., pvesm commands only)
+journalctl -t pvesm --since '10 minutes ago' | grep '\[TrueNAS\]'
+
+# Filter by log level (Level 2 shows _api_call entries)
+journalctl --since '10 minutes ago' | grep '\[TrueNAS\].*_api_call'
+
+# View pre-flight check logs
+journalctl --since '10 minutes ago' | grep '\[TrueNAS\].*Pre-flight'
 ```
 
-**Note**: After changing the debug level, restart Proxmox services:
+**Level 1 Message Types** (Light Debug):
+- `alloc_image` - Volume allocation entry/exit
+- `free_image` - Volume deletion entry/exit
+- `Pre-flight` - Pre-flight validation checks (~90% of level 1 messages)
+- `_free_image_iscsi` / `_free_image_nvme` - Transport-specific deletion
+
+**Level 2 Adds** (Verbose Debug):
+- `_api_call` - Full API request/response with JSON payloads
+- Internal state decisions and computed values
+- Detailed error context for troubleshooting API issues
+
+**Note**: After changing the debug level, the new setting takes effect immediately for new operations (no service restart required). However, if you want to clear cached storage status, restart Proxmox services:
 ```bash
 systemctl restart pvedaemon pveproxy
 ```

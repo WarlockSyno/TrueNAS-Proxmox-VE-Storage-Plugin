@@ -77,11 +77,10 @@ The installer provides:
 - ✅ Interactive menu-driven setup
 - ✅ Automatic version detection and updates
 - ✅ Built-in configuration wizard (supports iSCSI and NVMe/TCP)
-- ✅ Health check validation with consistent 30-character label formatting
+- ✅ Health check validation
 - ✅ Plugin function testing with graceful interrupt handling (Ctrl+C)
 - ✅ Backup and rollback support
 - ✅ Cluster-wide installation (install/update on all nodes simultaneously)
-- ✅ Cluster node compatibility
 
 **Alternative: Manual Installation**
 
