@@ -77,11 +77,10 @@ The installer provides:
 - ✅ Interactive menu-driven setup
 - ✅ Automatic version detection and updates
 - ✅ Built-in configuration wizard (supports iSCSI and NVMe/TCP)
-- ✅ Health check validation with consistent 30-character label formatting
+- ✅ Health check validation
 - ✅ Plugin function testing with graceful interrupt handling (Ctrl+C)
 - ✅ Backup and rollback support
 - ✅ Cluster-wide installation (install/update on all nodes simultaneously)
-- ✅ Cluster node compatibility
 
 **Alternative: Manual Installation**
 
@@ -282,6 +281,6 @@ This project is provided as-is for use with Proxmox VE and TrueNAS SCALE.
 
 ---
 
-**Version**: 1.1.7
+**Version**: 1.1.8
 **Last Updated**: November 22, 2025
 **Compatibility**: Proxmox VE 8.x+, TrueNAS SCALE 22.x+

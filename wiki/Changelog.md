@@ -1,5 +1,63 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.1.8 (November 22, 2025)
+
+### 🔧 **Debug Logging Standardization**
+
+#### **Consistent Debug Logging Coverage**
+- **Standardized all debug logging to use `_log()` helper** with configurable verbosity levels
+  - **Problem**: Inconsistent logging - some functions used direct `syslog()` calls bypassing debug level settings, others had no logging at all
+  - **Solution implemented**:
+    - Converted ~50 direct `syslog()` calls to `_log($scfg, $level, $priority, $message)`
+    - Added `[TrueNAS]` prefix to all ~134 log messages for easy grep filtering
+    - Added entry/completion logging to previously unlogged functions
+
+### 📊 **Logging Level Assignments**
+| Level | Usage | Examples |
+|-------|-------|----------|
+| 0 | Errors (always logged) | API failures, timeouts, authentication errors |
+| 1 | Operations (debug=1) | Function entry, job completion, major operations |
+| 2 | Verbose (debug=2) | API call details, internal state, polling status |
+
+### 🆕 **Functions with New Logging**
+- `volume_resize` - entry and completion logging
+- `volume_snapshot_rollback` - entry and completion logging
+- `volume_snapshot_info` - query logging (level 2)
+- `clone_image`, `_clone_image_iscsi`, `_clone_image_nvme` - entry logging
+- `activate_volume` - activation logging (level 2)
+
+### 🔄 **Functions with Converted Logging**
+- `_retry_with_backoff` - retry attempts and errors
+- `_wait_for_job_completion` - job status polling
+- `_handle_api_result_with_job_support` - async job handling
+- `volume_snapshot`, `volume_snapshot_delete` - snapshot operations
+- `_bulk_snapshot_delete` - bulk operations
+- `_tn_dataset_delete` - dataset deletion
+- `_free_image_iscsi`, `_free_image_nvme` - volume deletion
+- `status`, `activate_storage` - storage status checks
+- `_ensure_target_visible` - pre-flight checks
+- `alloc_image` - volume allocation
+- NVMe functions - connect, disconnect, namespace operations
+
+### 📋 **Usage**
+```bash
+# Enable light debug logging
+pvesm set <storage-id> --debug 1
+
+# Enable verbose debug logging
+pvesm set <storage-id> --debug 2
+
+# Filter TrueNAS logs
+journalctl -t truenasplugin | grep '\[TrueNAS\]'
+```
+
+### ✅ **Validation**
+- Perl syntax verified on Proxmox VE 9.x
+- All log messages include `[TrueNAS]` prefix
+- Appropriate debug levels assigned per message type
+
+---
+
 ## Version 1.1.7 (November 22, 2025)
 
 ### 🔧 **Installer Improvements**
