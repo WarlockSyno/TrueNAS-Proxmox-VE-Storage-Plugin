@@ -39,6 +39,7 @@ Common issues and solutions for the TrueNAS Proxmox VE Storage Plugin.
 - [VM Deletion Issues](#vm-deletion-issues)
   - [Orphaned Volumes After VM Deletion](#orphaned-volumes-after-vm-deletion)
   - [Warnings During VM Deletion](#warnings-during-vm-deletion)
+  - [Stale SCSI Devices After Disk Deletion](#stale-scsi-devices-after-disk-deletion)
 - [Snapshot Issues](#snapshot-issues)
   - [Snapshot Creation Fails](#snapshot-creation-fails)
   - [Snapshot Rollback Fails](#snapshot-rollback-fails)
@@ -1461,6 +1462,38 @@ warning: delete extent id=115 failed: does not exist
 
 **Action**: No action needed if deletion completes successfully
 
+### Stale SCSI Devices After Disk Deletion
+
+**Symptom**: Kernel errors "Read Capacity failed" after deleting iSCSI disks
+
+**Example kernel logs**:
+```
+sd 1:0:0:11: [sdx] Read Capacity(16) failed: Result: hostbyte=DID_OK driverbyte=DRIVER_OK
+sd 0:0:0:11: [sdw] Read Capacity(10) failed: Result: hostbyte=DID_OK driverbyte=DRIVER_OK
+```
+
+**Status**: Automatically handled by plugin (v1.1.9+)
+
+**Explanation**:
+- When disks are deleted, the Linux SCSI layer may retain "ghost" device entries with size=0
+- These stale devices cause kernel errors on every iSCSI session rescan
+- Plugin v1.1.9+ automatically cleans up SCSI devices after successful disk deletion
+
+**Manual cleanup (for older plugin versions)**:
+```bash
+# Remove stale SCSI devices with size=0
+for dev in /sys/block/sd*; do
+    devname=$(basename "$dev")
+    size=$(cat "$dev/size" 2>/dev/null)
+    if [ "$size" = "0" ] && [ -e "$dev/device/delete" ]; then
+        echo "Removing stale device $devname (size=0)"
+        echo 1 > "$dev/device/delete"
+    fi
+done
+```
+
+**Note**: The automatic cleanup is transparent and requires no configuration. Debug logging at level 2 shows cleanup operations.
+
 ## Snapshot Issues
 
 ### Snapshot Creation Fails
@@ -1822,6 +1855,7 @@ journalctl --since '10 minutes ago' | grep '\[TrueNAS\].*Pre-flight'
 - `_api_call` - Full API request/response with JSON payloads
 - Internal state decisions and computed values
 - Detailed error context for troubleshooting API issues
+- SCSI device cleanup operations (captured devices, cleanup results)
 
 **Note**: After changing the debug level, the new setting takes effect immediately for new operations (no service restart required). However, if you want to clear cached storage status, restart Proxmox services:
 ```bash
