@@ -358,26 +358,27 @@ truenasplugin: tnscale
 
 ### Viewing Debug Logs
 
-All debug output goes to syslog:
+All debug output goes to syslog with the `[TrueNAS]` prefix for easy filtering:
 
 ```bash
-# View all plugin logs in real-time
-journalctl -t truenasplugin -f
+# Best method: Search for [TrueNAS] prefix (works regardless of calling process)
+journalctl --since '10 minutes ago' | grep '\[TrueNAS\]'
 
-# View recent logs
-journalctl -t truenasplugin --since "5 minutes ago"
+# Real-time monitoring
+journalctl -f | grep '\[TrueNAS\]'
 
-# Filter by priority
-journalctl -t truenasplugin -p info
-journalctl -t truenasplugin -p debug
+# Count log messages (useful for verifying debug level)
+journalctl --since '5 minutes ago' | grep -c '\[TrueNAS\]'
 ```
+
+**Note**: The syslog identifier varies based on the calling process (`pvesm`, `pvedaemon`, `pvestatd`, etc.), so filtering by the `[TrueNAS]` prefix is more reliable than filtering by syslog tag.
 
 ### Debug Level Examples
 
 #### Level 0 (Errors Only - Default)
 
 ```
-Oct 08 07:15:23 pve-node truenasplugin[12345]: alloc_image pre-flight check failed for VM 100: API unreachable
+Nov 22 17:01:07 pve-node pvesm[12345]: [TrueNAS] alloc_image pre-flight check failed for VM 100: API unreachable
 ```
 
 Minimal logging - only critical errors. **Recommended for production.**
@@ -385,10 +386,10 @@ Minimal logging - only critical errors. **Recommended for production.**
 #### Level 1 (Light Diagnostic)
 
 ```
-Oct 08 07:15:23 pve-node truenasplugin[12345]: alloc_image: vmid=100, name=undef, size=33554432 KiB
-Oct 08 07:15:23 pve-node truenasplugin[12345]: alloc_image: running pre-flight checks for 34359738368 bytes
-Oct 08 07:15:24 pve-node truenasplugin[12345]: alloc_image: pre-flight checks passed for 32.00 GB volume
-Oct 08 07:15:25 pve-node truenasplugin[12345]: free_image: volname=vol-vm-100-disk-0-lun5
+Nov 22 17:01:07 pve-node pvesm[12345]: [TrueNAS] alloc_image: vmid=100, name=vm-100-disk-0, size=10485760 KiB
+Nov 22 17:01:08 pve-node pvesm[12345]: [TrueNAS] Pre-flight: checking target visibility for iqn.2005-10.org.freenas.ctl:proxmox
+Nov 22 17:01:09 pve-node pvesm[12345]: [TrueNAS] alloc_image: pre-flight checks passed for 10.00 GB volume
+Nov 22 17:01:10 pve-node pvesm[12345]: [TrueNAS] free_image: volname=vm-100-disk-0-lun5
 ```
 
 Shows function entry/exit and key operations. **Recommended for troubleshooting.**
@@ -396,11 +397,11 @@ Shows function entry/exit and key operations. **Recommended for troubleshooting.
 #### Level 2 (Verbose)
 
 ```
-Oct 08 07:15:23 pve-node truenasplugin[12345]: alloc_image: vmid=100, size=33554432 KiB
-Oct 08 07:15:23 pve-node truenasplugin[12345]: alloc_image: converting 33554432 KiB → 34359738368 bytes
-Oct 08 07:15:23 pve-node truenasplugin[12345]: _api_call: method=pool.dataset.create, transport=ws, params=[{"name":"pve_test/pve-storage/vm-100-disk-0","type":"VOLUME","volsize":34359738368}]
-Oct 08 07:15:24 pve-node truenasplugin[12345]: _api_call: response from pool.dataset.create: {"id":"pve_test/pve-storage/vm-100-disk-0"}
-Oct 08 07:15:24 pve-node truenasplugin[12345]: _api_call: method=iscsi.extent.create, params=[{"name":"vm-100-disk-0","disk":"zvol/pve_test/vm-100-disk-0"}]
+Nov 22 17:01:07 pve-node pvesm[12345]: [TrueNAS] alloc_image: vmid=100, size=10485760 KiB
+Nov 22 17:01:08 pve-node pvesm[12345]: [TrueNAS] _api_call: method=pool.dataset.create, transport=ws
+Nov 22 17:01:08 pve-node pvesm[12345]: [TrueNAS] _api_call: params=[{"name":"tank/proxmox/vm-100-disk-0","type":"VOLUME","volsize":10737418240}]
+Nov 22 17:01:09 pve-node pvesm[12345]: [TrueNAS] _api_call: response={"id":"tank/proxmox/vm-100-disk-0"}
+Nov 22 17:01:09 pve-node pvesm[12345]: [TrueNAS] _api_call: method=iscsi.extent.create, transport=ws
 ```
 
 Full API payloads and detailed traces. **Use for deep debugging only** (generates significant log volume).
@@ -433,11 +434,11 @@ sed -i '/truenasplugin: tnscale/a\        debug 1' /etc/pve/storage.cfg
 echo "        debug 1" >> /etc/pve/storage.cfg  # (add after storage entry)
 
 # Attempt operation and capture logs
-journalctl -t truenasplugin -f > debug.log &
+journalctl -f | grep '\[TrueNAS\]' > debug.log &
 pvesh create /nodes/$(hostname)/storage/tnscale/content --vmid 100 --filename vm-100-disk-0 --size 10G
 
 # Review logs
-grep -A 5 "alloc_image" debug.log
+grep "alloc_image" debug.log
 ```
 
 **Problem**: Size mismatch
@@ -445,9 +446,9 @@ grep -A 5 "alloc_image" debug.log
 # Enable verbose logging
 sed -i '/truenasplugin: tnscale/a\        debug 2' /etc/pve/storage.cfg
 
-# Check unit conversion in logs
-journalctl -t truenasplugin | grep "converting"
-# Should show: "converting X KiB → Y bytes"
+# Check API call parameters in logs
+journalctl --since '5 minutes ago' | grep '\[TrueNAS\].*_api_call'
+# Should show: [TrueNAS] _api_call: method=pool.dataset.create with volsize parameter
 ```
 
 ### Log Rotation

@@ -49,6 +49,8 @@ Complete reference for all TrueNAS Proxmox VE Storage Plugin configuration param
 - [Security Options](#security-options)
   - [chap_user](#chap_user)
   - [chap_password](#chap_password)
+- [Diagnostics](#diagnostics)
+  - [debug](#debug)
 - [Configuration Examples](#configuration-examples)
   - [Basic Single-Node Configuration](#basic-single-node-configuration)
   - [Production Cluster Configuration](#production-cluster-configuration)
@@ -576,6 +578,44 @@ Must match the CHAP secret configured in TrueNAS.
 ```ini
 chap_password your-secure-chap-password
 ```
+
+## Diagnostics
+
+### `debug`
+**Description**: Debug logging verbosity level
+**Type**: Integer (0-2)
+**Default**: `0`
+**Validation**: Must be between 0 and 2
+
+Enables debug logging with configurable verbosity. All log messages are prefixed with `[TrueNAS]` for easy filtering.
+
+**Debug Levels**:
+| Level | Description | Use Case |
+|-------|-------------|----------|
+| `0` | Errors only (always logged) | Production - minimal logging |
+| `1` | Light debug - function entry points, major operations | Troubleshooting - recommended starting point |
+| `2` | Verbose - full API call traces with JSON payloads | Deep diagnosis - generates significant log volume |
+
+```ini
+# Light debugging (recommended for troubleshooting)
+debug 1
+
+# Verbose debugging (API payload tracing)
+debug 2
+```
+
+**Viewing Debug Logs**:
+```bash
+# Filter all plugin messages by [TrueNAS] prefix
+journalctl --since '10 minutes ago' | grep '\[TrueNAS\]'
+
+# Real-time monitoring
+journalctl -f | grep '\[TrueNAS\]'
+```
+
+**Note**: Changes take effect immediately for new operations (no service restart required).
+
+See [Troubleshooting Guide - Enable Debug Logging](Troubleshooting.md#enable-debug-logging) for detailed usage.
 
 ## Configuration Examples
 

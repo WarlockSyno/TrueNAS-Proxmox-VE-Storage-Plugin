@@ -538,7 +538,7 @@ sub check_config {
             my $scheme = lc($opts->{api_scheme});
             if ($scheme eq 'http') {
                 syslog('warning',
-                    "Storage '$sectionId' is using insecure HTTP transport. " .
+                    "[TrueNAS] Storage '$sectionId' is using insecure HTTP transport. " .
                     "Consider using HTTPS for API communication."
                 );
             }
@@ -546,7 +546,7 @@ sub check_config {
             # WebSocket uses wss:// or ws:// - check if scheme is insecure
             if (defined $opts->{api_scheme} && lc($opts->{api_scheme}) eq 'ws') {
                 syslog('warning',
-                    "Storage '$sectionId' is using insecure WebSocket (ws://). " .
+                    "[TrueNAS] Storage '$sectionId' is using insecure WebSocket (ws://). " .
                     "Consider using secure WebSocket (wss://) for API communication."
                 );
             }
@@ -579,12 +579,12 @@ sub check_config {
         # Warn if NVMe-specific parameters are set in iSCSI mode
         if ($opts->{subsystem_nqn}) {
             syslog('warning',
-                "Storage '$sectionId': subsystem_nqn is ignored in iSCSI mode"
+                "[TrueNAS] Storage '$sectionId': subsystem_nqn is ignored in iSCSI mode"
             );
         }
         if ($opts->{hostnqn}) {
             syslog('warning',
-                "Storage '$sectionId': hostnqn is ignored in iSCSI mode"
+                "[TrueNAS] Storage '$sectionId': hostnqn is ignored in iSCSI mode"
             );
         }
 
@@ -607,17 +607,17 @@ sub check_config {
         # Warn if iSCSI-specific parameters are set in NVMe mode
         if ($opts->{target_iqn}) {
             syslog('warning',
-                "Storage '$sectionId': target_iqn is ignored in nvme-tcp mode"
+                "[TrueNAS] Storage '$sectionId': target_iqn is ignored in nvme-tcp mode"
             );
         }
         if ($opts->{chap_user} || $opts->{chap_password}) {
             syslog('warning',
-                "Storage '$sectionId': CHAP parameters are ignored in nvme-tcp mode (use nvme_dhchap_secret instead)"
+                "[TrueNAS] Storage '$sectionId': CHAP parameters are ignored in nvme-tcp mode (use nvme_dhchap_secret instead)"
             );
         }
         if ($opts->{use_by_path}) {
             syslog('warning',
-                "Storage '$sectionId': use_by_path is ignored in nvme-tcp mode (UUID paths used)"
+                "[TrueNAS] Storage '$sectionId': use_by_path is ignored in nvme-tcp mode (UUID paths used)"
             );
         }
 
@@ -2881,7 +2881,7 @@ sub alloc_image {
 
     # Log successful pre-flight checks
     _log($scfg, 1, 'info', sprintf(
-        "alloc_image: pre-flight checks passed for %s volume allocation on '%s' (VM %d)",
+        "[TrueNAS] alloc_image: pre-flight checks passed for %s volume allocation on '%s' (VM %d)",
         _format_bytes($bytes), $scfg->{dataset}, $vmid
     ));
 
