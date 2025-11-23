@@ -1,5 +1,40 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.1.9 (November 22, 2025)
+
+### 🧹 **SCSI Device Cleanup After iSCSI Disk Deletion**
+
+#### **Automatic Cleanup of Orphaned SCSI Devices**
+- **Added automatic SCSI device cleanup to `_free_image_iscsi` function** - Prevents "ghost" SCSI devices after disk deletion
+  - **Problem**: When disks are deleted via the plugin, the Linux SCSI layer retains stale device entries with size=0
+  - **Impact**: Stale devices caused "Read Capacity failed" kernel errors on every iSCSI session rescan (10-20 log messages per stale device)
+  - **Solution implemented**:
+    - Captures by-path symlinks and resolves device names BEFORE any deletion/logout occurs (lines 3202-3226)
+    - After TrueNAS deletion succeeds, writes `1` to `/sys/block/<dev>/device/delete` to remove orphaned SCSI devices (lines 3426-3443)
+    - Best-effort cleanup - never fails the delete operation if SCSI cleanup fails
+    - Handles multipath configurations (cleans up all path devices)
+    - Debug logging at level 2 for cleanup operations
+
+### 🔧 **Technical Details**
+- Device capture occurs at function entry before any API calls
+- Uses `Cwd::abs_path()` to resolve symlinks safely
+- Validates device names match expected `sd[a-z]{1,4}` pattern
+- Cleanup runs regardless of logout status (handles both logged-in and logged-out scenarios)
+- All cleanup operations wrapped in `eval {}` for safety
+
+### 📊 **Impact**
+- **Cleaner kernel logs**: No more "Read Capacity failed" errors from deleted LUNs
+- **Faster rescans**: iSCSI session rescans no longer delayed by stale device error handling
+- **Test reliability**: Eliminates test failures caused by stale SCSI device interference
+- **Transparent operation**: No configuration required, cleanup happens automatically
+
+### ✅ **Validation**
+- Tested disk deletion flow with SCSI device verification
+- Confirmed no stale devices remain after deletion
+- Verified kernel logs show no errors on subsequent session rescans
+
+---
+
 ## Version 1.1.8 (November 22, 2025)
 
 ### 🔧 **Debug Logging Standardization**

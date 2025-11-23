@@ -3199,6 +3199,32 @@ sub free_image {
 sub _free_image_iscsi {
     my ($class, $storeid, $scfg, $volname, $zname, $full_ds, $lun) = @_;
 
+    # Capture SCSI device names BEFORE any deletion/logout (symlinks disappear after logout)
+    # This allows us to clean up orphaned SCSI devices after TrueNAS deletion succeeds
+    my @scsi_devices_to_cleanup;
+    if (defined $lun) {
+        eval {
+            my $iqn = $scfg->{target_iqn};
+            my $pattern = "-iscsi-$iqn-lun-$lun";
+            if (opendir(my $dh, "/dev/disk/by-path")) {
+                my @by_paths = grep { $_ =~ /^ip-.*\Q$pattern\E$/ } readdir($dh);
+                closedir($dh);
+                for my $bp (@by_paths) {
+                    # Validate and untaint the path
+                    next unless $bp =~ m{^(ip-[\w.:,\[\]\-]+iscsi-[\w.:,\[\]\-]+lun-\d+)$};
+                    my $full_path = "/dev/disk/by-path/$1";
+                    next unless -l $full_path;
+                    # Resolve symlink to actual device
+                    my $real = Cwd::abs_path($full_path);
+                    if ($real && $real =~ m{^/dev/(sd[a-z]{1,4})$}) {
+                        push @scsi_devices_to_cleanup, $1;
+                    }
+                }
+            }
+        };
+        _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: captured " . scalar(@scsi_devices_to_cleanup) . " SCSI device(s) for cleanup") if @scsi_devices_to_cleanup;
+    }
+
     # Best-effort: flush local multipath path of this WWID (ignore "not a multipath device")
     if ($scfg->{use_multipath}) {
         eval {
@@ -3397,7 +3423,27 @@ sub _free_image_iscsi {
         warn "warning: delete dataset $full_ds failed: $err" unless $err =~ /does not exist|ENOENT|InstanceNotFound/i;
     }
 
-    # 5) Skip re-login after volume deletion - the device is gone, no need to reconnect
+    # 5) Clean up orphaned SCSI device entries from kernel
+    # This prevents "ghost" devices that cause kernel errors on session rescans
+    # Run cleanup in all cases - logout doesn't immediately remove SCSI devices
+    if (@scsi_devices_to_cleanup) {
+        _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: cleaning up " . scalar(@scsi_devices_to_cleanup) . " SCSI device(s)");
+        for my $dev (@scsi_devices_to_cleanup) {
+            my $delete_path = "/sys/block/$dev/device/delete";
+            if (-e $delete_path && -w $delete_path) {
+                eval {
+                    _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: deleting SCSI device $dev for LUN $lun");
+                    if (open my $fh, '>', $delete_path) {
+                        print $fh "1";
+                        close $fh;
+                    }
+                };
+                # Ignore errors - device may already be gone
+            }
+        }
+    }
+
+    # 6) Skip re-login after volume deletion - the device is gone, no need to reconnect
     if ($need_force_logout) {
         _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: skipping re-login after volume deletion (device is gone)");
 
