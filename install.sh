@@ -267,6 +267,9 @@ stop_spinner() {
 
 # Clear screen
 clear_screen() {
+    # Ensure any spinner output is cleared first
+    printf '\r\033[K' >&2
+    sleep 0.05  # Brief pause to ensure terminal processes the clear
     printf '\033[2J\033[H'
 }
 
@@ -5489,6 +5492,508 @@ check_nvme_multipath() {
     fi
 }
 
+# ======== TrueNAS API Provisioning Functions ========
+# These functions use WebSocket API via embedded Perl wrapper for full API access
+
+# Embedded Perl WebSocket client (extracted at runtime)
+# This allows us to use WebSocket API without external dependencies
+TN_API_PERL_SCRIPT='
+use strict;
+use warnings;
+use JSON::PP qw(encode_json decode_json);
+use MIME::Base64 qw(encode_base64);
+use Digest::SHA qw(sha1);
+use IO::Socket::INET;
+use IO::Socket::SSL;
+use Time::HiRes qw(usleep);
+use Socket qw(inet_ntoa);
+
+# Resolve hostname to IPv4
+sub host_ipv4 {
+    my $host = shift;
+    return $host if $host =~ /^\d+\.\d+\.\d+\.\d+$/;
+    my @ent = Socket::gethostbyname($host);
+    if (@ent && defined $ent[4]) {
+        my $ip = inet_ntoa($ent[4]);
+        return $ip if $ip;
+    }
+    return $host;
+}
+
+# XOR mask for WebSocket framing
+sub xor_mask {
+    my ($data, $mask) = @_;
+    my $len = length($data);
+    my $out = $data;
+    my @m = map { ord(substr($mask, $_, 1)) } (0..3);
+    for (my $i = 0; $i < $len; $i++) {
+        substr($out, $i, 1, chr(ord(substr($out, $i, 1)) ^ $m[$i & 3]));
+    }
+    return $out;
+}
+
+# Send WebSocket text frame
+sub ws_send_text {
+    my ($sock, $payload) = @_;
+    my $len = length($payload);
+    my $hdr = pack("C", 0x81);  # FIN + text
+    my $lenfield;
+    if ($len <= 125)       { $lenfield = pack("C",   0x80 | $len); }
+    elsif ($len <= 0xFFFF) { $lenfield = pack("C n", 0x80 | 126, $len); }
+    else                   { $lenfield = pack("C Q>", 0x80 | 127, $len); }
+    my $mask = join "", map { chr(int(rand(256))) } 1..4;
+    my $masked = xor_mask($payload, $mask);
+    my $frame = $hdr . $lenfield . $mask . $masked;
+    my $off = 0;
+    while ($off < length($frame)) {
+        my $w = $sock->syswrite($frame, length($frame) - $off, $off);
+        die "WS write failed: $!" unless defined $w;
+        $off += $w;
+    }
+}
+
+# Read exact bytes from socket
+sub ws_read_exact {
+    my ($sock, $ref, $want) = @_;
+    $$ref = "" if !defined $$ref;
+    my $got = 0;
+    while ($got < $want) {
+        my $r = $sock->sysread($$ref, $want - $got, $got);
+        return undef if !defined $r || $r == 0;
+        $got += $r;
+    }
+    return 1;
+}
+
+# Receive WebSocket text frame
+sub ws_recv_text {
+    my $sock = shift;
+    my $message = "";
+    while (1) {
+        my $hdr;
+        ws_read_exact($sock, \$hdr, 2) or die "WS read hdr failed";
+        my ($b1, $b2) = unpack("CC", $hdr);
+        my $fin = ($b1 & 0x80) ? 1 : 0;
+        my $opcode = $b1 & 0x0f;
+        my $masked = ($b2 & 0x80) ? 1 : 0;
+        my $len = ($b2 & 0x7f);
+        if ($len == 126) {
+            my $ext; ws_read_exact($sock, \$ext, 2) or die "WS len16 read fail";
+            $len = unpack("n", $ext);
+        } elsif ($len == 127) {
+            my $ext; ws_read_exact($sock, \$ext, 8) or die "WS len64 read fail";
+            $len = unpack("Q>", $ext);
+        }
+        my $mask_key = "";
+        if ($masked) { ws_read_exact($sock, \$mask_key, 4) or die "WS unexpected mask"; }
+        my $payload = "";
+        if ($len > 0) {
+            ws_read_exact($sock, \$payload, $len) or die "WS payload read fail";
+            if ($masked) { $payload = xor_mask($payload, $mask_key); }
+        }
+        if ($opcode == 0x01) {
+            $message = $payload;
+            return $message if $fin;
+        } elsif ($opcode == 0x00) {
+            $message .= $payload;
+            return $message if $fin;
+        } elsif ($opcode == 0x08) {
+            my $code = $len >= 2 ? unpack("n", substr($payload, 0, 2)) : 0;
+            die "WS closed by server (code: $code)";
+        } elsif ($opcode == 0x09) {
+            my $pong = pack("C", 0x8A) . pack("C", $len) . $payload;
+            $sock->syswrite($pong);
+        }
+    }
+}
+
+# JSON-RPC call over WebSocket
+sub ws_rpc {
+    my ($sock, $obj) = @_;
+    my $text = encode_json($obj);
+    ws_send_text($sock, $text);
+    my $resp = ws_recv_text($sock);
+    my $decoded = decode_json($resp);
+    die "JSON-RPC error: " . encode_json($decoded->{error}) if exists $decoded->{error};
+    return $decoded->{result};
+}
+
+# Main
+my ($host, $apikey, $method, $params_json) = @ARGV;
+die "Usage: $0 <host> <apikey> <method> [params_json]\n" unless $host && $apikey && $method;
+$params_json //= "[]";
+
+usleep(100_000);  # 100ms delay to avoid rate limiting
+
+my $peer = host_ipv4($host);
+my $sock = IO::Socket::SSL->new(
+    PeerHost => $peer,
+    PeerPort => 443,
+    SSL_verify_mode => 0x00,  # Skip cert verification
+    SSL_hostname => $host,
+    Timeout => 15,
+) or die "wss connect failed: $IO::Socket::SSL::SSL_ERROR\n";
+
+# WebSocket handshake
+my $key_raw = join "", map { chr(int(rand(256))) } 1..16;
+my $key_b64 = encode_base64($key_raw, "");
+my $req = "GET /api/current HTTP/1.1\r\n" .
+          "Host: $host:443\r\n" .
+          "Upgrade: websocket\r\n" .
+          "Connection: Upgrade\r\n" .
+          "Sec-WebSocket-Key: $key_b64\r\n" .
+          "Sec-WebSocket-Version: 13\r\n" .
+          "\r\n";
+print $sock $req;
+my $resp = "";
+while ($sock->sysread(my $buf, 1024)) {
+    $resp .= $buf;
+    last if $resp =~ /\r\n\r\n/s;
+}
+die "WebSocket handshake failed (no 101)" if $resp !~ m#^HTTP/1\.[01] 101#;
+my ($accept) = $resp =~ /Sec-WebSocket-Accept:\s*(\S+)/i;
+my $expect = encode_base64(sha1($key_b64 . "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"), "");
+die "WebSocket handshake invalid accept key" if ($accept // "") ne $expect;
+
+# Authenticate
+ws_rpc($sock, {
+    jsonrpc => "2.0", id => 1,
+    method => "auth.login_with_api_key",
+    params => [$apikey],
+}) or die "TrueNAS auth.login_with_api_key failed";
+
+# Execute requested method
+my $params = decode_json($params_json);
+my $result = ws_rpc($sock, {
+    jsonrpc => "2.0", id => 2,
+    method => $method,
+    params => $params,
+});
+
+print encode_json($result);
+'
+
+# Temporary file for Perl script
+TN_API_SCRIPT_FILE=""
+
+# Ensure cleanup of temp file on exit
+cleanup_tn_api_script() {
+    if [[ -n "$TN_API_SCRIPT_FILE" && -f "$TN_API_SCRIPT_FILE" ]]; then
+        rm -f "$TN_API_SCRIPT_FILE"
+    fi
+}
+
+# Initialize the Perl API script (call once at start)
+init_tn_api_script() {
+    if [[ -z "$TN_API_SCRIPT_FILE" || ! -f "$TN_API_SCRIPT_FILE" ]]; then
+        TN_API_SCRIPT_FILE=$(mktemp /tmp/tn-api-XXXXXX.pl)
+        # Use printf to preserve special characters in the Perl script
+        printf '%s' "$TN_API_PERL_SCRIPT" > "$TN_API_SCRIPT_FILE"
+        chmod 700 "$TN_API_SCRIPT_FILE"
+        # Register cleanup on main shell exit
+        trap 'cleanup_tn_api_script' EXIT
+    fi
+}
+
+# Call TrueNAS API via WebSocket (uses embedded Perl wrapper)
+# Usage: tn_api_call <host> <apikey> <method> [params_json]
+# Returns: JSON result on stdout, exit code 0 on success
+tn_api_call() {
+    local host="$1"
+    local apikey="$2"
+    local method="$3"
+    local params="${4:-[]}"
+
+    # Ensure script is initialized
+    if [[ -z "$TN_API_SCRIPT_FILE" || ! -f "$TN_API_SCRIPT_FILE" ]]; then
+        init_tn_api_script
+    fi
+
+    local result
+    if result=$(perl "$TN_API_SCRIPT_FILE" "$host" "$apikey" "$method" "$params" 2>&1); then
+        echo "$result"
+        return 0
+    else
+        echo "API Error: $result" >&2
+        return 1
+    fi
+}
+
+# Get TrueNAS version and parse major.minor
+# Usage: get_truenas_version <host> <apikey>
+# Returns: "MAJOR.MINOR" (e.g., "25.10") or empty on error
+get_truenas_version() {
+    local host="$1"
+    local apikey="$2"
+
+    local result
+    if ! result=$(tn_api_call "$host" "$apikey" "system.info" "[]" 2>/dev/null); then
+        return 1
+    fi
+
+    # Parse version string - handles both "25.10.0" and "TrueNAS-SCALE-25.10.0" formats
+    local version
+    version=$(echo "$result" | grep -Po '"version"\s*:\s*"[^"]*(\d+\.\d+)\.\d+"' | grep -Po '\d+\.\d+' | head -1)
+    echo "$version"
+}
+
+# Check if TrueNAS version supports NVMe-oF (25.10+)
+# Usage: truenas_supports_nvme <host> <apikey>
+# Returns: 0 if supported, 1 if not
+truenas_supports_nvme() {
+    local host="$1"
+    local apikey="$2"
+
+    local version
+    version=$(get_truenas_version "$host" "$apikey")
+    if [[ -z "$version" ]]; then
+        return 1
+    fi
+
+    local major minor
+    major=$(echo "$version" | cut -d. -f1)
+    minor=$(echo "$version" | cut -d. -f2)
+
+    # NVMe-oF available in 25.10+
+    if [[ "$major" -gt 25 ]] || { [[ "$major" -eq 25 ]] && [[ "$minor" -ge 10 ]]; }; then
+        return 0
+    fi
+    return 1
+}
+
+# Check service status
+# Usage: check_truenas_service <host> <apikey> <service_name>
+# service_name: "iscsitarget" or "nvmet"
+# Returns: 0 if running, 1 if not running or error
+check_truenas_service() {
+    local host="$1"
+    local apikey="$2"
+    local service="$3"
+
+    local result
+    # Query all services and filter locally (more reliable than server-side filter)
+    if ! result=$(tn_api_call "$host" "$apikey" "service.query" "[]" 2>/dev/null); then
+        return 1
+    fi
+
+    # Check if specific service state is RUNNING
+    # Look for the service entry and check its state
+    if echo "$result" | grep -Po '"service"\s*:\s*"'"$service"'"[^}]*"state"\s*:\s*"RUNNING"' >/dev/null 2>&1; then
+        return 0
+    fi
+    # Also try reverse order (state before service)
+    if echo "$result" | grep -Po '"state"\s*:\s*"RUNNING"[^}]*"service"\s*:\s*"'"$service"'"' >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+# Query ZFS pools
+# Usage: query_pools <host> <apikey>
+# Returns: JSON array of pools
+query_pools() {
+    local host="$1"
+    local apikey="$2"
+
+    tn_api_call "$host" "$apikey" "pool.query" "[]"
+}
+
+# Query datasets
+# Usage: query_datasets <host> <apikey>
+# Returns: JSON array of all datasets
+query_datasets() {
+    local host="$1"
+    local apikey="$2"
+
+    # Query all datasets - filter locally for reliability
+    tn_api_call "$host" "$apikey" "pool.dataset.query" "[]"
+}
+
+# Check if a dataset exists
+# Usage: dataset_exists <host> <apikey> <dataset_path>
+# Returns: 0 if exists, 1 if not
+dataset_exists() {
+    local host="$1"
+    local apikey="$2"
+    local dataset="$3"
+
+    local result
+    if ! result=$(tn_api_call "$host" "$apikey" "pool.dataset.query" "[[\"id\", \"=\", \"$dataset\"]]" 2>/dev/null); then
+        return 1
+    fi
+
+    # Check if result is non-empty array
+    if echo "$result" | grep -q '"id"'; then
+        return 0
+    fi
+    return 1
+}
+
+# Create a filesystem dataset
+# Usage: create_dataset <host> <apikey> <dataset_path>
+# Returns: 0 on success, 1 on error
+create_dataset() {
+    local host="$1"
+    local apikey="$2"
+    local dataset="$3"
+
+    local payload
+    payload="{\"name\": \"$dataset\", \"type\": \"FILESYSTEM\"}"
+
+    local result
+    if result=$(tn_api_call "$host" "$apikey" "pool.dataset.create" "[$payload]" 2>&1); then
+        return 0
+    else
+        # Check if error is "already exists" (which is OK)
+        if echo "$result" | grep -qi "already exists"; then
+            return 0
+        fi
+        echo "$result" >&2
+        return 1
+    fi
+}
+
+# Parse pool names from query_pools JSON result
+# Usage: echo "$pools_json" | parse_pool_names
+# Filters out UUIDs and vdev type names (raidz, mirror, etc.)
+parse_pool_names() {
+    grep -Po '"name"\s*:\s*"\K[^"]+' | \
+        grep -vE '^[0-9a-f-]{36}$' | \
+        grep -vE '^(raidz[0-9]*|mirror|stripe|spare|log|cache|special)-' | \
+        sort -u
+}
+
+# Parse dataset IDs from query_datasets JSON result
+# Usage: echo "$datasets_json" | parse_dataset_ids
+parse_dataset_ids() {
+    grep -Po '"id"\s*:\s*"\K[^"]+' | sort
+}
+
+# Query iSCSI targets
+# Usage: query_iscsi_targets <host> <apikey>
+# Returns: JSON array of targets
+query_iscsi_targets() {
+    local host="$1"
+    local apikey="$2"
+
+    tn_api_call "$host" "$apikey" "iscsi.target.query" "[]"
+}
+
+# Query iSCSI portal groups
+# Usage: query_iscsi_portals <host> <apikey>
+# Returns: JSON array of portal groups
+query_iscsi_portals() {
+    local host="$1"
+    local apikey="$2"
+
+    tn_api_call "$host" "$apikey" "iscsi.portal.query" "[]"
+}
+
+# Get default portal group ID (usually 1)
+# Usage: get_default_portal_id <host> <apikey>
+# Returns: portal ID or empty if none found
+get_default_portal_id() {
+    local host="$1"
+    local apikey="$2"
+
+    local result
+    if ! result=$(query_iscsi_portals "$host" "$apikey" 2>/dev/null); then
+        return 1
+    fi
+
+    # Get first portal ID
+    echo "$result" | grep -Po '"id"\s*:\s*\K\d+' | head -1
+}
+
+# Create an iSCSI target
+# Usage: create_iscsi_target <host> <apikey> <iqn> <alias> [portal_group_id]
+# Returns: created target JSON on success, error on failure
+create_iscsi_target() {
+    local host="$1"
+    local apikey="$2"
+    local iqn="$3"
+    local alias="$4"
+    local portal_id="${5:-1}"
+
+    local payload
+    payload="{\"name\": \"$iqn\", \"alias\": \"$alias\", \"mode\": \"ISCSI\", \"groups\": [{\"portal\": $portal_id, \"initiator\": null, \"auth\": null, \"authmethod\": \"NONE\"}]}"
+
+    local result
+    if result=$(tn_api_call "$host" "$apikey" "iscsi.target.create" "[$payload]" 2>&1); then
+        echo "$result"
+        return 0
+    else
+        echo "$result" >&2
+        return 1
+    fi
+}
+
+# Parse iSCSI target names/IQNs from query result
+# Usage: echo "$targets_json" | parse_target_iqns
+parse_target_iqns() {
+    grep -Po '"name"\s*:\s*"\K[^"]+' | sort
+}
+
+# Query NVMe subsystems (TrueNAS 25.10+)
+# Usage: query_nvme_subsystems <host> <apikey>
+# Returns: JSON array of subsystems
+query_nvme_subsystems() {
+    local host="$1"
+    local apikey="$2"
+
+    tn_api_call "$host" "$apikey" "nvmet.subsys.query" "[]"
+}
+
+# Create an NVMe subsystem (TrueNAS 25.10+)
+# Usage: create_nvme_subsystem <host> <apikey> <nqn> <name>
+# Returns: created subsystem JSON on success, error on failure
+create_nvme_subsystem() {
+    local host="$1"
+    local apikey="$2"
+    local nqn="$3"
+    local name="$4"
+
+    local payload
+    payload="{\"name\": \"$name\", \"subnqn\": \"$nqn\", \"allow_any_host\": true}"
+
+    local result
+    if result=$(tn_api_call "$host" "$apikey" "nvmet.subsys.create" "[$payload]" 2>&1); then
+        echo "$result"
+        return 0
+    else
+        echo "$result" >&2
+        return 1
+    fi
+}
+
+# Parse NVMe subsystem NQNs from query result
+# Usage: echo "$subsystems_json" | parse_subsystem_nqns
+parse_subsystem_nqns() {
+    grep -Po '"subnqn"\s*:\s*"\K[^"]+' | sort
+}
+
+# Generate a default IQN based on current date
+# Usage: generate_default_iqn <identifier>
+# Returns: IQN string like "iqn.2025-01.com.truenas:identifier"
+generate_default_iqn() {
+    local identifier="$1"
+    local year_month
+    year_month=$(date +%Y-%m)
+    echo "iqn.${year_month}.com.truenas:${identifier}"
+}
+
+# Generate a default NQN based on current date
+# Usage: generate_default_nqn <identifier>
+# Returns: NQN string like "nqn.2025-01.com.truenas:identifier"
+generate_default_nqn() {
+    local identifier="$1"
+    local year_month
+    year_month=$(date +%Y-%m)
+    echo "nqn.${year_month}.com.truenas:${identifier}"
+}
+
+# ======== End TrueNAS API Provisioning Functions ========
+
 # Test TrueNAS API connectivity
 test_truenas_api() {
     local ip="$1"
@@ -5964,7 +6469,12 @@ menu_edit_storage() {
 
 # Configuration wizard
 menu_configure_storage() {
-    print_header "Storage Configuration Wizard"
+    clear_screen
+    print_banner
+    echo
+
+    info "Storage Configuration Wizard"
+    echo
 
     info "This wizard will help you configure TrueNAS storage for Proxmox"
     echo
@@ -6006,8 +6516,14 @@ menu_configure_storage() {
                 return 0
                 ;;
             1)
-                # Edit mode - NOW show the storage list
+                # Edit mode - clear screen and show the storage list
+                clear_screen
+                print_banner
                 echo
+
+                info "Storage Configuration Wizard - Edit Storage"
+                echo
+
                 info "Available storage configurations:"
                 local idx=1
                 local -a storage_array=()
@@ -6038,8 +6554,14 @@ menu_configure_storage() {
                 # Add new storage mode - continue with existing workflow below
                 ;;
             3)
-                # Delete mode - show storage list and confirm deletion
+                # Delete mode - clear screen and show storage list
+                clear_screen
+                print_banner
                 echo
+
+                info "Storage Configuration Wizard - Delete Storage"
+                echo
+
                 info "Available storage configurations:"
                 local idx=1
                 local -a storage_array=()
@@ -6105,6 +6627,13 @@ menu_configure_storage() {
     fi
 
     # Continue with "Add New Storage" workflow
+    clear_screen
+    print_banner
+    echo
+
+    info "Storage Configuration Wizard - Add New Storage"
+    echo
+
     # Prompt for storage name
     local storage_name
     while true; do
@@ -6151,64 +6680,409 @@ menu_configure_storage() {
         [[ "$choice" =~ ^[Yy] ]] || return 1
     fi
 
-    # Dataset
-    local dataset
-    while true; do
-        read -rp "ZFS dataset path (e.g., tank/proxmox): " dataset
-        if [[ -z "$dataset" ]]; then
-            error "Dataset cannot be empty"
-            continue
-        fi
+    # Clear screen for provisioning section
+    clear_screen
+    print_banner
+    echo
 
-        # Verify dataset if API connection worked
-        if ! verify_dataset "$truenas_ip" "$api_key" "$dataset"; then
-            echo
-            warning "Dataset verification failed. The dataset may not exist or may not be accessible."
-            read -rp "Continue anyway? (y/N): " continue_choice
-            if [[ "$continue_choice" =~ ^[Yy] ]]; then
-                warning "Proceeding with unverified dataset '$dataset'"
-                break
-            else
-                echo
-                info "Please enter a different dataset name"
-                continue
-            fi
-        fi
-        break
-    done
+    info "Storage Configuration Wizard - TrueNAS Configuration"
+    echo
 
-    # Transport mode selection
+    # Track provisioning capabilities
+    local api_provisioning_available=true
+    local truenas_version=""
+    local nvme_supported=false
+
+    # Check TrueNAS version and capabilities
+    printf "  %-30s " "Checking TrueNAS capabilities..."
+    start_spinner
+    truenas_version=$(get_truenas_version "$truenas_ip" "$api_key" 2>/dev/null)
+    if [[ -n "$truenas_version" ]]; then
+        stop_spinner
+        echo ""
+        success "TrueNAS version: $truenas_version"
+
+        # Check NVMe support (25.10+)
+        if truenas_supports_nvme "$truenas_ip" "$api_key"; then
+            nvme_supported=true
+        fi
+    else
+        stop_spinner
+        echo ""
+        warning "Could not detect TrueNAS version (provisioning may be limited)"
+        api_provisioning_available=false
+    fi
+
+    # Transport mode selection (offer NVMe only if supported)
     echo
     info "Select transport protocol:"
     echo "  1) iSCSI (traditional, widely compatible)"
-    echo "  2) NVMe/TCP (modern, lower latency)"
+    if [[ "$nvme_supported" == true ]]; then
+        echo "  2) NVMe/TCP (modern, lower latency - requires TrueNAS 25.10+)"
+    else
+        echo "  2) NVMe/TCP (modern, lower latency) ${c3}[TrueNAS 25.10+ required]${c0}"
+    fi
     read -rp "Transport mode (1-2) [1]: " transport_choice
     transport_choice=${transport_choice:-1}
 
     local transport_mode
     case "$transport_choice" in
         1) transport_mode="iscsi" ;;
-        2) transport_mode="nvme-tcp" ;;
+        2)
+            transport_mode="nvme-tcp"
+            if [[ "$nvme_supported" != true ]]; then
+                warning "NVMe/TCP requires TrueNAS 25.10 or newer"
+                warning "Your TrueNAS version ($truenas_version) may not support NVMe-oF targets"
+                read -rp "Continue anyway? (y/N): " choice
+                [[ "$choice" =~ ^[Yy] ]] || return 1
+            fi
+            ;;
         *)
             error "Invalid choice, defaulting to iSCSI"
             transport_mode="iscsi"
             ;;
     esac
 
-    # Transport-specific configuration
+    # Check service status and warn if not running
+    local service_name
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        service_name="nvmet"
+    else
+        service_name="iscsitarget"
+    fi
+
+    printf "  %-30s " "Checking $service_name service..."
+    start_spinner
+    if check_truenas_service "$truenas_ip" "$api_key" "$service_name"; then
+        stop_spinner
+        echo ""
+        success "$service_name service is running"
+    else
+        stop_spinner
+        echo ""
+        warning "$service_name service is NOT running on TrueNAS"
+        info "Please enable it in TrueNAS: System Settings > Services > $service_name"
+        read -rp "Continue anyway? (y/N): " choice
+        [[ "$choice" =~ ^[Yy] ]] || return 1
+    fi
+
+    # ======== Dataset Provisioning ========
+    local dataset=""
+
+    if [[ "$api_provisioning_available" == true ]]; then
+        # Clear screen for dataset configuration
+        clear_screen
+        print_banner
+        echo
+
+        info "Storage Configuration Wizard - Dataset Configuration"
+        echo
+
+        # Query available pools
+        printf "  %-30s " "Querying ZFS pools..."
+        start_spinner
+        local pools_json
+        pools_json=$(query_pools "$truenas_ip" "$api_key" 2>/dev/null)
+        stop_spinner
+        echo ""
+
+        if [[ -n "$pools_json" ]]; then
+            local -a pool_array=()
+            while IFS= read -r pool; do
+                [[ -n "$pool" ]] && pool_array+=("$pool")
+            done < <(echo "$pools_json" | parse_pool_names)
+
+            if [[ ${#pool_array[@]} -gt 0 ]]; then
+                info "Available pools:"
+                local idx=1
+                for pool in "${pool_array[@]}"; do
+                    echo "  $idx) $pool"
+                    ((idx++))
+                done
+                echo
+
+                local pool_idx
+                while true; do
+                    read -rp "Select pool [1-${#pool_array[@]}]: " pool_idx
+                    if [[ "$pool_idx" =~ ^[0-9]+$ ]] && [[ "$pool_idx" -ge 1 ]] && [[ "$pool_idx" -le "${#pool_array[@]}" ]]; then
+                        break
+                    fi
+                    error "Invalid selection"
+                done
+
+                local selected_pool="${pool_array[$((pool_idx-1))]}"
+                info "Selected pool: $selected_pool"
+                echo
+
+                # Query existing datasets under this pool
+                printf "  %-30s " "Querying datasets..."
+                start_spinner
+                local datasets_json
+                datasets_json=$(query_datasets "$truenas_ip" "$api_key" 2>/dev/null) || true
+                stop_spinner
+                echo ""
+
+                local -a dataset_array=()
+                if [[ -n "$datasets_json" ]]; then
+                    # Filter datasets that belong to the selected pool (start with pool/)
+                    while IFS= read -r ds; do
+                        # Include datasets under this pool (pool/something) but not the pool itself
+                        if [[ -n "$ds" && "$ds" == "${selected_pool}/"* ]]; then
+                            dataset_array+=("$ds")
+                        fi
+                    done < <(echo "$datasets_json" | parse_dataset_ids)
+                fi
+
+                # Clear screen before dataset options
+                clear_screen
+                print_banner
+                echo
+
+                info "Storage Configuration Wizard - Dataset Selection"
+                echo
+                info "Selected pool: $selected_pool"
+                echo
+
+                # Present options: use existing or create new
+                info "Dataset options:"
+                echo "  1) Create new dataset under $selected_pool"
+                if [[ ${#dataset_array[@]} -gt 0 ]]; then
+                    echo "  2) Use existing dataset"
+                fi
+                echo
+
+                local dataset_choice
+                if [[ ${#dataset_array[@]} -gt 0 ]]; then
+                    read -rp "Choice [1-2]: " dataset_choice
+                else
+                    dataset_choice="1"
+                fi
+
+                case "$dataset_choice" in
+                    1)
+                        # Create new dataset
+                        local new_dataset_name
+                        read -rp "New dataset name (e.g., proxmox): " new_dataset_name
+                        if [[ -z "$new_dataset_name" ]]; then
+                            error "Dataset name cannot be empty"
+                            return 1
+                        fi
+
+                        dataset="${selected_pool}/${new_dataset_name}"
+
+                        # Check if it already exists
+                        if dataset_exists "$truenas_ip" "$api_key" "$dataset"; then
+                            info "Dataset '$dataset' already exists"
+                        else
+                            printf "  %-30s " "Creating dataset '$dataset'..."
+                            start_spinner
+                            if create_dataset "$truenas_ip" "$api_key" "$dataset"; then
+                                stop_spinner
+                                echo ""
+                                success "Dataset '$dataset' created"
+                            else
+                                stop_spinner
+                                echo ""
+                                error "Failed to create dataset"
+                                read -rp "Continue anyway with manual dataset? (y/N): " choice
+                                if [[ "$choice" =~ ^[Yy] ]]; then
+                                    read -rp "Enter dataset path manually: " dataset
+                                else
+                                    return 1
+                                fi
+                            fi
+                        fi
+                        ;;
+                    2)
+                        # Use existing dataset
+                        if [[ ${#dataset_array[@]} -eq 0 ]]; then
+                            error "No existing datasets found"
+                            return 1
+                        fi
+
+                        info "Available datasets:"
+                        local idx=1
+                        for ds in "${dataset_array[@]}"; do
+                            echo "  $idx) $ds"
+                            ((idx++))
+                        done
+                        echo
+
+                        local ds_idx
+                        while true; do
+                            read -rp "Select dataset [1-${#dataset_array[@]}]: " ds_idx
+                            if [[ "$ds_idx" =~ ^[0-9]+$ ]] && [[ "$ds_idx" -ge 1 ]] && [[ "$ds_idx" -le "${#dataset_array[@]}" ]]; then
+                                break
+                            fi
+                            error "Invalid selection"
+                        done
+
+                        dataset="${dataset_array[$((ds_idx-1))]}"
+                        success "Selected dataset: $dataset"
+                        ;;
+                    *)
+                        error "Invalid choice"
+                        return 1
+                        ;;
+                esac
+            else
+                warning "No pools found"
+                api_provisioning_available=false
+            fi
+        else
+            warning "Could not query pools"
+            api_provisioning_available=false
+        fi
+    fi
+
+    # Fallback to manual dataset entry
+    if [[ -z "$dataset" ]]; then
+        while true; do
+            read -rp "ZFS dataset path (e.g., tank/proxmox): " dataset
+            if [[ -z "$dataset" ]]; then
+                error "Dataset cannot be empty"
+                continue
+            fi
+
+            # Verify dataset if API connection worked
+            if ! verify_dataset "$truenas_ip" "$api_key" "$dataset"; then
+                echo
+                warning "Dataset verification failed. The dataset may not exist or may not be accessible."
+                read -rp "Continue anyway? (y/N): " continue_choice
+                if [[ "$continue_choice" =~ ^[Yy] ]]; then
+                    warning "Proceeding with unverified dataset '$dataset'"
+                    break
+                else
+                    echo
+                    info "Please enter a different dataset name"
+                    continue
+                fi
+            fi
+            break
+        done
+    fi
+
+    # ======== Target/Subsystem Provisioning ========
     local target=""
     local subsystem_nqn=""
     local hostnqn=""
 
+    # Clear screen for target configuration
+    clear_screen
+    print_banner
+    echo
+
     if [[ "$transport_mode" == "iscsi" ]]; then
-        # iSCSI Target
-        read -rp "iSCSI target (e.g., iqn.2025-01.com.truenas:target0): " target
-        if [[ -z "$target" ]]; then
-            error "iSCSI target cannot be empty"
-            return 1
+        # iSCSI Target provisioning
+        info "Storage Configuration Wizard - iSCSI Target Configuration"
+        echo
+
+        if [[ "$api_provisioning_available" == true ]]; then
+            # Query existing targets
+            printf "  %-30s " "Querying iSCSI targets..."
+            start_spinner
+            local targets_json
+            targets_json=$(query_iscsi_targets "$truenas_ip" "$api_key" 2>/dev/null)
+            stop_spinner
+            echo ""
+
+            local -a target_array=()
+            if [[ -n "$targets_json" ]]; then
+                while IFS= read -r tgt; do
+                    [[ -n "$tgt" ]] && target_array+=("$tgt")
+                done < <(echo "$targets_json" | parse_target_iqns)
+            fi
+
+            # Present options
+            echo
+            info "Target options:"
+            echo "  1) Create new iSCSI target"
+            if [[ ${#target_array[@]} -gt 0 ]]; then
+                echo "  2) Use existing target"
+            fi
+            echo
+
+            local target_choice
+            if [[ ${#target_array[@]} -gt 0 ]]; then
+                read -rp "Choice [1-2]: " target_choice
+            else
+                target_choice="1"
+            fi
+
+            case "$target_choice" in
+                1)
+                    # Create new target
+                    local default_iqn
+                    default_iqn=$(generate_default_iqn "$storage_name")
+
+                    echo
+                    info "Suggested IQN: $default_iqn"
+                    read -rp "iSCSI target IQN [$default_iqn]: " target
+                    target="${target:-$default_iqn}"
+
+                    # Get portal group ID
+                    local portal_id
+                    portal_id=$(get_default_portal_id "$truenas_ip" "$api_key" 2>/dev/null)
+                    portal_id="${portal_id:-1}"
+
+                    printf "  %-30s " "Creating iSCSI target..."
+                    start_spinner
+                    if create_iscsi_target "$truenas_ip" "$api_key" "$target" "$storage_name" "$portal_id" >/dev/null 2>&1; then
+                        stop_spinner
+                        echo ""
+                        success "iSCSI target '$target' created"
+                    else
+                        stop_spinner
+                        echo ""
+                        warning "Failed to create target (may already exist)"
+                        info "Proceeding with target IQN: $target"
+                    fi
+                    ;;
+                2)
+                    # Use existing target
+                    if [[ ${#target_array[@]} -eq 0 ]]; then
+                        error "No existing targets found"
+                        return 1
+                    fi
+
+                    info "Available targets:"
+                    local idx=1
+                    for tgt in "${target_array[@]}"; do
+                        echo "  $idx) $tgt"
+                        ((idx++))
+                    done
+                    echo
+
+                    local tgt_idx
+                    while true; do
+                        read -rp "Select target [1-${#target_array[@]}]: " tgt_idx
+                        if [[ "$tgt_idx" =~ ^[0-9]+$ ]] && [[ "$tgt_idx" -ge 1 ]] && [[ "$tgt_idx" -le "${#target_array[@]}" ]]; then
+                            break
+                        fi
+                        error "Invalid selection"
+                    done
+
+                    target="${target_array[$((tgt_idx-1))]}"
+                    success "Selected target: $target"
+                    ;;
+                *)
+                    error "Invalid choice"
+                    return 1
+                    ;;
+            esac
+        else
+            # Manual target entry
+            read -rp "iSCSI target (e.g., iqn.2025-01.com.truenas:target0): " target
+            if [[ -z "$target" ]]; then
+                error "iSCSI target cannot be empty"
+                return 1
+            fi
         fi
     else
         # NVMe/TCP configuration
+        info "Storage Configuration Wizard - NVMe/TCP Subsystem Configuration"
+        echo
+
         # Check nvme-cli
         if ! check_nvme_cli; then
             warning "nvme-cli package is not installed"
@@ -6235,19 +7109,115 @@ menu_configure_storage() {
             fi
         fi
 
-        # Subsystem NQN
-        while true; do
-            read -rp "NVMe subsystem NQN (e.g., nqn.2005-10.org.freenas.ctl:proxmox): " subsystem_nqn
-            if [[ -z "$subsystem_nqn" ]]; then
-                error "Subsystem NQN cannot be empty"
-                continue
+        # NVMe Subsystem provisioning
+        if [[ "$api_provisioning_available" == true ]] && [[ "$nvme_supported" == true ]]; then
+            # Query existing subsystems
+            printf "  %-30s " "Querying NVMe subsystems..."
+            start_spinner
+            local subsystems_json
+            subsystems_json=$(query_nvme_subsystems "$truenas_ip" "$api_key" 2>/dev/null)
+            stop_spinner
+            echo ""
+
+            local -a subsys_array=()
+            if [[ -n "$subsystems_json" ]]; then
+                while IFS= read -r sub; do
+                    [[ -n "$sub" ]] && subsys_array+=("$sub")
+                done < <(echo "$subsystems_json" | parse_subsystem_nqns)
             fi
-            if ! validate_nqn "$subsystem_nqn"; then
-                error "Invalid NQN format. Must start with nqn.YYYY-MM."
-                continue
+
+            # Present options
+            echo
+            info "Subsystem options:"
+            echo "  1) Create new NVMe subsystem"
+            if [[ ${#subsys_array[@]} -gt 0 ]]; then
+                echo "  2) Use existing subsystem"
             fi
-            break
-        done
+            echo
+
+            local subsys_choice
+            if [[ ${#subsys_array[@]} -gt 0 ]]; then
+                read -rp "Choice [1-2]: " subsys_choice
+            else
+                subsys_choice="1"
+            fi
+
+            case "$subsys_choice" in
+                1)
+                    # Create new subsystem
+                    local default_nqn
+                    default_nqn=$(generate_default_nqn "$storage_name")
+
+                    echo
+                    info "Suggested NQN: $default_nqn"
+                    read -rp "NVMe subsystem NQN [$default_nqn]: " subsystem_nqn
+                    subsystem_nqn="${subsystem_nqn:-$default_nqn}"
+
+                    if ! validate_nqn "$subsystem_nqn"; then
+                        error "Invalid NQN format. Must start with nqn.YYYY-MM."
+                        return 1
+                    fi
+
+                    printf "  %-30s " "Creating NVMe subsystem..."
+                    start_spinner
+                    if create_nvme_subsystem "$truenas_ip" "$api_key" "$subsystem_nqn" "$storage_name" >/dev/null 2>&1; then
+                        stop_spinner
+                        echo ""
+                        success "NVMe subsystem '$subsystem_nqn' created"
+                    else
+                        stop_spinner
+                        echo ""
+                        warning "Failed to create subsystem (may already exist)"
+                        info "Proceeding with NQN: $subsystem_nqn"
+                    fi
+                    ;;
+                2)
+                    # Use existing subsystem
+                    if [[ ${#subsys_array[@]} -eq 0 ]]; then
+                        error "No existing subsystems found"
+                        return 1
+                    fi
+
+                    info "Available subsystems:"
+                    local idx=1
+                    for sub in "${subsys_array[@]}"; do
+                        echo "  $idx) $sub"
+                        ((idx++))
+                    done
+                    echo
+
+                    local sub_idx
+                    while true; do
+                        read -rp "Select subsystem [1-${#subsys_array[@]}]: " sub_idx
+                        if [[ "$sub_idx" =~ ^[0-9]+$ ]] && [[ "$sub_idx" -ge 1 ]] && [[ "$sub_idx" -le "${#subsys_array[@]}" ]]; then
+                            break
+                        fi
+                        error "Invalid selection"
+                    done
+
+                    subsystem_nqn="${subsys_array[$((sub_idx-1))]}"
+                    success "Selected subsystem: $subsystem_nqn"
+                    ;;
+                *)
+                    error "Invalid choice"
+                    return 1
+                    ;;
+            esac
+        else
+            # Manual NQN entry
+            while true; do
+                read -rp "NVMe subsystem NQN (e.g., nqn.2005-10.org.freenas.ctl:proxmox): " subsystem_nqn
+                if [[ -z "$subsystem_nqn" ]]; then
+                    error "Subsystem NQN cannot be empty"
+                    continue
+                fi
+                if ! validate_nqn "$subsystem_nqn"; then
+                    error "Invalid NQN format. Must start with nqn.YYYY-MM."
+                    continue
+                fi
+                break
+            done
+        fi
 
         # Host NQN
         hostnqn=$(get_hostnqn)
@@ -6259,6 +7229,14 @@ menu_configure_storage() {
         echo
         check_nvme_multipath || true
     fi
+
+    # Clear screen for portal and advanced configuration
+    clear_screen
+    print_banner
+    echo
+
+    info "Storage Configuration Wizard - Portal and Advanced Settings"
+    echo
 
     # Portal (optional) - set default port based on transport
     local portal
@@ -6405,9 +7383,14 @@ menu_configure_storage() {
         use_multipath="0"
     fi
 
-    # Generate configuration
+    # Clear screen for configuration summary
+    clear_screen
+    print_banner
     echo
-    info "Configuration summary:"
+
+    info "Storage Configuration Wizard - Configuration Summary"
+    echo
+
     info "Transport mode: ${transport_mode}"
     echo "─────────────────────────────────────────────────────────"
     local config
