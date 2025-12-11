@@ -1,5 +1,26 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.2.3 (December 10, 2025)
+
+### 🐛 **Bug Fix: iSCSI Extent Deletion with Active Sessions**
+
+#### **Fixed orphaned iSCSI resources when deleting disks with active sessions**
+- **Problem**: Deleting iSCSI disks while other VMs had active sessions to the same shared target left orphaned extents and targetextent mappings on TrueNAS
+- **Error message**: `Associated target iqn.2005-10.org.freenas.ctl:vm is in use.`
+- **Root cause**: The plugin's `iscsi.targetextent.delete` and `iscsi.extent.delete` API calls didn't pass the `force` parameter that TrueNAS supports
+- **Solution**: Added `force=true` to all iSCSI extent and targetextent deletion API calls
+
+### 🔧 **Technical Details**
+- `_tn_extent_delete()`: Now passes `[id, remove=false, force=true]` to avoid orphaned extents
+- `_tn_targetextent_delete()`: Now passes `[id, force=true]` to delete mappings even when target is in use
+- `_bulk_targetextent_delete()`: Bulk operations include force parameter
+- `_bulk_extent_delete()`: Bulk operations include force parameter
+- `_cleanup_multiple_volumes()`: Both bulk and fallback paths include force
+- `_free_image_iscsi()`: All deletion calls (initial and retry) include force
+- Clone cleanup path: Extent deletion during error rollback includes force
+
+---
+
 ## Version 1.2.2 (December 9, 2025)
 
 ### 🐛 **Bug Fixes: Concurrent Operations & Multipath iSCSI**

@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '1.2.2';
+our $VERSION = '1.2.3';
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -1027,7 +1027,8 @@ sub _bulk_targetextent_delete($scfg, $targetextent_ids) {
     return [] if !$targetextent_ids || !@$targetextent_ids;
 
     # Prepare parameter arrays for each targetextent deletion
-    my @params_array = map { [$_] } @$targetextent_ids;
+    # Parameters: id, force (delete even if target is in use)
+    my @params_array = map { [$_, JSON::PP::true] } @$targetextent_ids;
 
     my $results = _api_bulk_call($scfg, 'iscsi.targetextent.delete', \@params_array,
         'Deleting targetextent {0}');
@@ -1049,7 +1050,8 @@ sub _bulk_extent_delete($scfg, $extent_ids) {
     return [] if !$extent_ids || !@$extent_ids;
 
     # Prepare parameter arrays for each extent deletion
-    my @params_array = map { [$_] } @$extent_ids;
+    # Parameters: id, remove (delete underlying zvol), force (delete even if in use)
+    my @params_array = map { [$_, JSON::PP::false, JSON::PP::true] } @$extent_ids;
 
     my $results = _api_bulk_call($scfg, 'iscsi.extent.delete', \@params_array,
         'Deleting extent {0}');
@@ -1085,8 +1087,8 @@ sub _cleanup_multiple_volumes($scfg, $volume_info_list) {
             # Fall back to individual deletion if bulk fails
             foreach my $id (@targetextent_ids) {
                 eval {
-                    _api_call($scfg, 'iscsi.targetextent.delete', [$id],
-                        sub { _rest_call($scfg, 'DELETE', "/iscsi/targetextent/id/$id", undef) });
+                    _api_call($scfg, 'iscsi.targetextent.delete', [$id, JSON::PP::true],
+                        sub { _rest_call($scfg, 'DELETE', "/iscsi/targetextent/id/$id", { force => JSON::PP::true }) });
                 };
                 push @all_errors, "Failed to delete targetextent $id: $@" if $@;
             }
@@ -1097,8 +1099,8 @@ sub _cleanup_multiple_volumes($scfg, $volume_info_list) {
         # Individual deletion for single item or when bulk disabled
         foreach my $id (@targetextent_ids) {
             eval {
-                _api_call($scfg, 'iscsi.targetextent.delete', [$id],
-                    sub { _rest_call($scfg, 'DELETE', "/iscsi/targetextent/id/$id", undef) });
+                _api_call($scfg, 'iscsi.targetextent.delete', [$id, JSON::PP::true],
+                    sub { _rest_call($scfg, 'DELETE', "/iscsi/targetextent/id/$id", { force => JSON::PP::true }) });
             };
             push @all_errors, "Failed to delete targetextent $id: $@" if $@;
         }
@@ -1111,8 +1113,8 @@ sub _cleanup_multiple_volumes($scfg, $volume_info_list) {
             # Fall back to individual deletion if bulk fails
             foreach my $id (@extent_ids) {
                 eval {
-                    _api_call($scfg, 'iscsi.extent.delete', [$id],
-                        sub { _rest_call($scfg, 'DELETE', "/iscsi/extent/id/$id", undef) });
+                    _api_call($scfg, 'iscsi.extent.delete', [$id, JSON::PP::false, JSON::PP::true],
+                        sub { _rest_call($scfg, 'DELETE', "/iscsi/extent/id/$id", { force => JSON::PP::true }) });
                 };
                 push @all_errors, "Failed to delete extent $id: $@" if $@;
             }
@@ -1123,8 +1125,8 @@ sub _cleanup_multiple_volumes($scfg, $volume_info_list) {
         # Individual deletion for single item or when bulk disabled
         foreach my $id (@extent_ids) {
             eval {
-                _api_call($scfg, 'iscsi.extent.delete', [$id],
-                    sub { _rest_call($scfg, 'DELETE', "/iscsi/extent/id/$id", undef) });
+                _api_call($scfg, 'iscsi.extent.delete', [$id, JSON::PP::false, JSON::PP::true],
+                    sub { _rest_call($scfg, 'DELETE', "/iscsi/extent/id/$id", { force => JSON::PP::true }) });
             };
             push @all_errors, "Failed to delete extent $id: $@" if $@;
         }
@@ -1994,8 +1996,10 @@ sub _tn_extent_create($scfg, $zname, $full) {
     return $result;
 }
 sub _tn_extent_delete($scfg, $extent_id) {
-    my $result = _api_call_write($scfg, 'iscsi.extent.delete', [ $extent_id ],
-        sub { _rest_call($scfg, 'DELETE', "/iscsi/extent/id/$extent_id") }
+    # Parameters: id, remove (delete underlying zvol), force (delete even if in use)
+    # We set remove=false since we handle zvol deletion separately
+    my $result = _api_call_write($scfg, 'iscsi.extent.delete', [ $extent_id, JSON::PP::false, JSON::PP::true ],
+        sub { _rest_call($scfg, 'DELETE', "/iscsi/extent/id/$extent_id", { force => JSON::PP::true }) }
     );
     # Invalidate cache since extents list has changed
     _clear_cache($scfg->{storeid}) if $result;
@@ -2024,8 +2028,9 @@ sub _tn_targetextent_create($scfg, $target_id, $extent_id, $lun) {
     return $result;
 }
 sub _tn_targetextent_delete($scfg, $tx_id) {
-    my $result = _api_call_write($scfg, 'iscsi.targetextent.delete', [ $tx_id ],
-        sub { _rest_call($scfg, 'DELETE', "/iscsi/targetextent/id/$tx_id") }
+    # Parameters: id, force (delete even if target is in use)
+    my $result = _api_call_write($scfg, 'iscsi.targetextent.delete', [ $tx_id, JSON::PP::true ],
+        sub { _rest_call($scfg, 'DELETE', "/iscsi/targetextent/id/$tx_id", { force => JSON::PP::true }) }
     );
     # Invalidate cache since targetextents list has changed
     _clear_cache($scfg->{storeid}) if $result;
@@ -3626,8 +3631,8 @@ sub _free_image_iscsi {
     if ($tx && defined $tx->{id}) {
         my $id = $tx->{id};
         my $ok = eval {
-            _api_call($scfg,'iscsi.targetextent.delete',[ $id ],
-                sub { _rest_call($scfg,'DELETE',"/iscsi/targetextent/id/$id",undef) });
+            _api_call($scfg,'iscsi.targetextent.delete',[ $id, JSON::PP::true ],
+                sub { _rest_call($scfg,'DELETE',"/iscsi/targetextent/id/$id",{ force => JSON::PP::true }) });
             1;
         };
         if (!$ok) {
@@ -3646,8 +3651,8 @@ sub _free_image_iscsi {
     if ($extent && defined $extent->{id}) {
         my $eid = $extent->{id};
         my $ok = eval {
-            _api_call($scfg,'iscsi.extent.delete',[ $eid ],
-                sub { _rest_call($scfg,'DELETE',"/iscsi/extent/id/$eid",undef) });
+            _api_call($scfg,'iscsi.extent.delete',[ $eid, JSON::PP::false, JSON::PP::true ],
+                sub { _rest_call($scfg,'DELETE',"/iscsi/extent/id/$eid",{ force => JSON::PP::true }) });
             1;
         };
         if (!$ok) {
@@ -3690,8 +3695,8 @@ sub _free_image_iscsi {
         if ($tx && defined $tx->{id}) {
             my $id = $tx->{id};
             eval {
-                _api_call($scfg,'iscsi.targetextent.delete',[ $id ],
-                    sub { _rest_call($scfg,'DELETE',"/iscsi/targetextent/id/$id",undef) });
+                _api_call($scfg,'iscsi.targetextent.delete',[ $id, JSON::PP::true ],
+                    sub { _rest_call($scfg,'DELETE',"/iscsi/targetextent/id/$id",{ force => JSON::PP::true }) });
             };
             if ($@) {
                 # In cluster environments, other nodes may have active sessions causing "in use" errors
@@ -3705,8 +3710,8 @@ sub _free_image_iscsi {
         if ($extent && defined $extent->{id}) {
             my $eid = $extent->{id};
             eval {
-                _api_call($scfg,'iscsi.extent.delete',[ $eid ],
-                    sub { _rest_call($scfg,'DELETE',"/iscsi/extent/id/$eid",undef) });
+                _api_call($scfg,'iscsi.extent.delete',[ $eid, JSON::PP::false, JSON::PP::true ],
+                    sub { _rest_call($scfg,'DELETE',"/iscsi/extent/id/$eid",{ force => JSON::PP::true }) });
             };
             if ($@) {
                 _log($scfg, 1, 'info', "[TrueNAS] _free_image_iscsi: could not delete extent id=$eid (may be in use by other cluster nodes)");
@@ -4700,8 +4705,8 @@ sub _clone_image_iscsi {
         if ($@) {
             # Cleanup: delete extent and zvol if mapping creation failed
             eval {
-                _api_call($scfg, 'iscsi.extent.delete', [$extent_id],
-                    sub { _rest_call($scfg, 'DELETE', "/iscsi/extent/id/$extent_id", undef) });
+                _api_call($scfg, 'iscsi.extent.delete', [$extent_id, JSON::PP::false, JSON::PP::true],
+                    sub { _rest_call($scfg, 'DELETE', "/iscsi/extent/id/$extent_id", { force => JSON::PP::true }) });
             };
             eval { _tn_dataset_delete($scfg, $target_full) };
             die "Failed to create target-extent mapping for clone: $@\n";
